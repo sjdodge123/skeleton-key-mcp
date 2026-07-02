@@ -17,11 +17,11 @@ export interface Annotations {
 }
 
 export function annotationsFor(resolved: ResolvedTool): Annotations {
-  const isRead = resolved.tool.tier === "read";
+  const isRead = resolved.tier === "read";
   return { readOnlyHint: isRead, destructiveHint: !isRead };
 }
 
 export function confirmationText(resolved: ResolvedTool, input: unknown): string | undefined {
-  if (resolved.tool.tier !== "execute") return undefined;
-  return resolved.tool.confirm?.(input, resolved.target);
+  if (resolved.tier !== "execute") return undefined;
+  return resolved.confirm?.(input);
 }

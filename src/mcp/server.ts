@@ -24,12 +24,12 @@ export function buildMcpServer(app: AppState): Server {
       const ann = annotationsFor(resolved);
       return {
         name: resolved.qualifiedName,
-        description: resolved.tool.description,
-        inputSchema: zodToJsonSchema(resolved.tool.inputSchema, {
+        description: resolved.description,
+        inputSchema: zodToJsonSchema(resolved.inputSchema, {
           $refStrategy: "none",
         }) as Tool["inputSchema"],
         annotations: {
-          title: `${resolved.target.name}: ${resolved.tool.name}`,
+          title: resolved.targetName ? `${resolved.targetName}: ${resolved.qualifiedName}` : resolved.qualifiedName,
           readOnlyHint: ann.readOnlyHint,
           destructiveHint: ann.destructiveHint,
         },
@@ -47,13 +47,13 @@ export function buildMcpServer(app: AppState): Server {
       return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }
 
-    const { tool, target } = resolved;
+    const auditTarget = resolved.targetName ?? "(global)";
 
     // Validate input against the tool's schema.
-    const parsed = tool.inputSchema.safeParse(rawArgs ?? {});
+    const parsed = resolved.inputSchema.safeParse(rawArgs ?? {});
     if (!parsed.success) {
       app.audit.record({
-        ts, tool: name, target: target.name, tier: tool.tier,
+        ts, tool: name, target: auditTarget, tier: resolved.tier,
         args: rawArgs, status: "error", detail: "input validation failed",
       });
       return {
@@ -63,42 +63,29 @@ export function buildMcpServer(app: AppState): Server {
     }
 
     // Approval gate for state-changing tools.
-    if (tool.tier === "execute") {
-      if (EXECUTE_DISABLED) {
-        app.audit.record({
-          ts, tool: name, target: target.name, tier: tool.tier,
-          args: parsed.data, status: "denied", detail: "execute globally disabled",
-        });
-        return {
-          content: [{ type: "text", text: "Execute tools are disabled on this server (SKELETON_KEY_DISABLE_EXECUTE=1)." }],
-          isError: true,
-        };
-      }
+    if (resolved.tier === "execute" && EXECUTE_DISABLED) {
+      app.audit.record({
+        ts, tool: name, target: auditTarget, tier: resolved.tier,
+        args: parsed.data, status: "denied", detail: "execute globally disabled",
+      });
+      return {
+        content: [{ type: "text", text: "Execute tools are disabled on this server (SKELETON_KEY_DISABLE_EXECUTE=1)." }],
+        isError: true,
+      };
     }
 
-    // Resolve credentials lazily; only tools that need them pay the cost.
-    const ctx = {
-      target,
-      getCredential: async () => {
-        if (!target.credentialRef) {
-          throw new Error(`Target '${target.name}' has no credentialRef configured.`);
-        }
-        return app.credentialFor(target.credentialRef);
-      },
-    };
-
     try {
-      const result = await tool.run(parsed.data, ctx);
+      const result = await resolved.invoke(parsed.data);
       app.audit.record({
-        ts, tool: name, target: target.name, tier: tool.tier,
+        ts, tool: name, target: auditTarget, tier: resolved.tier,
         args: parsed.data, status: result.isError ? "error" : "ok",
-        detail: tool.tier === "execute" ? confirmationText(resolved, parsed.data) : undefined,
+        detail: resolved.tier === "execute" ? confirmationText(resolved, parsed.data) : undefined,
       });
       return { content: [{ type: "text", text: result.text }], isError: result.isError };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       app.audit.record({
-        ts, tool: name, target: target.name, tier: tool.tier,
+        ts, tool: name, target: auditTarget, tier: resolved.tier,
         args: parsed.data, status: "error", detail: message,
       });
       return { content: [{ type: "text", text: `Tool failed: ${message}` }], isError: true };

@@ -17,8 +17,9 @@ ENV NODE_ENV=production
 
 # The Bitwarden CLI (`bw`) is required by the Vaultwarden secrets client.
 # It is installed globally and kept out of the app's node_modules.
+# openssh-client provides ssh-keygen, used by the vault_generate_ssh_key tool.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates openssh-client \
   && rm -rf /var/lib/apt/lists/* \
   && npm install -g @bitwarden/cli@2024.9.0 \
   && npm cache clean --force

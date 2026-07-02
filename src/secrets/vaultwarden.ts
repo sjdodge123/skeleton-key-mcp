@@ -113,10 +113,47 @@ export class VaultwardenClient {
     return JSON.parse(out) as { id: string; name: string }[];
   }
 
-  async listCollections(): Promise<{ id: string; name: string }[]> {
+  async listCollections(): Promise<{ id: string; name: string; organizationId: string }[]> {
     this.assertUnlocked();
     const out = await this.run(["list", "collections", "--session", this.session!]);
-    return JSON.parse(out) as { id: string; name: string }[];
+    return JSON.parse(out) as { id: string; name: string; organizationId: string }[];
+  }
+
+  /** Resolve the org + collection ids Skeleton Key writes new items into. */
+  async resolveCollection(name?: string): Promise<{ collectionId: string; organizationId: string; name: string }> {
+    const cols = await this.listCollections();
+    const col = name ? cols.find((c) => c.name === name) : cols[0];
+    if (!col) {
+      throw new Error(
+        name
+          ? `Collection "${name}" not found in the scoped vault.`
+          : "No collection is available to write to.",
+      );
+    }
+    return { collectionId: col.id, organizationId: col.organizationId, name: col.name };
+  }
+
+  /**
+   * Create a Login item in the scoped collection. `fields` become custom fields;
+   * mark secrets (private keys, tokens) hidden. Requires connectivity (writing a
+   * new secret to the server); the local cache is refreshed via sync afterwards.
+   */
+  async createLoginItem(input: {
+    name: string;
+    username?: string;
+    password?: string;
+    url?: string;
+    notes?: string;
+    fields?: { name: string; value: string; hidden?: boolean }[];
+    collectionName?: string;
+  }): Promise<{ name: string }> {
+    this.assertUnlocked();
+    const { collectionId, organizationId } = await this.resolveCollection(input.collectionName);
+    const item = buildLoginItemJson({ ...input, organizationId, collectionId });
+    const encoded = Buffer.from(JSON.stringify(item)).toString("base64");
+    await this.run(["create", "item", encoded, "--session", this.session!]);
+    await this.sync();
+    return { name: input.name };
   }
 
   async listItemNames(): Promise<string[]> {
@@ -143,4 +180,33 @@ export class VaultwardenClient {
       uris: (item.login?.uris ?? []).map((u) => u.uri),
     };
   }
+}
+
+/** Pure builder for a Bitwarden Login item JSON (exported for testing). */
+export function buildLoginItemJson(input: {
+  name: string;
+  username?: string;
+  password?: string;
+  url?: string;
+  notes?: string;
+  fields?: { name: string; value: string; hidden?: boolean }[];
+  organizationId: string;
+  collectionId: string;
+}): Record<string, unknown> {
+  return {
+    organizationId: input.organizationId,
+    collectionIds: [input.collectionId],
+    folderId: null,
+    type: 1, // login
+    name: input.name,
+    notes: input.notes ?? null,
+    favorite: false,
+    reprompt: 0,
+    fields: (input.fields ?? []).map((f) => ({ name: f.name, value: f.value, type: f.hidden ? 1 : 0 })),
+    login: {
+      username: input.username ?? null,
+      password: input.password ?? null,
+      uris: input.url ? [{ match: null, uri: input.url }] : [],
+    },
+  };
 }
