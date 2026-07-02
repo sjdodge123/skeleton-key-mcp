@@ -25,8 +25,19 @@ docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
    - review the automatic **scoping & durability** checks,
    - optionally **scan your LAN** to discover services and register them,
    - enroll **TOTP** 2FA,
-   - copy the generated **Claude MCP snippet**.
-3. **Add the snippet to Claude** (Code or Desktop). Claude now sees tools for each registered service.
+   - copy the **Claude connect command**.
+3. **Connect Claude** (Code or Desktop): `claude mcp add --transport http skeleton-key http://<host>:8787/mcp`. On first use, Claude opens a browser **consent page**; approve it with your authenticator code. Claude now sees tools for each registered service.
+
+## Connecting Claude (OAuth)
+
+Skeleton Key is an **OAuth 2.1** resource+authorization server, so there's no token to copy or store in plaintext:
+
+- Add the server (`claude mcp add --transport http skeleton-key http://<host>:8787/mcp`).
+- The first request 401s with a discovery hint; Claude auto-registers, then opens the **"Authorize an AI agent"** page served by Skeleton Key.
+- You approve with your **TOTP code** (PKCE + short-lived access tokens that auto-refresh).
+- Revoke an agent anytime — it's TOTP-gated (`POST /api/oauth/clients/:id/revoke`); a future admin console surfaces this in the UI.
+
+A **static bearer token** is still accepted as a fallback for clients without OAuth support (shown under "Advanced" in the wizard).
 
 ## Configuration
 

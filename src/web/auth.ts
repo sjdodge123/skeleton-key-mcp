@@ -9,9 +9,17 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
+function baseUrl(req: Request): string {
+  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol || "http";
+  return `${proto}://${req.get("host")}`;
+}
+
 /**
- * Gate the MCP endpoint: setup must be complete, the vault unlocked, and the
- * request must carry the configured bearer token. Fails closed on every check.
+ * Gate the MCP endpoint: setup must be complete and the vault unlocked, then the
+ * request must present either a valid OAuth 2.1 access token (preferred) or the
+ * legacy static bearer token. On failure, emit the RFC 9728 `WWW-Authenticate`
+ * hint so OAuth-capable clients (Claude) can discover the authorization server
+ * and start the browser consent flow automatically. Fails closed throughout.
  */
 export function mcpAuth(app: AppState) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -23,13 +31,32 @@ export function mcpAuth(app: AppState) {
       res.status(503).json({ error: "Vault is locked. Unlock via the web UI." });
       return;
     }
-    const expected = app.store.get().mcpBearerToken;
     const header = req.header("authorization") ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!expected || !token || !safeEqual(token, expected)) {
-      res.status(401).json({ error: "Missing or invalid bearer token." });
+
+    const challenge = (): void => {
+      res
+        .status(401)
+        .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`)
+        .json({ error: "Missing or invalid credentials." });
+    };
+
+    if (!token) {
+      challenge();
       return;
     }
-    next();
+
+    // 1. OAuth access token (preferred).
+    if (app.oauth.validateAccessToken(token)) {
+      next();
+      return;
+    }
+    // 2. Legacy static bearer token (kept for existing connections).
+    const expected = app.store.get().mcpBearerToken;
+    if (expected && safeEqual(token, expected)) {
+      next();
+      return;
+    }
+    challenge();
   };
 }

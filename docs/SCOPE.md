@@ -93,7 +93,7 @@ Claude (Code / Desktop / mobile via LAN)
 ## Security model (beyond secrets)
 
 - **Tool tiers:** every tool declares `read` or `execute`. Execute tools route through the approval gate and name the exact action + target in confirmation text so the permission prompt is meaningful. Per-connector dry-run where feasible.
-- **MCP auth:** static bearer token required on the HTTP transport; stored in the Claude client config, not the repo.
+- **MCP auth:** **OAuth 2.1** authorization server (dynamic client registration, PKCE S256, short-lived access + refresh tokens) with a **TOTP-gated consent screen** ("Authorize an AI agent"). Tokens are stored only as SHA-256 hashes and are revocable per-client. A static bearer token remains as a fallback for non-OAuth clients. `/mcp` 401s carry an RFC 9728 `WWW-Authenticate` discovery hint.
 - **Audit:** append-only SQLite table — tool, target, args digest, caller, timestamp, result status. Viewable in the web UI.
 - **Blast-radius limits:** SSH allow/deny command lists (deny `rm -rf`, `mkfs`, `dd`, etc.); destructive UniFi/DSM endpoints excluded from v1.
 - **Web UI:** LAN-bound only, HTTPS (local/self-signed cert), single admin account (+ optional second user later).
