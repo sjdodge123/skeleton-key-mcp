@@ -130,15 +130,26 @@ const views = {
     '<li><b>LAN only:</b> never expose this to the internet.</li></ul>'+
     btn("Get started", ()=>go(2))),
   2: async ()=> card("Set up the scoped Vaultwarden account",
-    '<p class="muted">Do this once in the Vaultwarden <b>web vault</b> — open your Vaultwarden URL in a browser. Organizations <b>cannot</b> be created from the mobile or desktop app, which is why there\\'s no org button there. The trick: the service account <b>creates its own org</b>, so there are no invites or SMTP to configure.</p>'+
-    '<ol>'+
-    '<li><b>Create a dedicated account</b> for Skeleton Key (e.g. <code>skeleton-key@home.lan</code>) on the web vault\\'s <em>Create account</em> screen. If sign-ups are disabled, add it from the Vaultwarden <code>/admin</code> page (<em>Invite User</em>) or enable sign-ups briefly.</li>'+
-    '<li><b>Log in as that new account</b>, not your normal one. Its vault is empty — that is exactly what keeps your real passwords out of reach.</li>'+
-    '<li>In the left sidebar click <b>New organization</b> (or open <code>/#/create-organization</code>), choose the <b>Free</b> plan, and name it <b>Skeleton Key</b>.</li>'+
-    '<li>Open the org → <b>Collections</b> → <b>New collection</b> named <b>Homelab</b>.</li>'+
-    '<li>Add your infra logins (SSH keys, NAS, Proxmox, UniFi, …) into that collection.</li>'+
-    '<li>Go to <b>Account settings → Security → Keys → View API Key</b> to reveal <code>client_id</code>/<code>client_secret</code>.</li>'+
-    '</ol>'+
+    '<p class="muted">Do this once in the Vaultwarden <b>web vault</b> (your Vaultwarden URL in a browser). The service account <b>creates its own org</b>, so there are no org invites or SMTP to deal with. Replace <code>&lt;vaultwarden&gt;</code> below with your Vaultwarden URL.</p>'+
+    '<h3>1 · Create a dedicated account</h3>'+
+    '<p class="muted">Skeleton Key needs its own empty account, e.g. <code>skeleton-key@home.lan</code>, so it can never reach your personal vault.</p>'+
+    '<ul>'+
+    '<li><b>If sign-ups are enabled:</b> open <code>&lt;vaultwarden&gt;/#/signup</code>, register that email, and set a master password.</li>'+
+    '<li><b>If sign-ups are disabled</b> (the usual case, and why there is no "add user" button) — enable the admin page and invite it:'+
+      '<ol>'+
+      '<li>Add an <code>ADMIN_TOKEN</code> env var to your Vaultwarden container (generate one with <code>openssl rand -base64 32</code>) and restart it.</li>'+
+      '<li>Open <code>&lt;vaultwarden&gt;/admin</code>, log in with that token, and under <b>Users → Invite User</b> enter the email.</li>'+
+      '<li>No SMTP needed: open <code>&lt;vaultwarden&gt;/#/signup</code>, enter that <b>same invited email</b>, and set its master password.</li>'+
+      '</ol>'+
+    '</li></ul>'+
+    '<h3>2 · Log in as that new account</h3>'+
+    '<p class="muted">Sign out of your normal account and sign in as the new one. Its vault is empty — that is exactly what keeps your real passwords out of reach.</p>'+
+    '<h3>3 · Create the organization</h3>'+
+    '<p class="muted">On the <b>Vaults</b> page, in the <b>FILTERS</b> panel (the middle column), under <b>All vaults</b>, click <b>＋ New organization</b>. Choose the <b>Free</b> plan if prompted and name it <b>Skeleton Key</b>.</p>'+
+    '<h3>4 · Add a collection and your logins</h3>'+
+    '<p class="muted">Open the org → <b>Collections → New collection</b> named <b>Homelab</b>. Add your infra logins (SSH keys, NAS, Proxmox, UniFi, …) into that collection.</p>'+
+    '<h3>5 · Get the API key</h3>'+
+    '<p class="muted">Go to <b>Settings → Security → Keys → View API Key</b> to reveal <code>client_id</code> / <code>client_secret</code>.</p>'+
     '<p class="muted">Because this account owns only this one org and holds no personal data, it is cryptographically unable to read your real passwords. Keep the API key and this account\\'s master password for the next step.</p>'+
     btn("I\\'ve done this", ()=>go(3))),
   3: async ()=> card("Connect the vault",
