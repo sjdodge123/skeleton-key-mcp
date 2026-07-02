@@ -52,6 +52,7 @@ All configuration is optional — the defaults work for a standard container dep
 | `SKELETON_KEY_BIND_HOST` | `0.0.0.0` | Interface the server binds to inside the container. Leave at `0.0.0.0`; scope exposure with the host-side port mapping (below), not this. |
 | `SKELETON_KEY_PASSPHRASE` | _(unset)_ | Optional. If set, the encrypted store is **unlocked automatically at boot** so the MCP endpoint comes back up without manual intervention after a restart. If unset, you unlock via the web UI after each restart. Prefer a Docker/Portainer **secret** over an inline value — it's your master passphrase. |
 | `SKELETON_KEY_DISABLE_EXECUTE` | _(unset)_ | Set to `1` as a kill-switch: all `execute`-tier tools are refused and audited as denied, leaving only read-only tools. Useful while testing or if you want Claude to look but not touch. |
+| `SKELETON_KEY_PUBLIC_URL` | _(unset)_ | The externally-reachable base URL (e.g. `http://192.168.1.10:8787`). Used as the OAuth issuer / discovery origin so it can't be steered by a forged `Host` header. Set this if a reverse proxy sits in front; otherwise the request's own host is used and `X-Forwarded-*` is ignored. |
 
 ### Docker / compose setup
 

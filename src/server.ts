@@ -29,6 +29,11 @@ async function main(): Promise<void> {
     }
   }
 
+  // Housekeeping: drop expired OAuth codes/tokens at boot and hourly.
+  app.oauth.purgeExpired();
+  const purgeTimer = setInterval(() => app.oauth.purgeExpired(), 3600_000);
+  purgeTimer.unref();
+
   const httpApp = buildHttpApp(app);
   const server = httpApp.listen(env.port, env.bindHost, async () => {
     const setup = await app.isSetupComplete();

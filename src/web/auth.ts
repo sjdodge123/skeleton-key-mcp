@@ -1,17 +1,13 @@
 import type { Request, Response, NextFunction } from "express";
 import { timingSafeEqual } from "node:crypto";
 import type { AppState } from "../app.js";
+import { baseUrl } from "./http-util.js";
 
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
-}
-
-function baseUrl(req: Request): string {
-  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol || "http";
-  return `${proto}://${req.get("host")}`;
 }
 
 /**
@@ -46,17 +42,22 @@ export function mcpAuth(app: AppState) {
       return;
     }
 
-    // 1. OAuth access token (preferred).
-    if (app.oauth.validateAccessToken(token)) {
-      next();
-      return;
+    try {
+      // 1. OAuth access token (preferred).
+      if (app.oauth.validateAccessToken(token)) {
+        next();
+        return;
+      }
+      // 2. Legacy static bearer token (kept for existing connections).
+      const expected = app.store.get().mcpBearerToken;
+      if (expected && safeEqual(token, expected)) {
+        next();
+        return;
+      }
+      challenge();
+    } catch {
+      // Fail closed on any error (e.g. a transient DB failure) rather than hang.
+      challenge();
     }
-    // 2. Legacy static bearer token (kept for existing connections).
-    const expected = app.store.get().mcpBearerToken;
-    if (expected && safeEqual(token, expected)) {
-      next();
-      return;
-    }
-    challenge();
   };
 }

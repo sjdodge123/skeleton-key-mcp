@@ -1,8 +1,8 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Response } from "express";
 import { z } from "zod";
-import { authenticator } from "otplib";
 import type { AppState } from "../app.js";
 import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
+import { baseUrl, firstStr } from "./http-util.js";
 
 /**
  * OAuth 2.1 endpoints for the MCP authorization flow. Claude discovers these via
@@ -10,11 +10,6 @@ import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
  * authorization-code + PKCE flow. Human consent happens on a TOTP-gated screen,
  * so only the admin (with the authenticator) can authorize an agent.
  */
-
-function baseUrl(req: Request): string {
-  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol || "http";
-  return `${proto}://${req.get("host")}`;
-}
 
 function htmlEscape(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -107,8 +102,13 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Authorization endpoint: render the consent screen ---
   router.get("/oauth/authorize", (req, res) => {
-    const q = req.query as Record<string, string | undefined>;
-    const { client_id = "", redirect_uri = "", response_type = "", code_challenge = "", code_challenge_method = "", state = "" } = q;
+    // firstStr guards against array-valued (duplicated) query params.
+    const client_id = firstStr(req.query.client_id);
+    const redirect_uri = firstStr(req.query.redirect_uri);
+    const response_type = firstStr(req.query.response_type);
+    const code_challenge = firstStr(req.query.code_challenge);
+    const code_challenge_method = firstStr(req.query.code_challenge_method);
+    const state = firstStr(req.query.state);
     const client = client_id ? app.oauth.getClient(client_id) : undefined;
     if (!client) {
       res.status(400).send("Unknown client_id");
@@ -132,8 +132,12 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Consent decision (TOTP-gated) ---
   router.post("/oauth/authorize/decision", (req, res) => {
-    const b = req.body as Record<string, string | undefined>;
-    const { client_id = "", redirect_uri = "", state = "", code_challenge = "", totp = "", action = "" } = b;
+    const client_id = firstStr(req.body.client_id);
+    const redirect_uri = firstStr(req.body.redirect_uri);
+    const state = firstStr(req.body.state);
+    const code_challenge = firstStr(req.body.code_challenge);
+    const totp = firstStr(req.body.totp);
+    const action = firstStr(req.body.action);
     const client = client_id ? app.oauth.getClient(client_id) : undefined;
     if (!client || !client.redirect_uris.includes(redirect_uri)) {
       res.status(400).send("Invalid client or redirect_uri");
@@ -142,8 +146,7 @@ export function buildOAuthRouter(app: AppState): Router {
     if (action === "deny") {
       return redirectError(res, redirect_uri, state, "access_denied", "User denied the request");
     }
-    const secret = app.store.locked ? undefined : app.store.get().totpSecret;
-    if (!secret || !authenticator.verify({ token: totp.trim(), secret })) {
+    if (!app.verifyTotp(totp)) {
       res.type("html").send(
         consentPage({
           clientName: client.client_name,
@@ -166,14 +169,19 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Token endpoint ---
   router.post("/oauth/token", (req, res) => {
-    const b = req.body as Record<string, string | undefined>;
-    const { grant_type = "", code = "", client_id = "", redirect_uri = "", code_verifier = "", refresh_token = "" } = b;
+    const grant_type = firstStr(req.body.grant_type);
+    const code = firstStr(req.body.code);
+    const client_id = firstStr(req.body.client_id);
+    const redirect_uri = firstStr(req.body.redirect_uri);
+    const code_verifier = firstStr(req.body.code_verifier);
+    const refresh_token = firstStr(req.body.refresh_token);
     try {
       if (grant_type === "authorization_code") {
         const out = app.oauth.redeemAuthCode({ code, client_id, redirect_uri, code_verifier });
         res.json({ token_type: "Bearer", access_token: out.access_token, refresh_token: out.refresh_token, expires_in: out.expires_in, scope: out.scope });
       } else if (grant_type === "refresh_token") {
-        const out = app.oauth.refresh(refresh_token, client_id);
+        // client_id is optional for public clients; refresh() checks it only if present.
+        const out = app.oauth.refresh(refresh_token, client_id || undefined);
         res.json({ token_type: "Bearer", access_token: out.access_token, refresh_token: out.refresh_token, expires_in: out.expires_in, scope: out.scope });
       } else {
         res.status(400).json({ error: "unsupported_grant_type" });
@@ -183,10 +191,11 @@ export function buildOAuthRouter(app: AppState): Router {
     }
   });
 
-  // --- Token revocation (RFC 7009) — best-effort ---
-  router.post("/oauth/revoke", (_req, res) => {
-    // Individual token revocation is available via the web UI (per-client);
-    // acknowledge per spec so clients don't error.
+  // --- Token revocation (RFC 7009) ---
+  router.post("/oauth/revoke", (req, res) => {
+    const t = firstStr(req.body.token);
+    if (t) app.oauth.revokeToken(t);
+    // RFC 7009: always 200, even for unknown/invalid tokens.
     res.status(200).end();
   });
 
