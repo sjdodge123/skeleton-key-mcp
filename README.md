@@ -50,6 +50,7 @@ All configuration is optional — the defaults work for a standard container dep
 | **Volume** | `skeleton-key-data:/data` | Persists everything in `SKELETON_KEY_DATA_DIR` across restarts and image updates. Without it you'd re-run the wizard every restart. Use a named volume or a host bind mount you back up. |
 | **`image` vs `build`** | `image: ghcr.io/sjdodge123/skeleton-key-mcp:latest` | On the NAS, pull the CI-built image. Use `build: .` only when developing from a source checkout. |
 | **`restart`** | `unless-stopped` | Brings Skeleton Key back after a NAS reboot. Pair with `SKELETON_KEY_PASSPHRASE` for hands-off recovery, or unlock via the UI. |
+| **Watchtower label** | `com.centurylinklabs.watchtower.enable: "true"` | If you run [Watchtower](https://containrrr.dev/watchtower/), this opts the container into auto-updates: when CI publishes a new `:latest`, Watchtower pulls and recreates it on its next poll. The `/data` volume persists, so no re-setup. Force an immediate update with `docker exec watchtower /watchtower --run-once skeleton-key`. |
 
 Minimal Portainer stack:
 

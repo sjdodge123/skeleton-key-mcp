@@ -99,12 +99,16 @@ const views = {
     '<li><b>LAN only:</b> never expose this to the internet.</li></ul>'+
     btn("Get started", ()=>go(2))),
   2: async ()=> card("Set up the scoped Vaultwarden account",
-    '<p class="muted">Do this once in your Vaultwarden admin, then continue:</p>'+
-    '<ol><li>Create an <b>Organization</b> named "Skeleton Key".</li>'+
-    '<li>Add one <b>Collection</b> (e.g. "Homelab") and put your infra logins in it (SSH keys, NAS, Proxmox, etc.).</li>'+
-    '<li>Create a <b>new user</b> to act as the service account; invite it to the org and restrict it to <em>only</em> that collection.</li>'+
-    '<li>Log in as that user and generate its <b>personal API key</b> (Account Settings → Security → Keys).</li></ol>'+
-    '<p class="muted">Keep the API key <code>client_id</code>/<code>client_secret</code> and the service account\\'s master password handy.</p>'+
+    '<p class="muted">Do this once in the Vaultwarden <b>web vault</b> — open your Vaultwarden URL in a browser. Organizations <b>cannot</b> be created from the mobile or desktop app, which is why there\\'s no org button there. The trick: the service account <b>creates its own org</b>, so there are no invites or SMTP to configure.</p>'+
+    '<ol>'+
+    '<li><b>Create a dedicated account</b> for Skeleton Key (e.g. <code>skeleton-key@home.lan</code>) on the web vault\\'s <em>Create account</em> screen. If sign-ups are disabled, add it from the Vaultwarden <code>/admin</code> page (<em>Invite User</em>) or enable sign-ups briefly.</li>'+
+    '<li><b>Log in as that new account</b>, not your normal one. Its vault is empty — that is exactly what keeps your real passwords out of reach.</li>'+
+    '<li>In the left sidebar click <b>New organization</b> (or open <code>/#/create-organization</code>), choose the <b>Free</b> plan, and name it <b>Skeleton Key</b>.</li>'+
+    '<li>Open the org → <b>Collections</b> → <b>New collection</b> named <b>Homelab</b>.</li>'+
+    '<li>Add your infra logins (SSH keys, NAS, Proxmox, UniFi, …) into that collection.</li>'+
+    '<li>Go to <b>Account settings → Security → Keys → View API Key</b> to reveal <code>client_id</code>/<code>client_secret</code>.</li>'+
+    '</ol>'+
+    '<p class="muted">Because this account owns only this one org and holds no personal data, it is cryptographically unable to read your real passwords. Keep the API key and this account\\'s master password for the next step.</p>'+
     btn("I\\'ve done this", ()=>go(3))),
   3: async ()=> card("Connect the vault",
     field("serverUrl","Vaultwarden internal URL (LAN)","text","http://192.168.0.x:port")+
