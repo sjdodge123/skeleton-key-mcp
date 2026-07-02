@@ -26,6 +26,12 @@ services:
       # SKELETON_KEY_DISABLE_EXECUTE: "1"
     volumes:
       - skeleton-key-data:/data
+    labels:
+      # Opt this container into Watchtower auto-updates. When CI publishes a new
+      # :latest, Watchtower pulls it and recreates the container on its next poll;
+      # the /data volume persists so no re-setup. Force an immediate update with:
+      #   docker exec watchtower /watchtower --run-once skeleton-key
+      com.centurylinklabs.watchtower.enable: "true"
 
 volumes:
   skeleton-key-data:
