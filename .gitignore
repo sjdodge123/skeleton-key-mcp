@@ -1,0 +1,18 @@
+node_modules/
+dist/
+*.log
+
+# Runtime data — never commit secrets, vault cache, or the local store
+data/
+*.sqlite
+*.sqlite3
+bootstrap.store
+.bw-cache/
+config.local.yaml
+
+# Env
+.env
+.env.local
+
+# OS
+.DS_Store

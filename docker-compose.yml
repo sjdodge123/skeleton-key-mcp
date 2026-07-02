@@ -1,0 +1,30 @@
+# Skeleton Key MCP — deploy on your NAS (e.g. import this stack in Portainer).
+#
+# SECURITY: This binds to the LAN only. Do NOT put it behind an internet-facing
+# reverse proxy or publish the port to the WAN. Remote access = VPN into the LAN.
+services:
+  skeleton-key:
+    build: .
+    # Or pull a prebuilt image once you publish one:
+    # image: ghcr.io/youruser/skeleton-key-mcp:latest
+    container_name: skeleton-key
+    restart: unless-stopped
+    ports:
+      # Bind to a specific LAN interface address, not 0.0.0.0, so it is never
+      # exposed beyond your local network. Replace 192.168.0.229 with this host's
+      # LAN IP.
+      - "192.168.0.229:8787:8787"
+    environment:
+      SKELETON_KEY_PORT: "8787"
+      SKELETON_KEY_BIND_HOST: "0.0.0.0" # inside the container; the port map above scopes it to the LAN
+      # Optional: unlock the encrypted store automatically at boot. If unset, the
+      # web UI prompts for the passphrase after a restart. Prefer a Docker/
+      # Portainer secret over an inline value.
+      # SKELETON_KEY_PASSPHRASE: "change-me"
+      # Blunt kill-switch for all state-changing tools:
+      # SKELETON_KEY_DISABLE_EXECUTE: "1"
+    volumes:
+      - skeleton-key-data:/data
+
+volumes:
+  skeleton-key-data:
