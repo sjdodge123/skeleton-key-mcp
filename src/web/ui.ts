@@ -10,54 +10,81 @@ export const WIZARD_HTML = /* html */ `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Skeleton Key — Setup</title>
 <style>
-  :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --acc:#5b8cff; --ok:#3ecf8e; --bad:#ff6b6b; --mut:#8b93a7; }
+  :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --panel2:#1c202b; --line:#262b36; --acc:#4d7cfe; --acc-h:#3b6bf0; --ok:#3ecf8e; --bad:#ff6b6b; --mut:#8b93a7; --text:#e6e9ef; --radius:10px; }
   * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:#e6e9ef; }
-  header { padding:20px 28px; border-bottom:1px solid #232733; display:flex; align-items:center; gap:12px; }
-  header h1 { font-size:18px; margin:0; }
-  .key { font-size:22px; }
-  main { max-width:760px; margin:0 auto; padding:28px; }
-  .steps { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:24px; }
-  .steps span { font-size:12px; padding:4px 10px; border-radius:20px; background:#1c202b; color:var(--mut); }
-  .steps span.active { background:var(--acc); color:#fff; }
-  .steps span.done { background:#22303f; color:var(--ok); }
-  .card { background:var(--panel); border:1px solid #232733; border-radius:12px; padding:22px; margin-bottom:18px; }
-  h2 { margin-top:0; font-size:20px; }
-  label { display:block; font-size:13px; color:var(--mut); margin:12px 0 4px; }
-  input { width:100%; padding:10px; border-radius:8px; border:1px solid #2b3140; background:#0d0f14; color:#e6e9ef; }
-  button { background:var(--acc); color:#fff; border:0; padding:10px 18px; border-radius:8px; font-size:14px; cursor:pointer; margin-top:16px; }
-  button.ghost { background:#232733; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .row { display:flex; gap:10px; flex-wrap:wrap; }
-  .check { padding:8px 12px; border-radius:8px; margin:6px 0; background:#0d0f14; border-left:3px solid var(--mut); }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; font-size:15px; line-height:1.55; color:var(--text); min-height:100vh; background:radial-gradient(1100px 560px at 50% -12%, #182033 0%, var(--bg) 62%); }
+  header { padding:16px 28px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; background:rgba(23,26,33,.65); backdrop-filter:blur(8px); position:sticky; top:0; z-index:5; }
+  header .logo { font-size:22px; }
+  header h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.2px; }
+  main { max-width:720px; margin:0 auto; padding:28px 20px 64px; }
+
+  /* Stepper / breadcrumbs */
+  .steps { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:26px; }
+  .step { font-size:12.5px; padding:6px 12px; border-radius:999px; background:var(--panel2); color:var(--mut); border:1px solid var(--line); user-select:none; display:inline-flex; align-items:center; gap:7px; transition:border-color .15s,color .15s,background .15s; }
+  .step .num { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:50%; background:#2a3040; font-size:11px; font-weight:600; }
+  .step.done { color:var(--ok); border-color:#274b3d; }
+  .step.done .num { background:#1f3b30; color:var(--ok); }
+  .step.active { color:#fff; background:var(--acc); border-color:var(--acc); }
+  .step.active .num { background:rgba(255,255,255,.28); color:#fff; }
+  .step.clickable { cursor:pointer; }
+  .step.clickable:hover { border-color:var(--acc); color:#fff; }
+
+  /* Card */
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:24px; margin-bottom:18px; box-shadow:0 10px 30px rgba(0,0,0,.25); }
+  h2 { margin:0 0 6px; font-size:21px; font-weight:650; }
+  h3 { font-size:12px; margin:18px 0 8px; color:var(--mut); text-transform:uppercase; letter-spacing:.6px; }
+
+  /* Forms */
+  label { display:block; font-size:13px; color:var(--mut); margin:14px 0 6px; }
+  .form-control { width:100%; padding:11px 12px; border-radius:var(--radius); border:1px solid #2b3140; background:#0d0f14; color:var(--text); font-size:14px; transition:border-color .15s,box-shadow .15s; }
+  .form-control:focus { outline:none; border-color:var(--acc); box-shadow:0 0 0 3px rgba(77,124,254,.22); }
+
+  /* Buttons */
+  .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; background:var(--acc); color:#fff; border:1px solid transparent; padding:10px 18px; border-radius:var(--radius); font-size:14px; font-weight:550; cursor:pointer; margin-top:16px; transition:background .15s,border-color .15s,opacity .15s; }
+  .btn:hover:not(:disabled) { background:var(--acc-h); }
+  .btn:disabled { opacity:.65; cursor:not-allowed; }
+  .btn-secondary { background:var(--panel2); border-color:var(--line); color:var(--text); }
+  .btn-secondary:hover:not(:disabled) { background:#242a37; }
+  .btn-outline { background:transparent; border-color:#2b3140; color:var(--mut); }
+  .btn-outline:hover:not(:disabled) { background:transparent; border-color:var(--acc); color:#fff; }
+  .btn-sm { padding:7px 12px; font-size:13px; margin:0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+
+  /* Spinner */
+  .spinner { width:15px; height:15px; border:2px solid rgba(255,255,255,.35); border-top-color:#fff; border-radius:50%; display:inline-block; animation:spin .6s linear infinite; }
+  .btn-secondary .spinner, .btn-outline .spinner { border-color:rgba(139,147,167,.35); border-top-color:var(--text); }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* Checks */
+  .check { padding:10px 14px; border-radius:10px; margin:8px 0; background:#0d0f14; border-left:3px solid var(--mut); }
   .check.ok { border-color:var(--ok); }
   .check.bad { border-color:var(--bad); }
   .check .n { font-weight:600; }
   .check .d { color:var(--mut); font-size:13px; }
+
+  /* Misc */
   code, pre { background:#0d0f14; border:1px solid #2b3140; border-radius:8px; }
-  pre { padding:12px; overflow:auto; }
-  code { padding:2px 6px; }
-  .muted { color:var(--mut); font-size:13px; }
-  .svc { display:flex; align-items:center; gap:10px; padding:8px; border-bottom:1px solid #232733; }
-  .err { color:var(--bad); margin-top:10px; min-height:18px; }
-  ol { padding-left:20px; } ol li { margin:6px 0; }
+  pre { padding:14px; overflow:auto; font-size:12.5px; }
+  code { padding:2px 6px; font-size:12.5px; }
+  .muted { color:var(--mut); font-size:13.5px; }
+  .svc { display:flex; align-items:center; gap:10px; padding:10px 4px; border-bottom:1px solid var(--line); }
+  .err { color:var(--bad); margin-top:12px; min-height:18px; font-size:13.5px; }
+  ol { padding-left:20px; } ol li { margin:7px 0; }
   img.qr { background:#fff; padding:8px; border-radius:8px; margin-top:12px; }
-  .pwwrap { position:relative; }
-  .pwwrap input { padding-right:46px; }
-  .eye { position:absolute; right:6px; top:6px; margin:0; padding:6px 9px; background:transparent; font-size:16px; line-height:1; }
-  .eye:hover { background:#232733; }
-  .eye.on { background:#22303f; }
+  .pwwrap { position:relative; display:flex; align-items:center; }
+  .pwwrap .form-control { padding-right:78px; }
+  .pwwrap .btn-reveal { position:absolute; right:6px; top:50%; transform:translateY(-50%); }
 </style>
 </head>
 <body>
-<header><span class="key">🗝️</span><h1>Skeleton Key — First-run setup</h1></header>
+<header><span class="logo">🗝️</span><h1>Skeleton Key — First-run setup</h1></header>
 <main>
   <div class="steps" id="steps"></div>
   <div id="view"></div>
   <div class="err" id="err"></div>
 </main>
 <script>
-const S = { step:0, discovered:[], bearer:null };
+const S = { step:0, max:0, discovered:[], bearer:null };
 const STEP_NAMES = ["Passphrase","Welcome","Vaultwarden","Connect","Verify","Discover","2FA","Claude","Done"];
 const el = (id)=>document.getElementById(id);
 const err = (m)=>{ el("err").textContent = m || ""; };
@@ -68,13 +95,17 @@ async function api(path, body){
   return j;
 }
 function renderSteps(){
-  el("steps").innerHTML = STEP_NAMES.map((n,i)=>
-    '<span class="'+(i===S.step?"active":(i<S.step?"done":""))+'">'+(i+1)+". "+n+'</span>').join("");
+  el("steps").innerHTML = STEP_NAMES.map((n,i)=>{
+    const state = i===S.step ? "active" : (i<=S.max ? "done" : "");
+    const clickable = i<=S.max && i!==S.step; // any reached step can be revisited
+    return '<div class="step '+state+(clickable?" clickable":"")+'"'+(clickable?' onclick="go('+i+')"':'')+
+      ' title="'+(clickable?"Go to "+n:n)+'"><span class="num">'+(i+1)+'</span>'+n+'</div>';
+  }).join("");
 }
 function checksHtml(checks){
   return checks.map(c=>'<div class="check '+(c.passed?"ok":"bad")+'"><div class="n">'+(c.passed?"✓":"✗")+" "+c.name+'</div><div class="d">'+c.detail+'</div></div>').join("");
 }
-function go(n){ S.step=n; render(); }
+function go(n){ S.step=n; if(n>S.max) S.max=n; render(); }
 
 const views = {
   0: async ()=>{
@@ -86,7 +117,7 @@ const views = {
     }
     if(st.storeExists && !st.storeLocked){ go(1); return ""; }
     return card("Choose a master passphrase",
-      '<p class="muted">This passphrase encrypts Skeleton Key\\'s own secrets at rest and is your admin login. Minimum 8 characters. There is no recovery — store it safely. Use the eye to reveal what you typed before confirming.</p>'+
+      '<p class="muted">This passphrase encrypts Skeleton Key\\'s own secrets at rest and is your admin login. Minimum 8 characters. There is no recovery — store it safely. Use <b>Show</b> to reveal what you typed before confirming.</p>'+
       pwField("passphrase","Master passphrase")+
       pwField("passphrase2","Confirm master passphrase")+
       btn("Create", async()=>{ const p=val("passphrase"), c=val("passphrase2"); if(p.length<8){err("Passphrase must be at least 8 characters.");return;} if(p!==c){err("Passphrases do not match.");return;} await api("/store/init",{passphrase:p}); go(1); }));
@@ -136,7 +167,7 @@ const views = {
     btn("Scan my network", async()=>{ err("Scanning…"); const r=await api("/setup/discover",{}); S.discovered=r.services; err(""); render(); })+
     (S.discovered.length? '<h3>Detected</h3>'+S.discovered.map((s,i)=>
       '<div class="svc"><code>'+s.host+':'+s.port+'</code> — '+s.label+
-      ' <button class="ghost" onclick="addSvc('+i+')">Register</button></div>').join(""):"")+
+      ' <button class="btn btn-secondary btn-sm" onclick="addSvc('+i+')">Register</button></div>').join(""):"")+
     '<h3>Add manually</h3>'+
     field("t_name","Name","text","asura1")+field("t_type","Type","text","ssh")+
     field("t_host","Host","text","192.168.0.x")+field("t_port","Port","text","22")+
@@ -173,10 +204,24 @@ const views = {
 };
 
 function card(title, inner){ return '<div class="card"><h2>'+title+'</h2>'+inner+'</div>'; }
-function field(id,label,type,ph){ return '<label>'+label+'</label><input id="'+id+'" type="'+(type||"text")+'" placeholder="'+(ph||"")+'"/>'; }
-function pwField(id,label,ph){ return '<label>'+label+'</label><div class="pwwrap"><input id="'+id+'" type="password" placeholder="'+(ph||"")+'"/><button type="button" class="eye" onclick="togglePw(\\''+id+'\\',this)" aria-label="Show or hide">👁</button></div>'; }
-window.togglePw=(id,b)=>{ const i=el(id); if(!i)return; const show=i.type==="password"; i.type=show?"text":"password"; b.textContent=show?"🙈":"👁"; b.classList.toggle("on",show); };
-function btn(label,fn,cls){ const id="b"+Math.random().toString(36).slice(2); setTimeout(()=>{const b=el(id); if(b)b.onclick=()=>{err("");fn().catch?fn().catch(e=>err(e.message)):fn();};},0); return '<button id="'+id+'" class="'+(cls||"")+'">'+label+'</button>'; }
+function field(id,label,type,ph){ return '<label>'+label+'</label><input id="'+id+'" class="form-control" type="'+(type||"text")+'" placeholder="'+(ph||"")+'"/>'; }
+function pwField(id,label,ph){ return '<label>'+label+'</label><div class="pwwrap"><input id="'+id+'" class="form-control" type="password" placeholder="'+(ph||"")+'"/><button type="button" class="btn btn-outline btn-sm btn-reveal" onclick="togglePw(\\''+id+'\\',this)">Show</button></div>'; }
+window.togglePw=(id,b)=>{ const i=el(id); if(!i)return; const show=i.type==="password"; i.type=show?"text":"password"; b.textContent=show?"Hide":"Show"; };
+// Async-aware button: shows a spinner + "Working…" and disables itself while the
+// handler runs, so slow actions (argon2 unlock, vault auth) never look frozen.
+function btn(label,fn,cls){
+  const id="b"+Math.random().toString(36).slice(2);
+  const klass="btn "+(cls==="ghost"?"btn-secondary":(cls||"btn-primary"));
+  setTimeout(()=>{ const b=el(id); if(!b) return; b.onclick=async()=>{
+    if(b.dataset.busy) return;
+    err(""); b.dataset.busy="1"; b.disabled=true;
+    const orig=b.innerHTML; b.innerHTML='<span class="spinner"></span> Working…';
+    try { await fn(); }
+    catch(e){ err((e&&e.message)||String(e)); }
+    finally { if(document.body.contains(b)){ b.disabled=false; b.innerHTML=orig; b.removeAttribute("data-busy"); } }
+  };},0);
+  return '<button id="'+id+'" class="'+klass+'">'+label+'</button>';
+}
 const val = (id)=> (el(id)?.value||"").trim();
 async function registerTarget(t){ try{ await api("/targets",t); await refreshTargets(); }catch(e){ err(e.message); } }
 window.addSvc = async (i)=>{ const s=S.discovered[i]; const name=prompt("Name for "+s.host+":", s.host.replace(/\\./g,"-")); if(!name)return; const cred=prompt("Vault item name for credentials (blank if none):")||undefined; await registerTarget({name,type:s.connectorType,host:s.host,port:s.port,credentialRef:cred}); };
