@@ -42,6 +42,11 @@ export const WIZARD_HTML = /* html */ `<!doctype html>
   .err { color:var(--bad); margin-top:10px; min-height:18px; }
   ol { padding-left:20px; } ol li { margin:6px 0; }
   img.qr { background:#fff; padding:8px; border-radius:8px; margin-top:12px; }
+  .pwwrap { position:relative; }
+  .pwwrap input { padding-right:46px; }
+  .eye { position:absolute; right:6px; top:6px; margin:0; padding:6px 9px; background:transparent; font-size:16px; line-height:1; }
+  .eye:hover { background:#232733; }
+  .eye.on { background:#22303f; }
 </style>
 </head>
 <body>
@@ -76,14 +81,15 @@ const views = {
     const st = await api("/status");
     if(st.storeExists && st.storeLocked){
       return card("Unlock", '<p class="muted">A configuration already exists. Enter your master passphrase to unlock it.</p>'+
-        field("passphrase","Master passphrase","password")+
+        pwField("passphrase","Master passphrase")+
         btn("Unlock", async()=>{ await api("/store/unlock",{passphrase:val("passphrase")}); go(1); }));
     }
     if(st.storeExists && !st.storeLocked){ go(1); return ""; }
     return card("Choose a master passphrase",
-      '<p class="muted">This passphrase encrypts Skeleton Key\\'s own secrets at rest and is your admin login. Minimum 8 characters. There is no recovery — store it safely.</p>'+
-      field("passphrase","Master passphrase","password")+
-      btn("Create", async()=>{ const p=val("passphrase"); if(p.length<8){err("At least 8 characters.");return;} await api("/store/init",{passphrase:p}); go(1); }));
+      '<p class="muted">This passphrase encrypts Skeleton Key\\'s own secrets at rest and is your admin login. Minimum 8 characters. There is no recovery — store it safely. Use the eye to reveal what you typed before confirming.</p>'+
+      pwField("passphrase","Master passphrase")+
+      pwField("passphrase2","Confirm master passphrase")+
+      btn("Create", async()=>{ const p=val("passphrase"), c=val("passphrase2"); if(p.length<8){err("Passphrase must be at least 8 characters.");return;} if(p!==c){err("Passphrases do not match.");return;} await api("/store/init",{passphrase:p}); go(1); }));
   },
   1: async ()=> card("Welcome — how Skeleton Key stays safe",
     '<p>Skeleton Key lets Claude read logs and (with your approval) act across your homelab.</p>'+
@@ -104,8 +110,8 @@ const views = {
     field("serverUrl","Vaultwarden internal URL (LAN)","text","http://192.168.0.x:port")+
     field("collectionName","Collection name (optional)","text","Homelab")+
     field("clientId","API key client_id","text")+
-    field("clientSecret","API key client_secret","password")+
-    field("masterPassword","Service account master password","password")+
+    pwField("clientSecret","API key client_secret")+
+    pwField("masterPassword","Service account master password")+
     btn("Connect &amp; verify", async()=>{
       const checks = (await api("/setup/vault",{
         serverUrl:val("serverUrl"), collectionName:val("collectionName")||undefined,
@@ -164,6 +170,8 @@ const views = {
 
 function card(title, inner){ return '<div class="card"><h2>'+title+'</h2>'+inner+'</div>'; }
 function field(id,label,type,ph){ return '<label>'+label+'</label><input id="'+id+'" type="'+(type||"text")+'" placeholder="'+(ph||"")+'"/>'; }
+function pwField(id,label,ph){ return '<label>'+label+'</label><div class="pwwrap"><input id="'+id+'" type="password" placeholder="'+(ph||"")+'"/><button type="button" class="eye" onclick="togglePw(\\''+id+'\\',this)" aria-label="Show or hide">👁</button></div>'; }
+window.togglePw=(id,b)=>{ const i=el(id); if(!i)return; const show=i.type==="password"; i.type=show?"text":"password"; b.textContent=show?"🙈":"👁"; b.classList.toggle("on",show); };
 function btn(label,fn,cls){ const id="b"+Math.random().toString(36).slice(2); setTimeout(()=>{const b=el(id); if(b)b.onclick=()=>{err("");fn().catch?fn().catch(e=>err(e.message)):fn();};},0); return '<button id="'+id+'" class="'+(cls||"")+'">'+label+'</button>'; }
 const val = (id)=> (el(id)?.value||"").trim();
 async function registerTarget(t){ try{ await api("/targets",t); await refreshTargets(); }catch(e){ err(e.message); } }
