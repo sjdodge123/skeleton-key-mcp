@@ -62,14 +62,36 @@ describe("OAuthService", () => {
     expect(() => svc.redeemAuthCode({ code, client_id: "someone-else", redirect_uri: REDIRECT, code_verifier: verifier })).toThrow(/client mismatch/i);
   });
 
-  it("issues a new access token on refresh, and blocks a client mismatch", () => {
+  it("rotates the refresh token on use and rejects the old one", () => {
     const client = register();
     const { verifier, challenge } = pkce();
     const code = svc.createAuthCode({ client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, scope: "mcp" });
     const first = svc.redeemAuthCode({ code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
-    const refreshed = svc.refresh(first.refresh_token, client.client_id);
+    const refreshed = svc.refresh(first.refresh_token); // client_id optional
     expect(svc.validateAccessToken(refreshed.access_token)).toBeTruthy();
+    expect(refreshed.refresh_token).not.toBe(first.refresh_token);
+    // The presented (now rotated-out) refresh token must no longer work.
+    expect(() => svc.refresh(first.refresh_token)).toThrow(/unknown refresh token/i);
+  });
+
+  it("rejects a refresh with a mismatched client_id but allows omitting it", () => {
+    const client = register();
+    const { verifier, challenge } = pkce();
+    const code = svc.createAuthCode({ client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, scope: "mcp" });
+    const first = svc.redeemAuthCode({ code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
     expect(() => svc.refresh(first.refresh_token, "other-client")).toThrow(/client mismatch/i);
+    // The token wasn't rotated (the mismatch threw before deletion), so omitting client_id still works.
+    expect(svc.refresh(first.refresh_token).access_token).toBeTruthy();
+  });
+
+  it("revokes an individual access token (RFC 7009)", () => {
+    const client = register();
+    const { verifier, challenge } = pkce();
+    const code = svc.createAuthCode({ client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, scope: "mcp" });
+    const tokens = svc.redeemAuthCode({ code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier });
+    expect(svc.validateAccessToken(tokens.access_token)).toBeTruthy();
+    expect(svc.revokeToken(tokens.access_token)).toBe(true);
+    expect(svc.validateAccessToken(tokens.access_token)).toBeNull();
   });
 
   it("invalidates all tokens when a client is revoked", () => {

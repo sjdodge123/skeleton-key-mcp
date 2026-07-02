@@ -60,9 +60,7 @@ export class SetupService {
   }
 
   verifyTotp(token: string): boolean {
-    const secret = this.app.store.get().totpSecret;
-    if (!secret) return false;
-    return authenticator.verify({ token, secret });
+    return this.app.verifyTotp(token);
   }
 
   /** Step: generate (or rotate) the MCP bearer token clients must present. */

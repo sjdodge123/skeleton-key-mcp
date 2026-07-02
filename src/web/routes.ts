@@ -1,6 +1,5 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { authenticator } from "otplib";
 import type { AppState } from "../app.js";
 import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
@@ -228,8 +227,7 @@ export function buildApiRouter(app: AppState): Router {
     "/oauth/clients/:id/revoke",
     h(async (req, res) => {
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body);
-      const secret = app.store.locked ? undefined : app.store.get().totpSecret;
-      if (!secret || !authenticator.verify({ token: totp.trim(), secret })) {
+      if (!app.verifyTotp(totp)) {
         res.status(403).json({ error: "Invalid authenticator code." });
         return;
       }

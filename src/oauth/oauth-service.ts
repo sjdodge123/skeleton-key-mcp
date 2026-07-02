@@ -154,15 +154,28 @@ export class OAuthService {
     return { access_token: access, refresh_token: refresh, expires_in: ACCESS_TTL_S, scope };
   }
 
-  /** Refresh grant: rotate the access token (refresh token stays valid). */
-  refresh(refreshToken: string, clientId: string): { access_token: string; refresh_token: string; expires_in: number; scope: string } {
-    const row = this.db.prepare(`SELECT * FROM tokens WHERE token_hash = ? AND type = 'refresh'`).get(sha256(refreshToken)) as
+  /**
+   * Refresh grant with rotation: the presented refresh token is invalidated and a
+   * new access+refresh pair is issued, so a leaked refresh token stops working the
+   * moment the legitimate client next refreshes. `clientId` is optional (OAuth 2.1
+   * public clients may omit it on refresh); if supplied it must match.
+   */
+  refresh(refreshToken: string, clientId?: string): { access_token: string; refresh_token: string; expires_in: number; scope: string } {
+    const hash = sha256(refreshToken);
+    const row = this.db.prepare(`SELECT * FROM tokens WHERE token_hash = ? AND type = 'refresh'`).get(hash) as
       | { client_id: string; scope: string; expires_at: number }
       | undefined;
     if (!row) throw new Error("invalid_grant: unknown refresh token");
     if (row.expires_at < nowS()) throw new Error("invalid_grant: refresh token expired");
-    if (row.client_id !== clientId) throw new Error("invalid_grant: client mismatch");
-    return this.issueTokens(clientId, row.scope);
+    if (clientId && row.client_id !== clientId) throw new Error("invalid_grant: client mismatch");
+    // Rotate: burn the presented refresh token before issuing the new pair.
+    this.db.prepare(`DELETE FROM tokens WHERE token_hash = ?`).run(hash);
+    return this.issueTokens(row.client_id, row.scope);
+  }
+
+  /** Revoke a single access or refresh token (RFC 7009). */
+  revokeToken(t: string): boolean {
+    return this.db.prepare(`DELETE FROM tokens WHERE token_hash = ?`).run(sha256(t)).changes > 0;
   }
 
   /** Validate a bearer access token; returns null if invalid/expired. */

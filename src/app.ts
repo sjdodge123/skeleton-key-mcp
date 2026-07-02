@@ -4,6 +4,7 @@ import { VaultwardenClient } from "./secrets/vaultwarden.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
+import { authenticator } from "otplib";
 import { paths } from "./config/paths.js";
 
 /**
@@ -38,6 +39,16 @@ export class AppState {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Single source of truth for admin TOTP verification. Fails closed if the
+   * store is locked (no secret available). Used by every 2FA-gated action.
+   */
+  verifyTotp(token: string): boolean {
+    const secret = this.store.locked ? undefined : this.store.get().totpSecret;
+    if (!secret || !token) return false;
+    return authenticator.verify({ token: token.trim(), secret });
   }
 
   /** Resolve a target's credential from the vault (offline-cache backed). */
