@@ -66,11 +66,11 @@ Claude (Code / Desktop / mobile via LAN)
 
 **Why it works:** in the Bitwarden/Vaultwarden model, the personal vault is encrypted with the user's *user key*; each **Organization** has its own separate symmetric key, handed only to that org's members. A service account that belongs *only* to a homelab org never receives the personal user key, so it cannot decrypt personal items — this is a cryptographic boundary, not just an ACL.
 
-**Setup:**
-1. Create a dedicated Vaultwarden **Organization** ("Skeleton Key" / "Homelab").
-2. One **Collection** in it holding *only* local infra credentials (Synology, Proxmox, UniFi, HA token, Portainer, Pi-hole, SSH keys, etc.).
-3. A dedicated **service-account org member** whose only membership is that org/collection, with its own strong master password (distinct from the user's personal login) + its own **API key** (`client_id`/`client_secret`).
-4. Skeleton Key authenticates non-interactively via the `bw` CLI / org API as that service account.
+**Setup (service account creates its own org — avoids invites/SMTP):**
+1. Create a dedicated Vaultwarden **user account** for Skeleton Key (empty personal vault). With sign-ups disabled, invite it from the `/admin` page (needs `ADMIN_TOKEN`); without SMTP the invited email self-registers at `/#/signup`.
+2. **Log in as that account** and create an **Organization** "Skeleton Key" (Vaults page → FILTERS → *New organization*, Free plan) — the account becomes the org owner, so no cross-user invite/confirmation is needed.
+3. Add one **Collection** ("Homelab") holding *only* local infra credentials (Synology, Proxmox, UniFi, HA token, Portainer, Pi-hole, SSH keys, etc.).
+4. Generate the account's **API key** (Settings → Security → Keys → View API Key). Skeleton Key authenticates non-interactively via the `bw` CLI as this account. Because it owns only this org and holds no personal data, it cannot decrypt the real user's personal vault.
 
 **Result:** worst case (full host compromise) exposes only homelab creds — which an attacker on the box already reaches — never personal passwords.
 
