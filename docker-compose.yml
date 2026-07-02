@@ -12,9 +12,14 @@ services:
     restart: unless-stopped
     ports:
       # Bind to a specific LAN interface address, not 0.0.0.0, so it is never
-      # exposed beyond your local network. Replace 192.168.0.229 with this host's
+      # exposed beyond your local network. Replace 192.168.1.10 with this host's
       # LAN IP.
-      - "192.168.0.229:8787:8787"
+      - "192.168.1.10:8787:8787"
+    # Optional: use host networking instead of the port mapping above if you want
+    # the built-in LAN service discovery to scan your real subnet directly. On a
+    # bridged network (the default) the container only sees Docker's internal
+    # network, so either use host networking or type your subnet into the scan.
+    # network_mode: host
     environment:
       SKELETON_KEY_PORT: "8787"
       SKELETON_KEY_BIND_HOST: "0.0.0.0" # inside the container; the port map above scopes it to the LAN

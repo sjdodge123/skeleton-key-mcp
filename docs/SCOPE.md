@@ -15,28 +15,25 @@
 | 2FA | TOTP on the admin web UI; scoped service account has its own credentials + API key |
 | v1 execute targets | Portainer (Docker), SSH, Home Assistant, Proxmox VMs/LXC |
 
-## Homelab inventory (from user's Homepage dashboard, 2026-07-02)
+## Supported service types (examples — users register their own)
 
-Base dashboard: Homepage at `192.168.0.229:3000`. LAN is `192.168.0.0/24`.
-_User noted not every entry is accurate — confirm hostnames/IPs before wiring each connector._
+Skeleton Key ships with no hard-coded hosts. The table below is the roadmap of
+service *types* the connectors target; a deployment registers whatever exists on
+its own network, and anything else is reachable via the generic `ssh` / `http`
+connectors.
 
-| Service | Kind | Connector | Notes |
+| Service type | Kind | Connector | Notes |
 |---|---|---|---|
-| Asura 1 / Asura 2 | Synology DiskStation (×2) | synology + ssh | Multi-target — connector must handle multiple DSM hosts |
-| TorrentBox | Synology VirtualDSM | synology | VM'd DSM |
-| Pi-hole (admin + 4.14.24) | DNS sinkhole (RPi) | pihole + ssh | Directly relevant to network troubleshooting |
-| UniFi Cloud Gateway Ultra | UniFi OS gateway | unifi | **UniFi OS device** — cookie/CSRF auth, not self-hosted controller login |
-| ATT Router | ISP gateway | (documented target) | Consumer AT&T gear; little/no API — read-only scrape at best |
-| Home Assistant | Home automation | home-assistant | Long-lived token; confirm HAOS vs container |
-| Vaultwarden | Password manager | **secrets source** | See secrets model — not a target, it's where creds come from |
-| Portainer | Docker management | portainer | Headline request: spin up containers on the NAS |
-| Proxmox VE (pve) | Hypervisor | proxmox | VMs + LXC; strong REST API |
-| NPMplus | Nginx Proxy Manager | npm (later) | Reverse proxy config, has API |
-| Plex / Plex-Gameserver | Media server | app (later) | |
-| SABnzbd / Radarr / Sonarr / Overseerr / Tautulli | *arr media stack | app (later) | All have REST APIs; low priority |
-| Synology Surveillance Station | NVR | synology (later) | |
-| Uptime Kuma | Uptime monitoring | app (later) | Read status/incidents |
-| Pelican / rl-infra fleet / CC Watcher / GPTWOL | Misc dashboards / WOL | later | GPTWOL = wake-on-LAN |
+| Synology DiskStation | NAS (may be multiple, incl. VirtualDSM) | synology + ssh | Multi-target — connector must handle several DSM hosts |
+| Pi-hole | DNS sinkhole | pihole + ssh | Relevant to network troubleshooting |
+| UniFi (UDM / Cloud Gateway family) | Network gateway | unifi | UniFi OS device — cookie/CSRF auth, not a self-hosted controller login |
+| Consumer ISP router | ISP gateway | (documented target) | Often little/no API — read-only at best |
+| Home Assistant | Home automation | home-assistant | Long-lived token; HAOS vs container affects config edits |
+| Vaultwarden | Password manager | **secrets source** | Not a target — it's where credentials come from (see secrets model) |
+| Portainer | Docker management | portainer | Spin up / manage containers — headline feature |
+| Proxmox VE | Hypervisor | proxmox | VMs + LXC; strong REST API |
+| Nginx Proxy Manager | Reverse proxy | http (later) | Config via API |
+| Media / monitoring stack (Plex, *arr, Uptime Kuma, …) | Apps | http (later) | All have REST APIs; low priority |
 
 ## Architecture
 

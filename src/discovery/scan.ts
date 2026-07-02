@@ -36,6 +36,24 @@ export interface DiscoveredService {
   label: string;
 }
 
+/**
+ * Is `prefix` (a "a.b.c" /24 prefix) inside an RFC1918 private range? Used to
+ * gate scanning: a user may point the scan at their real LAN subnet even when
+ * the container itself is on Docker's bridge network, but we never scan public
+ * IP space.
+ */
+export function isPrivateSubnet(prefix: string): boolean {
+  const parts = prefix.split(".");
+  if (parts.length !== 3) return false;
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const [a, b] = nums as [number, number, number];
+  if (a === 10) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  return false;
+}
+
 /** Enumerate local IPv4 /24 subnets from the host's own interfaces. */
 export function localSubnets(): string[] {
   const subnets = new Set<string>();
@@ -84,8 +102,12 @@ export interface ScanOptions {
  * scan anything that isn't one of the host's own private subnets.
  */
 export async function scanLan(opts: ScanOptions = {}): Promise<DiscoveredService[]> {
+  // Honor a user-supplied subnet (e.g. their real LAN "192.168.0") even if the
+  // container itself is bridged and only sees Docker's network; fall back to the
+  // host's own interfaces. Either way, restrict to private ranges.
   const detected = localSubnets();
-  const subnets = (opts.subnets ?? detected).filter((s) => detected.includes(s));
+  const requested = opts.subnets && opts.subnets.length > 0 ? opts.subnets : detected;
+  const subnets = requested.filter(isPrivateSubnet);
   if (subnets.length === 0) return [];
 
   const start = opts.start ?? 1;

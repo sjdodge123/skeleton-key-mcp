@@ -46,7 +46,8 @@ All configuration is optional — the defaults work for a standard container dep
 
 | Setting | Example | Why it matters |
 |---|---|---|
-| **Port mapping** | `"192.168.0.229:8787:8787"` | **This is your security boundary.** Bind to the NAS's specific **LAN IP**, not `0.0.0.0` or `8787:8787`, so the service is never reachable from the WAN. Format is `HOST_IP:HOST_PORT:CONTAINER_PORT`. Never put this behind an internet-facing reverse proxy. |
+| **Port mapping** | `"192.168.1.10:8787:8787"` | **This is your security boundary.** Bind to the NAS's specific **LAN IP**, not `0.0.0.0` or `8787:8787`, so the service is never reachable from the WAN. Format is `HOST_IP:HOST_PORT:CONTAINER_PORT`. Never put this behind an internet-facing reverse proxy. |
+| **Networking** | bridge (default) or `network_mode: host` | On the default bridge network the container only sees Docker's internal subnet, so built-in **LAN discovery** can't enumerate your real network — type your subnet (e.g. `192.168.0`) into the scan, or use `network_mode: host` for full discovery. Reaching already-registered targets works either way. |
 | **Volume** | `skeleton-key-data:/data` | Persists everything in `SKELETON_KEY_DATA_DIR` across restarts and image updates. Without it you'd re-run the wizard every restart. Use a named volume or a host bind mount you back up. |
 | **`image` vs `build`** | `image: ghcr.io/sjdodge123/skeleton-key-mcp:latest` | On the NAS, pull the CI-built image. Use `build: .` only when developing from a source checkout. |
 | **`restart`** | `unless-stopped` | Brings Skeleton Key back after a NAS reboot. Pair with `SKELETON_KEY_PASSPHRASE` for hands-off recovery, or unlock via the UI. |
@@ -61,7 +62,7 @@ services:
     container_name: skeleton-key
     restart: unless-stopped
     ports:
-      - "192.168.0.229:8787:8787"   # your NAS's LAN IP
+      - "192.168.1.10:8787:8787"   # your NAS's LAN IP
     environment:
       SKELETON_KEY_PORT: "8787"
       SKELETON_KEY_BIND_HOST: "0.0.0.0"
