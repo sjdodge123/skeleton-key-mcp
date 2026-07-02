@@ -12,7 +12,7 @@ export type ToolTier = "read" | "execute";
 
 /** A registered service instance the user wants Skeleton Key to reach. */
 export interface Target {
-  /** Stable, user-facing name, unique across the registry (e.g. "asura1"). */
+  /** Stable, user-facing name, unique across the registry (e.g. "nas1"). */
   name: string;
   /** Connector type this target is served by (e.g. "ssh", "http"). */
   type: string;

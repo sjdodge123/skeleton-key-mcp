@@ -174,14 +174,16 @@ const views = {
       btn("Continue", ()=>go(5))+'</div>');
   },
   5: async ()=> card("Discover &amp; register services",
-    '<p class="muted">Optional: scan your LAN for known services. You confirm each before it\\'s registered — nothing connects automatically.</p>'+
-    btn("Scan my network", async()=>{ err("Scanning…"); const r=await api("/setup/discover",{}); S.discovered=r.services; err(""); render(); })+
+    '<p class="muted">Optional: scan for known services. You confirm each before it\\'s registered — nothing connects automatically.</p>'+
+    '<p class="muted"><b>Running in a bridged Docker container?</b> It only sees Docker\\'s internal network (e.g. <code>172.x</code>), not your LAN. Enter your real subnet below (the first three octets, e.g. <code>192.168.0</code>) to scan it, or leave blank to auto-detect.</p>'+
+    field("scan_subnet","Subnet to scan (optional)","text","192.168.0")+
+    btn("Scan network", async()=>{ const sn=val("scan_subnet"); err("Scanning…"); const r=await api("/setup/discover", sn?{subnets:[sn]}:{}); S.discovered=r.services; err(r.services.length?"":"No services found on that subnet. Try Add manually below."); render(); })+
     (S.discovered.length? '<h3>Detected</h3>'+S.discovered.map((s,i)=>
       '<div class="svc"><code>'+s.host+':'+s.port+'</code> — '+s.label+
       ' <button class="btn btn-secondary btn-sm" onclick="addSvc('+i+')">Register</button></div>').join(""):"")+
     '<h3>Add manually</h3>'+
-    field("t_name","Name","text","asura1")+field("t_type","Type","text","ssh")+
-    field("t_host","Host","text","192.168.0.x")+field("t_port","Port","text","22")+
+    field("t_name","Name","text","nas1")+field("t_type","Type","text","ssh")+
+    field("t_host","Host","text","192.168.1.50")+field("t_port","Port","text","22")+
     field("t_cred","Vault item name (credentialRef)","text")+
     btn("Add target", async()=>{ await registerTarget({name:val("t_name"),type:val("t_type"),host:val("t_host"),port:Number(val("t_port"))||undefined,credentialRef:val("t_cred")||undefined}); })+
     '<div id="tlist"></div>'+

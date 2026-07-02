@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**Skeleton Key MCP** — an MCP server (TypeScript/Node) that gives Claude full, audited access to a homelab: read logs on any server, execute changes with approval, manage UniFi networking, Home Assistant, Synology NAS (×2), Proxmox, Pi-hole, and Docker containers via Portainer. Credentials come from a **scoped Vaultwarden collection**; a LAN-only admin web UI manages targets. This is greenfield — see `docs/SCOPE.md` for the full architecture, homelab inventory, and decisions before building anything.
+**Skeleton Key MCP** — an MCP server (TypeScript/Node) that gives Claude full, audited access to a homelab: read logs on any server, execute changes with approval, and manage common services (SSH hosts, Synology, UniFi, Home Assistant, Proxmox, Pi-hole, Docker via Portainer). Credentials come from a **scoped Vaultwarden collection**; a LAN-only admin web UI manages targets. It's a framework — users register their own targets; nothing is hard-coded. See `docs/SCOPE.md` for the full architecture and roadmap.
 
 **This project holds the "keys to the city."** Treat every design choice through a security lens: the whole point is broad infrastructure access, so the guardrails (encryption, 2FA, approval gate, audit log, LAN-only) are load-bearing, not optional polish.
 
@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Transport:** Streamable HTTP with a static bearer token (server runs as a Docker container on the NAS, so stdio won't reach it). Not stdio.
 - **Secrets:** **Scoped Vaultwarden + offline cache.** Infra credentials live in a dedicated Vaultwarden Organization/Collection accessed by a service account that is a member of *only* that org. Because org keys are separate from the personal user key, this account is **cryptographically unable** to decrypt the user's personal passwords — do not weaken this (e.g. never log in as the user's personal Vaultwarden account, never widen the service account's collections). Reads come from the `bw` CLI's **local encrypted offline cache**, so an outage of the Vaultwarden server does not lock Skeleton Key out (degrades to last-known-good creds); the server is only contacted to sync. A small **local libsodium-encrypted bootstrap store** holds only Skeleton Key's own secrets (the Vaultwarden service-account API key, the MCP bearer token, the TOTP seed). No plaintext `.env` for credentials — a `.env` may hold only non-secret config.
 - **2FA:** TOTP (otplib) gates the admin web UI. The scoped service account has its own credentials distinct from the user's personal login.
-- **Exposure:** LAN only, always (`192.168.0.0/24`). No internet-facing reverse proxy, no tunnels. Remote access = VPN into the LAN.
+- **Exposure:** LAN only, always. No internet-facing reverse proxy, no tunnels. Remote access = VPN into the LAN.
 
 ## Architecture in one breath
 
@@ -52,11 +52,14 @@ Config comes from env (see `src/config/paths.ts`): `SKELETON_KEY_DATA_DIR` (runt
 - **Secrets never hit the registry:** `targets.yaml` stores only a `credentialRef` (a Vaultwarden item name); the actual credential is fetched in-memory at call time via `AppState.credentialFor`.
 - **Setup gating:** the MCP endpoint returns 503 until `data/setup-complete.json` exists AND the store+vault are unlocked (`src/web/auth.ts`). Setup-mutating API routes fail closed once setup is complete.
 
-## Environment specifics
+## Connector notes (service types, not a specific deployment)
 
-- **LAN:** `192.168.0.0/24`; Homepage dashboard at `192.168.0.229:3000` lists the targets (some entries may be stale — confirm before wiring).
-- **NAS:** two Synology DiskStations ("Asura 1/2") plus a VirtualDSM ("TorrentBox"); Portainer already installed for container management. Synology connector must be multi-host.
-- **Network:** UniFi **Cloud Gateway Ultra** — a UniFi OS device, so the connector uses the UniFi OS API (cookie/CSRF), not a self-hosted controller login. Upstream **AT&T router** has little/no API (read-only at best).
-- **Hypervisor:** Proxmox VE — prefer API-token auth; confirm host IP.
-- **Home Assistant:** confirm HAOS vs container install before the HA connector; it decides whether config edits go over SSH or the Supervisor API.
-- **Pi-hole:** DNS sinkhole on a Raspberry Pi — relevant to network troubleshooting.
+These are portability considerations for the planned connectors — Skeleton Key ships with no hard-coded hosts; users register their own targets.
+
+- **Synology DSM:** the connector must be multi-host (a user may run several DiskStations, incl. VirtualDSM). DSM Web API.
+- **UniFi:** UniFi OS devices (UDM/Cloud Gateway family) use the UniFi OS API (cookie/CSRF), not a self-hosted controller login — detect which the user has.
+- **Proxmox VE:** prefer API-token auth over user/password.
+- **Home Assistant:** HAOS vs container install decides whether config edits go over SSH or the Supervisor API; the REST API + long-lived token covers states/services/logs either way.
+- **Pi-hole / DNS:** relevant to network troubleshooting; Pi-hole API for stats/blocklists.
+- **Consumer ISP routers:** often little/no API — treat as read-only/documented targets at best.
+- **Discovery/networking:** on a bridged container the LAN scan only sees Docker's subnet; users provide their real subnet to the scan or run with host networking (see `src/discovery/scan.ts`).

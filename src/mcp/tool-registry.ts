@@ -3,7 +3,7 @@ import type { ConnectorTool, Target } from "../connectors/types.js";
 import { getConnector } from "../connectors/index.js";
 
 export interface ResolvedTool {
-  /** Fully-qualified, target-namespaced name, e.g. "ssh.asura1.tail_log". */
+  /** Fully-qualified, target-namespaced name, e.g. "ssh.nas1.tail_log". */
   qualifiedName: string;
   target: Target;
   tool: ConnectorTool;
