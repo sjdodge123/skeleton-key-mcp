@@ -202,13 +202,20 @@ const views = {
       }));
   },
   7: async ()=>{
+    const url = location.protocol+"//"+location.host+"/mcp";
+    // Ensure a bearer token exists so setup can complete (used as a fallback path).
     const t = (await api("/setup/token",{})).token;
     S.bearer = t;
-    const url = location.protocol+"//"+location.host+"/mcp";
-    const snippet = JSON.stringify({ mcpServers: { "skeleton-key": { type:"http", url, headers:{ Authorization:"Bearer "+t } } } }, null, 2);
+    const cmd = 'claude mcp add --transport http skeleton-key '+url;
+    const snippet = JSON.stringify({ mcpServers: { "skeleton-key": { type:"http", url } } }, null, 2);
     return card("Connect Claude",
-      '<p class="muted">Add this to your Claude Code / Desktop MCP config. This bearer token is shown once.</p>'+
-      '<pre>'+snippet.replace(/</g,"&lt;")+'</pre>'+
+      '<p class="muted">Skeleton Key uses <b>OAuth</b> — no token to copy. Add the server, and the first time Claude connects it opens a browser page here asking you to approve the agent with your authenticator code.</p>'+
+      '<h3>Claude Code</h3><pre>'+cmd.replace(/</g,"&lt;")+'</pre>'+
+      '<h3>Claude Desktop (config)</h3><pre>'+snippet.replace(/</g,"&lt;")+'</pre>'+
+      '<p class="muted">On first use you will see an <b>Authorize an AI agent</b> page — enter your 6-digit code to approve. You can revoke access anytime from the admin console. Tokens are short-lived and refresh automatically.</p>'+
+      '<details><summary class="muted">Advanced: static bearer token (fallback)</summary>'+
+      '<p class="muted">If your client does not support OAuth, use a bearer header instead:</p>'+
+      '<pre>Authorization: Bearer '+t.replace(/</g,"&lt;")+'</pre></details>'+
       btn("Finish setup", async()=>{ await api("/setup/complete",{}); go(8); }));
   },
   8: async ()=> card("You're all set 🗝️",

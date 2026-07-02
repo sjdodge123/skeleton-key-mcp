@@ -3,6 +3,7 @@ import { BootstrapStore } from "./secrets/bootstrap-store.js";
 import { VaultwardenClient } from "./secrets/vaultwarden.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
+import { OAuthService } from "./oauth/oauth-service.js";
 import { paths } from "./config/paths.js";
 
 /**
@@ -16,6 +17,7 @@ export class AppState {
     readonly vault: VaultwardenClient,
     readonly registry: TargetRegistry,
     readonly audit: AuditLog,
+    readonly oauth: OAuthService,
   ) {}
 
   static async create(): Promise<AppState> {
@@ -23,7 +25,8 @@ export class AppState {
     const vault = new VaultwardenClient();
     const registry = await TargetRegistry.load();
     const audit = new AuditLog();
-    return new AppState(store, vault, registry, audit);
+    const oauth = new OAuthService();
+    return new AppState(store, vault, registry, audit, oauth);
   }
 
   /** True once the first-run wizard has completed. Until then the MCP endpoint

@@ -51,6 +51,7 @@ Config comes from env (see `src/config/paths.ts`): `SKELETON_KEY_DATA_DIR` (runt
 - **Adding a connector:** implement the `Connector` interface in `src/connectors/types.ts`, register it in `src/connectors/index.ts`. Tools are composed dynamically per registered target in `src/mcp/tool-registry.ts` (`resolveTools`) and namespaced `${type}.${name}.${tool}`. There is no static tool list.
 - **Secrets never hit the registry:** `targets.yaml` stores only a `credentialRef` (a Vaultwarden item name); the actual credential is fetched in-memory at call time via `AppState.credentialFor`.
 - **Setup gating:** the MCP endpoint returns 503 until `data/setup-complete.json` exists AND the store+vault are unlocked (`src/web/auth.ts`). Setup-mutating API routes fail closed once setup is complete.
+- **MCP auth:** OAuth 2.1 (`src/oauth/oauth-service.ts` + `src/web/oauth-routes.ts`) — dynamic client registration, PKCE S256, TOTP-gated consent, opaque tokens stored as SHA-256 hashes in `oauth.sqlite`. `mcpAuth` (`src/web/auth.ts`) accepts a valid OAuth access token OR the legacy static bearer, and 401s carry the RFC 9728 `WWW-Authenticate` discovery hint. Consent approval and client revocation are gated by the admin TOTP.
 
 ## Connector notes (service types, not a specific deployment)
 

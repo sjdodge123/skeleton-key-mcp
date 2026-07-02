@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { AppState } from "../app.js";
 import { buildMcpServer } from "../mcp/server.js";
 import { buildApiRouter } from "./routes.js";
+import { buildOAuthRouter } from "./oauth-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
 
@@ -15,6 +16,11 @@ import { WIZARD_HTML } from "./ui.js";
 export function buildHttpApp(app: AppState): express.Express {
   const server = express();
   server.use(express.json({ limit: "4mb" }));
+  // OAuth token/consent requests are form-encoded.
+  server.use(express.urlencoded({ extended: false }));
+
+  // OAuth 2.1 authorization server (discovery, registration, consent, token).
+  server.use(buildOAuthRouter(app));
 
   // MCP endpoint. Stateless: a fresh Server+transport per request keeps the
   // dynamic tool set correct and avoids session bookkeeping for a single user.

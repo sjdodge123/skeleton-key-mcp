@@ -44,6 +44,7 @@ async function main(): Promise<void> {
   const shutdown = () => {
     server.close();
     app.audit.close();
+    app.oauth.close();
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);

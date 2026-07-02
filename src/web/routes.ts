@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
+import { authenticator } from "otplib";
 import type { AppState } from "../app.js";
 import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
@@ -211,6 +212,33 @@ export function buildApiRouter(app: AppState): Router {
       if (!(await guardSetup(res))) return;
       const removed = await app.registry.remove(req.params.name!);
       res.json({ ok: removed });
+    }),
+  );
+
+  // --- OAuth client management (authorized agents) ---
+  router.get(
+    "/oauth/clients",
+    h(async (_req, res) => {
+      res.json({ clients: app.oauth.listClientsWithTokens() });
+    }),
+  );
+
+  // Revoking an agent's access is sensitive, so require a fresh TOTP code.
+  router.post(
+    "/oauth/clients/:id/revoke",
+    h(async (req, res) => {
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body);
+      const secret = app.store.locked ? undefined : app.store.get().totpSecret;
+      if (!secret || !authenticator.verify({ token: totp.trim(), secret })) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return;
+      }
+      const ok = app.oauth.revokeClient(req.params.id!);
+      app.audit.record({
+        ts: new Date().toISOString(), tool: "oauth.revoke", target: req.params.id!,
+        tier: "execute", args: {}, status: ok ? "ok" : "error", detail: "agent access revoked",
+      });
+      res.json({ ok });
     }),
   );
 
