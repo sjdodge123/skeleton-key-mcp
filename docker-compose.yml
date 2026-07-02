@@ -4,9 +4,10 @@
 # reverse proxy or publish the port to the WAN. Remote access = VPN into the LAN.
 services:
   skeleton-key:
-    build: .
-    # Or pull a prebuilt image once you publish one:
-    # image: ghcr.io/youruser/skeleton-key-mcp:latest
+    # Pull the prebuilt image published by CI (recommended for the NAS):
+    image: ghcr.io/sjdodge123/skeleton-key-mcp:latest
+    # To build locally instead, comment out `image:` above and uncomment:
+    # build: .
     container_name: skeleton-key
     restart: unless-stopped
     ports:

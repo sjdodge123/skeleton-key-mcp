@@ -10,6 +10,14 @@ It's a framework, not a fixed inventory: connectors are adapters for a *type* of
 
 ## Quick start
 
+CI publishes an image to `ghcr.io/sjdodge123/skeleton-key-mcp:latest` on every push to `main`.
+
+```bash
+docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
+# If the GHCR package is private, log in first:
+#   echo <GITHUB_PAT_with_read:packages> | docker login ghcr.io -u sjdodge123 --password-stdin
+```
+
 1. **Deploy the container** on your NAS/home server (e.g. import `docker-compose.yml` as a stack in Portainer). Edit the `ports:` line to bind your host's LAN IP.
 2. **Open the web UI** at `http://<host>:8787/` and follow the wizard:
    - set a master passphrase (encrypts Skeleton Key's own secrets; also your admin login),
