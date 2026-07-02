@@ -28,6 +28,50 @@ docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
    - copy the generated **Claude MCP snippet**.
 3. **Add the snippet to Claude** (Code or Desktop). Claude now sees tools for each registered service.
 
+## Configuration
+
+### Environment variables
+
+All configuration is optional — the defaults work for a standard container deploy. Set these in the `environment:` block of your compose/Portainer stack.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SKELETON_KEY_DATA_DIR` | `/data` (image) · `./data` (dev) | Directory for all mutable state: the encrypted bootstrap store, the `bw` offline cache, the audit DB, and `targets.yaml`. Back this up; it's the only stateful part. |
+| `SKELETON_KEY_PORT` | `8787` | Port the HTTP server (web UI + `/mcp`) listens on **inside** the container. |
+| `SKELETON_KEY_BIND_HOST` | `0.0.0.0` | Interface the server binds to inside the container. Leave at `0.0.0.0`; scope exposure with the host-side port mapping (below), not this. |
+| `SKELETON_KEY_PASSPHRASE` | _(unset)_ | Optional. If set, the encrypted store is **unlocked automatically at boot** so the MCP endpoint comes back up without manual intervention after a restart. If unset, you unlock via the web UI after each restart. Prefer a Docker/Portainer **secret** over an inline value — it's your master passphrase. |
+| `SKELETON_KEY_DISABLE_EXECUTE` | _(unset)_ | Set to `1` as a kill-switch: all `execute`-tier tools are refused and audited as denied, leaving only read-only tools. Useful while testing or if you want Claude to look but not touch. |
+
+### Docker / compose setup
+
+| Setting | Example | Why it matters |
+|---|---|---|
+| **Port mapping** | `"192.168.0.229:8787:8787"` | **This is your security boundary.** Bind to the NAS's specific **LAN IP**, not `0.0.0.0` or `8787:8787`, so the service is never reachable from the WAN. Format is `HOST_IP:HOST_PORT:CONTAINER_PORT`. Never put this behind an internet-facing reverse proxy. |
+| **Volume** | `skeleton-key-data:/data` | Persists everything in `SKELETON_KEY_DATA_DIR` across restarts and image updates. Without it you'd re-run the wizard every restart. Use a named volume or a host bind mount you back up. |
+| **`image` vs `build`** | `image: ghcr.io/sjdodge123/skeleton-key-mcp:latest` | On the NAS, pull the CI-built image. Use `build: .` only when developing from a source checkout. |
+| **`restart`** | `unless-stopped` | Brings Skeleton Key back after a NAS reboot. Pair with `SKELETON_KEY_PASSPHRASE` for hands-off recovery, or unlock via the UI. |
+
+Minimal Portainer stack:
+
+```yaml
+services:
+  skeleton-key:
+    image: ghcr.io/sjdodge123/skeleton-key-mcp:latest
+    container_name: skeleton-key
+    restart: unless-stopped
+    ports:
+      - "192.168.0.229:8787:8787"   # your NAS's LAN IP
+    environment:
+      SKELETON_KEY_PORT: "8787"
+      SKELETON_KEY_BIND_HOST: "0.0.0.0"
+      # SKELETON_KEY_PASSPHRASE: "..."       # optional auto-unlock (prefer a secret)
+      # SKELETON_KEY_DISABLE_EXECUTE: "1"    # optional read-only mode
+    volumes:
+      - skeleton-key-data:/data
+volumes:
+  skeleton-key-data:
+```
+
 ## How credentials stay safe
 
 The service account belongs to exactly one Vaultwarden organization/collection. In Bitwarden's model, organization keys are separate from your personal user key, so this account is **cryptographically unable** to decrypt your personal vault — only the homelab collection. Reads are served from the `bw` CLI's **local encrypted offline cache**, so a Vaultwarden outage degrades you to last-known-good credentials instead of locking you out.
