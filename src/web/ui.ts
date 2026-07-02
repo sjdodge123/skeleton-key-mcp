@@ -219,8 +219,14 @@ const views = {
       btn("Finish setup", async()=>{ await api("/setup/complete",{}); go(8); }));
   },
   8: async ()=> card("You're all set 🗝️",
-    '<p>The MCP endpoint is now live at <code>/mcp</code>. Claude can see tools for your registered services.</p>'+
-    '<p class="muted">Restart this container? You\\'ll be asked for your master passphrase to unlock again.</p>'),
+    '<p>The MCP endpoint is now live at <code>/mcp</code>. From here you can finish onboarding <b>just by talking to Claude</b> — no more forms.</p>'+
+    '<p class="muted">Try asking Claude to:</p>'+
+    '<ul>'+
+    '<li>“<b>Map my network</b>” (my LAN is <code>192.168.0</code>) — runs <code>network_scan</code>.</li>'+
+    '<li>“<b>Generate an SSH key</b> for that NAS as user <code>skeletonkey</code> and register it” — <code>vault_generate_ssh_key</code> + <code>register_target</code>. It stores the private key in your vault and gives you the public key to install.</li>'+
+    '<li>“<b>Validate</b> access to it” — <code>vault_validate_ssh</code>.</li>'+
+    '</ul>'+
+    '<p class="muted">Installing each returned public key on the target host is the one manual step — that boundary is deliberate. Restart this container? You\\'ll be asked for your master passphrase to unlock again.</p>'),
 };
 
 function card(title, inner){ return '<div class="card"><h2>'+title+'</h2>'+inner+'</div>'; }

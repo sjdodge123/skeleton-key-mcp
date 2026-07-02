@@ -6,6 +6,8 @@ Skeleton Key is a self-hosted [MCP](https://modelcontextprotocol.io) server that
 
 It's a framework, not a fixed inventory: connectors are adapters for a *type* of service, and you register your own instances. Generic **SSH** and **HTTP** connectors mean anything reachable is usable on day one.
 
+**Near-turnkey onboarding:** once your scoped Vaultwarden collection exists and the first MCP connection is made, the rest happens *in conversation with Claude* — it can scan your LAN, generate and store SSH keys, register targets, and validate access, all through built-in tools. See [Conversational onboarding](#conversational-onboarding).
+
 > **Security:** LAN only. Never expose this to the internet. Remote access = VPN into your LAN.
 
 ## Quick start
@@ -85,6 +87,31 @@ services:
 volumes:
   skeleton-key-data:
 ```
+
+## Conversational onboarding
+
+After the wizard (scoped vault + first MCP connection), you don't hand-build the rest — you ask Claude. These **global MCP tools** are always available:
+
+| Tool | Tier | What it does |
+|---|---|---|
+| `network_scan` | read | Scans your LAN for known services (Synology, Proxmox, UniFi, Home Assistant, Portainer, Pi-hole, SSH). Pass your subnet (e.g. `192.168.0`) if running in a bridged container. |
+| `vault_generate_ssh_key` | execute | Generates a dedicated ed25519 keypair, stores the **private** key in your Homelab collection, and returns the **public** key + the `authorized_keys` line to install. The private key is never shown. |
+| `vault_store_login` | execute | Stores an arbitrary username/password/token + URL in the collection (for APIs, web UIs, …). |
+| `vault_list_credentials` | read | Lists the item names in the scoped collection (no secret values). |
+| `vault_validate_ssh` | read | SSH-connects to a host with a stored key and runs a harmless `id` to confirm access works. |
+| `register_target` | execute | Registers a service as a target so its tools become available. |
+| `list_targets` | read | Lists registered targets. |
+
+A typical first session, entirely in chat:
+
+> **You:** Map my network — my LAN is 192.168.0.
+> **Claude:** *(network_scan)* Found a Synology at 192.168.0.20, Proxmox at 192.168.0.30, …
+> **You:** Generate an SSH key for the Synology, user `skeletonkey`, and register it.
+> **Claude:** *(vault_generate_ssh_key)* Here's the public key to install: `ssh-ed25519 …`. *(register_target)* Registered `synology1`.
+> **You:** I installed it — validate.
+> **Claude:** *(vault_validate_ssh)* ✅ Works. `uid=1027(skeletonkey) …`
+
+Execute-tier tools go through Claude's approval prompt and are audited; installing the returned public key on each host is the one manual step (that's the security boundary — Skeleton Key never pushes its own key onto your machines).
 
 ## How credentials stay safe
 

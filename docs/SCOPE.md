@@ -77,6 +77,17 @@ Claude (Code / Desktop / mobile via LAN)
 
 - **Deployment nuance:** if Vaultwarden and Skeleton Key run on the same NAS, a full-NAS outage takes both down (troubleshoot from elsewhere then). The common cases — Vaultwarden container crash, or a network blip — are fully covered by the cache. For max resilience, host Skeleton Key slightly independent of the component most likely to fail.
 
+## Global onboarding tools (conversational setup)
+
+Beyond per-target connector tools, a set of **global MCP tools** operate on the
+vault and registry themselves, so once the scoped collection + first MCP
+connection exist, the rest is driven by chat: `network_scan` (map the LAN),
+`vault_generate_ssh_key` (make + store a key, return the public key to install),
+`vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`,
+`register_target`, `list_targets`. Vault writes go through `bw create item`;
+key generation uses `ssh-keygen` (OpenSSH format, so the ssh2 connector parses
+it). Private keys are stored, never returned to the caller.
+
 ## Connector modules (one per integration)
 
 | Connector | Transport | Read tools | Execute tools |
