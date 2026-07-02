@@ -2,7 +2,19 @@ import type { z } from "zod";
 import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier } from "../connectors/types.js";
 import { getConnector } from "../connectors/index.js";
-import { buildGlobalTools } from "./builtin-tools.js";
+import { buildGlobalTools, type GlobalTool } from "./builtin-tools.js";
+
+// The global tool set never changes for a given app, so build it once. Only the
+// per-target tools are recomposed from the live registry on each resolve.
+const globalToolsCache = new WeakMap<AppState, GlobalTool[]>();
+function getGlobalTools(app: AppState): GlobalTool[] {
+  let tools = globalToolsCache.get(app);
+  if (!tools) {
+    tools = buildGlobalTools(app);
+    globalToolsCache.set(app, tools);
+  }
+  return tools;
+}
 
 /**
  * A tool resolved for invocation. Both per-target connector tools and global
@@ -31,7 +43,7 @@ export interface ResolvedTool {
 export function resolveTools(app: AppState): ResolvedTool[] {
   const resolved: ResolvedTool[] = [];
 
-  for (const g of buildGlobalTools(app)) {
+  for (const g of getGlobalTools(app)) {
     resolved.push({
       qualifiedName: g.name,
       description: g.description,

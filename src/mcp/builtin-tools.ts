@@ -4,7 +4,10 @@ import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../connectors/ssh-keygen.js";
 import { scanLan } from "../discovery/scan.js";
 import { getConnector } from "../connectors/index.js";
-import { runSsh } from "../connectors/ssh-exec.js";
+import { runSsh, shellQuote } from "../connectors/ssh-exec.js";
+
+/** Safe, filename-like identifier for vault item names (they double as credentialRefs). */
+const safeName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, "Use letters, digits, dot, dash, underscore.");
 
 /**
  * Global MCP tools that operate on the vault and registry themselves rather than
@@ -32,7 +35,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         "Generate a dedicated ed25519 SSH keypair and store the PRIVATE key in the scoped Vaultwarden collection as a Login item. Returns the PUBLIC key and the authorized_keys line to install on the target host. The private key is never returned.",
       tier: "execute",
       inputSchema: z.object({
-        name: z.string().describe("Vault item name (also the credentialRef you'll register the target with), e.g. 'nas1-ssh'."),
+        name: safeName.describe("Vault item name (also the credentialRef you'll register the target with), e.g. 'nas1-ssh'."),
         username: z.string().describe("The remote SSH user this key logs in as, e.g. 'skeletonkey'."),
         host: z.string().describe("Target host/IP the key is for (stored for reference)."),
         url: z.string().optional().describe("Optional URL/URI to store on the item."),
@@ -56,12 +59,14 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           url: i.url ?? `ssh://${i.host}`,
           notes: "SSH key managed by Skeleton Key. Private key in the 'private_key' field.",
           fields,
+          collectionName: a.store.get().bwCollectionName,
         });
         return ok(
           `Stored SSH key as vault item "${i.name}" (credentialRef).\n` +
             `Fingerprint: ${key.fingerprint}\n\n` +
             `Install this on ${i.host} for user ${i.username} — append to ~${i.username}/.ssh/authorized_keys:\n\n${key.publicKey}\n\n` +
-            `One-liner (run on the target):\n  echo ${JSON.stringify(key.publicKey)} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\n\n` +
+            // shellQuote (single quotes) so a copy-pasted one-liner can't run command substitution.
+            `One-liner (run on the target):\n  mkdir -p ~/.ssh && echo ${shellQuote(key.publicKey)} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\n\n` +
             `The private key was stored in the vault and intentionally not shown here. Validate with vault_validate_ssh once installed.`,
         );
       },
@@ -71,7 +76,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       description: "Store an arbitrary login (username/password and/or token) with an optional URL in the scoped Vaultwarden collection.",
       tier: "execute",
       inputSchema: z.object({
-        name: z.string(),
+        name: safeName,
         username: z.string().optional(),
         password: z.string().optional(),
         token: z.string().optional().describe("An API token/key; stored as a hidden 'token' field."),
@@ -88,6 +93,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           url: i.url,
           notes: i.notes,
           fields: i.token ? [{ name: "token", value: i.token, hidden: true }] : [],
+          collectionName: a.store.get().bwCollectionName,
         });
         return ok(`Stored login "${i.name}" in the vault (credentialRef).`);
       },
@@ -138,8 +144,14 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         const i = input as { subnet?: string };
         const services = await scanLan(i.subnet ? { subnets: [i.subnet] } : {});
         if (!services.length) return ok("No services detected. In a bridged container, pass your real subnet (e.g. '192.168.0').");
-        const lines = services.map((s) => `- ${s.host}:${s.port}  →  ${s.label} (type: ${s.connectorType})`);
-        return ok(`Discovered ${services.length} service(s):\n${lines.join("\n")}\n\nRegister any with register_target.`);
+        const lines = services.map((s) => {
+          // Only ssh/http connectors exist today; map bespoke detections to a
+          // registerable fallback so register_target actually accepts them.
+          const registerType = getConnector(s.connectorType) ? s.connectorType : s.port === 22 ? "ssh" : "http";
+          const note = registerType === s.connectorType ? "" : ` — register as '${registerType}' (no bespoke ${s.connectorType} connector yet)`;
+          return `- ${s.host}:${s.port}  →  ${s.label}  [register_target type: ${registerType}]${note}`;
+        });
+        return ok(`Discovered ${services.length} service(s):\n${lines.join("\n")}\n\nRegister any with register_target using the shown type.`);
       },
     },
     {
@@ -147,7 +159,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       description: "Register a service as a target so its tools become available. type is a connector (ssh, http, ...); credentialRef is a vault item name.",
       tier: "execute",
       inputSchema: z.object({
-        name: z.string(),
+        name: safeName,
         type: z.string().describe("Connector type, e.g. 'ssh' or 'http'."),
         host: z.string(),
         port: z.number().int().positive().optional(),
@@ -170,9 +182,15 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         if (connector.requiresCredential && !i.credentialRef) {
           return err(`Connector '${i.type}' requires a credentialRef (a vault item name).`);
         }
-        await a.registry.upsert({ name: i.name, type: i.type, host: i.host, port: i.port, credentialRef: i.credentialRef, options: i.options });
-        const toolCount = connector.buildTools({ name: i.name, type: i.type, host: i.host }).length;
-        return ok(`Registered '${i.name}'. ${toolCount} tools are now available for it (e.g. ${i.type}.${i.name}.*).`);
+        const target = { name: i.name, type: i.type, host: i.host, port: i.port, credentialRef: i.credentialRef, options: i.options };
+        await a.registry.upsert(target);
+        // Best-effort tool count against the full target; never fail the (already
+        // persisted) registration just because counting threw.
+        let count = "";
+        try {
+          count = ` ${connector.buildTools(target).length} tools are now available for it.`;
+        } catch { /* ignore */ }
+        return ok(`Registered '${i.name}' (${i.type} @ ${i.host}).${count} Tools are namespaced ${i.type}.${i.name}.*`);
       },
     },
     {

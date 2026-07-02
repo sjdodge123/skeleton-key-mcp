@@ -1,10 +1,22 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { Credential } from "./types.js";
 import { paths } from "../config/paths.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Reduce a `bw` failure to a safe, first-line message. We never surface the
+ * original execFile error (its `.message` embeds the full argv, which for some
+ * commands contains base64 secret payloads and the session key) — that would
+ * leak secrets into the audit log and tool output.
+ */
+function sanitizeBwError(subcommand: string, err: unknown): Error {
+  const stderr = (err as { stderr?: unknown })?.stderr;
+  const first = typeof stderr === "string" ? stderr.trim().split("\n")[0] : "";
+  return new Error(`bw ${subcommand} failed${first ? `: ${first}` : ""}`);
+}
 
 export interface BwStatus {
   status: "unauthenticated" | "locked" | "unlocked";
@@ -43,19 +55,48 @@ export class VaultwardenClient {
   }
 
   private env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-    return {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       BITWARDENCLI_APPDATA_DIR: this.appDataDir,
       ...extra,
     };
+    // Pass the session via env, never as an argv `--session` flag, so the
+    // long-lived session key never appears in argv / `ps` / error messages.
+    if (this.session) env.BW_SESSION = this.session;
+    return env;
   }
 
   private async run(args: string[], extraEnv: Record<string, string> = {}): Promise<string> {
-    const { stdout } = await execFileAsync("bw", args, {
-      env: this.env(extraEnv),
-      maxBuffer: 16 * 1024 * 1024,
+    try {
+      const { stdout } = await execFileAsync("bw", args, {
+        env: this.env(extraEnv),
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return stdout.trim();
+    } catch (err) {
+      throw sanitizeBwError(args[0] ?? "", err);
+    }
+  }
+
+  /**
+   * Run a `bw` command feeding `input` on stdin instead of argv — used for
+   * `create item` so the base64 secret payload never lands in the argument list.
+   */
+  private runWithStdin(args: string[], input: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("bw", args, { env: this.env() });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("error", () => reject(new Error(`bw ${args[0] ?? ""} failed to start`)));
+      child.on("close", (code) => {
+        if (code === 0) resolve(stdout.trim());
+        else reject(sanitizeBwError(args[0] ?? "", { stderr }));
+      });
+      child.stdin.on("error", () => {}); // ignore EPIPE if bw exits early
+      child.stdin.end(input);
     });
-    return stdout.trim();
   }
 
   async ensureAppDataDir(): Promise<void> {
@@ -96,7 +137,7 @@ export class VaultwardenClient {
   /** Refresh the local cache from the server. Requires connectivity. */
   async sync(): Promise<void> {
     this.assertUnlocked();
-    await this.run(["sync", "--session", this.session!]);
+    await this.run(["sync"]);
   }
 
   lock(): void {
@@ -109,34 +150,42 @@ export class VaultwardenClient {
 
   async listOrganizations(): Promise<{ id: string; name: string }[]> {
     this.assertUnlocked();
-    const out = await this.run(["list", "organizations", "--session", this.session!]);
+    const out = await this.run(["list", "organizations"]);
     return JSON.parse(out) as { id: string; name: string }[];
   }
 
   async listCollections(): Promise<{ id: string; name: string; organizationId: string }[]> {
     this.assertUnlocked();
-    const out = await this.run(["list", "collections", "--session", this.session!]);
+    const out = await this.run(["list", "collections"]);
     return JSON.parse(out) as { id: string; name: string; organizationId: string }[];
   }
 
-  /** Resolve the org + collection ids Skeleton Key writes new items into. */
+  /**
+   * Resolve the org + collection ids to write into. Requires an unambiguous
+   * target: the named collection, or the single collection if the account only
+   * has one. Refuses to guess when several exist so secrets never land in the
+   * wrong (possibly broader) collection.
+   */
   async resolveCollection(name?: string): Promise<{ collectionId: string; organizationId: string; name: string }> {
     const cols = await this.listCollections();
-    const col = name ? cols.find((c) => c.name === name) : cols[0];
-    if (!col) {
-      throw new Error(
-        name
-          ? `Collection "${name}" not found in the scoped vault.`
-          : "No collection is available to write to.",
-      );
+    if (name) {
+      const col = cols.find((c) => c.name === name);
+      if (!col) throw new Error(`Collection "${name}" not found in the scoped vault.`);
+      return { collectionId: col.id, organizationId: col.organizationId, name: col.name };
     }
+    if (cols.length === 0) throw new Error("No collection is available to write to.");
+    if (cols.length > 1) {
+      throw new Error(`Ambiguous target: ${cols.length} collections exist — specify which to write to.`);
+    }
+    const col = cols[0]!;
     return { collectionId: col.id, organizationId: col.organizationId, name: col.name };
   }
 
   /**
    * Create a Login item in the scoped collection. `fields` become custom fields;
-   * mark secrets (private keys, tokens) hidden. Requires connectivity (writing a
-   * new secret to the server); the local cache is refreshed via sync afterwards.
+   * mark secrets (private keys, tokens) hidden. Requires connectivity to write
+   * the new secret; the payload is fed on stdin (never argv) so it can't leak
+   * into `ps` or error messages.
    */
   async createLoginItem(input: {
     name: string;
@@ -148,17 +197,25 @@ export class VaultwardenClient {
     collectionName?: string;
   }): Promise<{ name: string }> {
     this.assertUnlocked();
+    // Names double as credentialRefs, and `bw get item <name>` fails on
+    // duplicates — so refuse to create a second item with an existing name.
+    const existing = await this.listItemNames();
+    if (existing.includes(input.name)) {
+      throw new Error(`A vault item named "${input.name}" already exists — pick a different name.`);
+    }
     const { collectionId, organizationId } = await this.resolveCollection(input.collectionName);
     const item = buildLoginItemJson({ ...input, organizationId, collectionId });
     const encoded = Buffer.from(JSON.stringify(item)).toString("base64");
-    await this.run(["create", "item", encoded, "--session", this.session!]);
-    await this.sync();
+    await this.runWithStdin(["create", "item"], encoded);
+    // The item is written server-side; refreshing the local cache is best-effort
+    // so a transient sync failure doesn't make callers retry and duplicate it.
+    await this.sync().catch(() => {});
     return { name: input.name };
   }
 
   async listItemNames(): Promise<string[]> {
     this.assertUnlocked();
-    const out = await this.run(["list", "items", "--session", this.session!]);
+    const out = await this.run(["list", "items"]);
     const items = JSON.parse(out) as BwItem[];
     return items.map((i) => i.name);
   }
@@ -166,7 +223,7 @@ export class VaultwardenClient {
   /** Fetch one item by name and map it to a connector-friendly Credential. */
   async getCredential(ref: string): Promise<Credential> {
     this.assertUnlocked();
-    const out = await this.run(["get", "item", ref, "--session", this.session!]);
+    const out = await this.run(["get", "item", ref]);
     const item = JSON.parse(out) as BwItem;
     const fields: Record<string, string> = {};
     for (const f of item.fields ?? []) fields[f.name] = f.value;
