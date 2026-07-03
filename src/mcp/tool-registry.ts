@@ -29,6 +29,9 @@ export interface ResolvedTool {
   inputSchema: z.ZodTypeAny;
   /** Target name for audit, or null for global tools. */
   targetName: string | null;
+  /** Callable while the vault is locked (needs no credentials). Connector tools
+   *  never are; locked calls short-circuit with unlock guidance instead. */
+  availableWhenLocked: boolean;
   /** Confirmation text for execute-tier tools. */
   confirm?: (input: unknown) => string | undefined;
   invoke: (input: unknown) => Promise<ToolResult>;
@@ -50,6 +53,7 @@ export function resolveTools(app: AppState): ResolvedTool[] {
       tier: g.tier,
       inputSchema: g.inputSchema,
       targetName: null,
+      availableWhenLocked: g.availableWhenLocked ?? false,
       confirm: g.confirm,
       invoke: (input) => g.run(input, app),
     });
@@ -65,6 +69,7 @@ export function resolveTools(app: AppState): ResolvedTool[] {
         tier: tool.tier,
         inputSchema: tool.inputSchema,
         targetName: target.name,
+        availableWhenLocked: false,
         confirm: tool.confirm ? (input) => tool.confirm!(input, target) : undefined,
         invoke: (input) =>
           tool.run(input, {

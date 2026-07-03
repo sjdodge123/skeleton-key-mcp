@@ -2,7 +2,7 @@
 
 Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
 
-_Last updated: 2026-07-03._
+_Last updated: 2026-07-02._
 
 ## TL;DR
 
@@ -19,6 +19,8 @@ Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connect
 - **Self-guiding onboarding** — server `instructions` on connect + live `tools/list_changed` push on target registration.
 - **LAN discovery fingerprinting** — SSH banner + HTTP content match with confidence levels (replaces port-only guessing).
 - **Packaging & CI** — multi-stage Dockerfile, Portainer compose, CI on every PR, GHCR publish on merge, branch protection.
+- **Exact-name credential lookup** — `getCredential` resolves refs by exact item name (`bw get item` substring-matched, so `PiHole` broke when `pihole-ssh` was created; found live during onboarding).
+- **Locked-vault UX (#13)** — a locked vault no longer 503s authenticated clients; sessions connect, `get_started`/`list_targets`/`network_scan` still work, and every other tool call returns "unlock at `<admin URL>`" guidance instead of an opaque error.
 
 Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang).
 

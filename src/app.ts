@@ -41,6 +41,28 @@ export class AppState {
     }
   }
 
+  /** True while credentials are unavailable (fresh boot / container restart)
+   *  until the admin unlocks via the web UI. Tools degrade rather than the
+   *  endpoint going dark — see `mcpAuth` and the CallTool locked gate. */
+  get locked(): boolean {
+    return this.store.locked || !this.vault.unlocked;
+  }
+
+  private lastSeenOrigin: string | null = null;
+
+  /** Remember the origin a client actually reached us on, as a fallback for
+   *  building user-facing links when SKELETON_KEY_PUBLIC_URL isn't set. */
+  notePublicOrigin(origin: string): void {
+    this.lastSeenOrigin = origin;
+  }
+
+  /** Admin web UI URL for "go unlock" guidance, or null if we can't know it. */
+  unlockUrl(): string | null {
+    const configured = process.env.SKELETON_KEY_PUBLIC_URL;
+    if (configured) return configured.replace(/\/$/, "");
+    return this.lastSeenOrigin;
+  }
+
   private readonly toolChangeListeners = new Set<() => void>();
 
   /** Subscribe to tool-set changes (e.g. a target registered). Returns an unsubscribe fn. */
@@ -67,7 +89,10 @@ export class AppState {
   /** Resolve a target's credential from the vault (offline-cache backed). */
   async credentialFor(credentialRef: string) {
     if (!this.vault.unlocked) {
-      throw new Error("Vault is locked; cannot resolve credentials.");
+      const url = this.unlockUrl();
+      throw new Error(
+        `Vault is locked; cannot resolve credentials. Unlock via the admin web UI${url ? ` at ${url}/` : ""}.`,
+      );
     }
     return this.vault.getCredential(credentialRef);
   }
