@@ -186,7 +186,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         const services = await scanLan(i.subnet ? { subnets: [i.subnet] } : {});
         if (!services.length) return ok("No services detected. In a bridged container, pass your real subnet (e.g. '192.168.0').");
         const lines = services.map((s) => {
-          const registerType = registerableType(s.connectorType, s.port);
+          const registerType = registerableType(s.connectorType, s.port, s.confidence);
           const note = registerType === s.connectorType ? "" : ` (no bespoke ${s.connectorType} connector yet)`;
           // Flag lower-confidence guesses so they're taken with a grain of salt.
           const conf = s.confidence === "confirmed" ? "" : s.confidence === "likely" ? "  (likely — verify)" : "  (open port, unidentified)";

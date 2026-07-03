@@ -25,13 +25,16 @@ export function listConnectors(): Connector[] {
 
 /**
  * Map a discovered service type to a connector that can actually register it.
- * Discovery labels services by product (synology, proxmox, …) but only `ssh`
- * and `http` connectors exist today, so bespoke detections fall back to `http`
- * (or `ssh` for port 22). Used by both the wizard and the MCP register flow so
- * they agree on the registerable type.
+ * A bespoke connector is only suggested when the detection was **fingerprint-
+ * confirmed**; a port-only guess (e.g. any HTTPS on 9443, which merely *hints*
+ * Portainer) falls back to the generic `http`/`ssh` connector, so following the
+ * suggestion never registers a non-Portainer service as a broken portainer
+ * target. Types without a bespoke connector always fall back. Used by both the
+ * wizard and the MCP register flow so they agree on the registerable type.
  */
-export function registerableType(connectorType: string, port?: number): string {
-  if (getConnector(connectorType)) return connectorType;
+export function registerableType(connectorType: string, port?: number, confidence?: string): string {
+  const trusted = confidence === undefined || confidence === "confirmed";
+  if (trusted && getConnector(connectorType)) return connectorType;
   return port === 22 ? "ssh" : "http";
 }
 

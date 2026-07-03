@@ -137,7 +137,7 @@ export function buildApiRouter(app: AppState): Router {
           timeoutMs: z.number().int().optional(),
         })
         .parse(req.body ?? {});
-      const services = (await scanLan(opts)).map((s) => ({ ...s, registerType: registerableType(s.connectorType, s.port) }));
+      const services = (await scanLan(opts)).map((s) => ({ ...s, registerType: registerableType(s.connectorType, s.port, s.confidence) }));
       res.json({ services });
     }),
   );

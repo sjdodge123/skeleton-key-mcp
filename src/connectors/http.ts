@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, Credential, Target, ToolContext } from "./types.js";
+import { deriveBaseUrl } from "./net.js";
 
 /**
  * Generic HTTP/REST connector — the fallback for any service that speaks HTTP
@@ -16,16 +17,11 @@ const optionsSchema = z
     auth: z.enum(["none", "bearer", "basic", "header"]).default("none"),
     /** Header name when auth === "header" (e.g. "X-API-Key"). */
     headerName: z.string().optional(),
-    /** Skip TLS verification for self-signed LAN certs. */
-    insecureTLS: z.boolean().default(false),
   })
   .default({});
 
 function baseUrl(target: Target): string {
-  const opts = optionsSchema.parse(target.options ?? {});
-  if (opts.baseUrl) return opts.baseUrl.replace(/\/$/, "");
-  const scheme = (target.port ?? 80) === 443 ? "https" : "http";
-  return `${scheme}://${target.host}${target.port ? `:${target.port}` : ""}`;
+  return deriveBaseUrl(target, { baseUrl: optionsSchema.parse(target.options ?? {}).baseUrl });
 }
 
 function authHeaders(target: Target, cred: Credential): Record<string, string> {
@@ -51,8 +47,6 @@ async function request(
   path: string,
   body?: unknown,
 ): Promise<{ text: string; isError?: boolean }> {
-  const opts = optionsSchema.parse(ctx.target.options ?? {});
-  if (opts.insecureTLS) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   let headers: Record<string, string> = { Accept: "application/json" };
   if (ctx.target.credentialRef) {
     headers = { ...headers, ...authHeaders(ctx.target, await ctx.getCredential()) };
