@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, Target, ToolContext } from "./types.js";
+import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
+import { deriveBaseUrl } from "./net.js";
 
 /**
  * Portainer connector — manage Docker through a Portainer CE/BE instance.
@@ -19,12 +20,10 @@ import type { Connector, ConnectorTool, Credential, Target, ToolContext } from "
 
 const optionsSchema = z
   .object({
-    /** Base URL; if omitted, host/port form the URL (9443 ⇒ https, else http). */
+    /** Base URL; if omitted, host/port form the URL (9443/443 ⇒ https, else http). */
     baseUrl: z.string().url().optional(),
     /** Docker environment ("endpoint") id for container ops. Auto-detected if unset. */
     endpointId: z.number().int().positive().optional(),
-    /** Skip TLS verification for a self-signed Portainer cert (e.g. on :9443). */
-    insecureTLS: z.boolean().default(false),
   })
   .default({});
 
@@ -35,10 +34,7 @@ function options(target: Target): Options {
 }
 
 export function baseUrl(target: Target): string {
-  const opts = options(target);
-  if (opts.baseUrl) return opts.baseUrl.replace(/\/$/, "");
-  const scheme = target.port === 9443 || target.port === 443 ? "https" : "http";
-  return `${scheme}://${target.host}${target.port ? `:${target.port}` : ""}`;
+  return deriveBaseUrl(target, { baseUrl: options(target).baseUrl, httpsPorts: [443, 9443] });
 }
 
 /** The API key from an explicit credential field (never the notes-derived secret). */
@@ -84,7 +80,6 @@ class Portainer {
     path: string,
     opts: { method?: string; body?: unknown; noAuth?: boolean; raw?: boolean } = {},
   ): Promise<{ ok: boolean; status: number; json?: unknown; text: string; buf?: Buffer }> {
-    if (options(this.target).insecureTLS) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
     const headers: Record<string, string> = { Accept: "application/json" };
     if (!opts.noAuth) Object.assign(headers, await this.authHeaders());
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -171,14 +166,6 @@ class Portainer {
     if (!res.ok) throw new Error(`HTTP ${res.status} updating stack #${id}: ${res.text.slice(0, 400)}`);
     return `Stack '${cur.Name}' (#${id}) redeployed with the updated compose file.`;
   }
-
-  async stackName(id: number): Promise<string> {
-    try {
-      return (await this.get<PortainerStack>(`/api/stacks/${id}`)).Name;
-    } catch {
-      return `#${id}`;
-    }
-  }
 }
 
 interface DockerContainer {
@@ -234,7 +221,6 @@ async function withClient<T>(ctx: ToolContext, fn: (p: Portainer) => Promise<T>)
 }
 
 const ok = (text: string): ToolResult => ({ text });
-type ToolResult = { text: string; isError?: boolean };
 
 function run(fn: (p: Portainer, input: any) => Promise<string>) {
   return async (input: unknown, ctx: ToolContext): Promise<ToolResult> => {
@@ -260,7 +246,7 @@ function buildTools(target: Target): ConnectorTool[] {
       description: `List containers on ${target.name} (name, state, image).`,
       tier: "read",
       inputSchema: z.object({ all: z.boolean().default(true).describe("Include stopped containers.") }),
-      run: run((p, i) => p.listContainers(i.all ?? true)),
+      run: run((p, i) => p.listContainers(i.all)),
     },
     {
       name: "container_logs",
@@ -270,7 +256,7 @@ function buildTools(target: Target): ConnectorTool[] {
         container: z.string().describe("Container name or id."),
         lines: z.number().int().positive().max(2000).default(200),
       }),
-      run: run((p, i) => p.containerLogs(i.container, i.lines ?? 200)),
+      run: run((p, i) => p.containerLogs(i.container, i.lines)),
     },
     {
       name: "list_stacks",
@@ -322,7 +308,7 @@ function buildTools(target: Target): ConnectorTool[] {
         pullImage: z.boolean().default(false).describe("Re-pull images on redeploy."),
       }),
       confirm: (input, t) => `Redeploy Portainer stack #${(input as { stackId: number }).stackId} on ${t.name} with an edited compose file`,
-      run: run((p, i) => p.updateStack(i.stackId, i.stackFileContent, i.pullImage ?? false)),
+      run: run((p, i) => p.updateStack(i.stackId, i.stackFileContent, i.pullImage)),
     },
   ];
 }
