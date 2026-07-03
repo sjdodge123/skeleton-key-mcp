@@ -32,6 +32,16 @@ describe("resolveSshAuth", () => {
     expect(auth.password).toBeUndefined();
   });
 
+  it("uses a key-shaped notes value as the key (older items stored the key in notes)", () => {
+    const auth = resolveSshAuth(cred({ notes: KEY }));
+    expect(auth).toEqual({ privateKey: KEY, passphrase: undefined });
+  });
+
+  it("does NOT treat freeform notes as a key (falls back to password)", () => {
+    const auth = resolveSshAuth(cred({ notes: "Stored via hand-off. reason", password: "pw" }));
+    expect(auth).toEqual({ password: "pw" });
+  });
+
   it("returns no auth when neither a key nor a password is available", () => {
     expect(resolveSshAuth(cred({ secret: "just a note" }))).toEqual({});
   });
