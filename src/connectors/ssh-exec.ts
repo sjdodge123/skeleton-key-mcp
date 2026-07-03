@@ -24,8 +24,15 @@ function looksLikePrivateKey(v: string | undefined): v is string {
  * `cred.secret`) work instead of being misread as a broken key.
  */
 export function resolveSshAuth(cred: Credential): { privateKey?: string; passphrase?: string; password?: string } {
-  const keyField = cred.fields["private_key"];
-  const privateKey = keyField ?? (looksLikePrivateKey(cred.secret) ? cred.secret : undefined);
+  // A private key may live in the explicit field, in `secret`, or (for older
+  // vault items) in `notes` — but ONLY if it's actually key-shaped, so freeform
+  // notes on a password login are never mistaken for a key (#26). getCredential
+  // no longer folds notes into `secret`, so we check `notes` directly here to
+  // keep key-in-notes items working.
+  const privateKey =
+    cred.fields["private_key"] ??
+    (looksLikePrivateKey(cred.secret) ? cred.secret : undefined) ??
+    (looksLikePrivateKey(cred.notes) ? cred.notes : undefined);
   if (privateKey) return { privateKey, passphrase: cred.fields["key_passphrase"] || undefined };
   if (cred.password) return { password: cred.password };
   return {};
