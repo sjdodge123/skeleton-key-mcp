@@ -64,7 +64,19 @@ function formPage(req: CredentialRequest, error?: string): string {
       <button class="deny" type="submit" name="action" value="decline">Cancel</button>
       <button class="approve" type="submit" name="action" value="submit">Store credential</button>
     </div>
-  </form>`,
+  </form>
+  <script>
+  (function(){
+    var f = document.querySelector('form'); var busy = false;
+    f.addEventListener('submit', function(e){
+      if (busy){ e.preventDefault(); return; }        // block double-submit
+      busy = true;
+      var s = f.querySelector('button.approve');
+      if (s && e.submitter === s){ s.textContent = 'Storing…'; } // feedback without disabling (keeps its value)
+      f.querySelectorAll('button').forEach(function(b){ b.style.opacity = '0.6'; b.style.cursor = 'default'; });
+    });
+  })();
+  </script>`,
   );
 }
 
