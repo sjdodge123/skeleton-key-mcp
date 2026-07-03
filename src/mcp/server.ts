@@ -19,11 +19,15 @@ const SERVER_INSTRUCTIONS = [
   "",
   "Getting started — if the user hasn't set up targets yet, offer to onboard them (call `get_started` for live status). The typical flow, all conversational:",
   "1. `network_scan` (pass their LAN subnet, e.g. '192.168.0', when asked) to map services.",
-  "2. `vault_generate_ssh_key` to create + store an SSH key for a host, then give the user the returned public key to install (they must install it — you cannot).",
+  "2. Obtain a credential WITHOUT secrets passing through the chat:",
+  "   - Password / API token: `request_credential` returns a one-time, TOTP-gated web link the user opens to type the secret straight into the vault; poll `credential_request_status` until it's 'fulfilled'.",
+  "   - SSH key: `vault_generate_ssh_key` stores the private key and returns the public key. If you already have a working credential for the host you can install it via that host's `run_command`; otherwise give the user the one-liner to install it themselves.",
   "3. `register_target` to add the host so its per-target tools appear.",
-  "4. `vault_validate_ssh` to confirm access works.",
+  "4. `vault_validate_ssh` to confirm SSH access works.",
   "",
-  "Tool tiers: 'read' tools are safe; 'execute' tools change state and require the user's approval. Private keys are stored in the vault and never returned — never ask the user to paste one. Credentials come from a scoped vault; you cannot see their personal passwords.",
+  "Managing credentials: `update_target` re-points a host at a new credentialRef (e.g. upgrade password → key), `vault_delete_credential` retires an old item.",
+  "",
+  "Never ask the user to paste a password, token, or private key into the chat — always route secrets through `request_credential` or the web UI. Tool tiers: 'read' tools are safe; 'execute' tools change state and require the user's approval. Credentials come from a scoped vault; you cannot see their personal passwords.",
 ].join("\n");
 
 /**

@@ -253,10 +253,29 @@ export class VaultwardenClient {
    * case-insensitive matches. The bounded `--search` fetch is the fast path; a
    * full-list fallback covers refs `--search` can't surface (notably item ids).
    */
-  async getCredential(ref: string): Promise<Credential> {
+  /**
+   * Resolve a credentialRef to its underlying item. The bounded `--search` fetch
+   * is the fast path; a full-list fallback covers refs `--search` can't surface
+   * (notably item ids). Throws with a clear message when nothing/too much matches.
+   */
+  private async findItem(ref: string): Promise<BwItem> {
     let item = resolveItem(await this.listItems(ref), ref);
     if (!item) item = resolveItem(await this.listItems(), ref);
     if (!item) throw new Error(`No vault item named "${ref}" in the scoped collection.`);
+    return item;
+  }
+
+  /** Delete a vault item by credentialRef. Requires connectivity (writes to the
+   *  server); the local cache is refreshed best-effort afterwards. */
+  async deleteItem(ref: string): Promise<{ name: string }> {
+    const item = await this.findItem(ref);
+    await this.run(["delete", "item", item.id]);
+    await this.sync().catch(() => {});
+    return { name: item.name };
+  }
+
+  async getCredential(ref: string): Promise<Credential> {
+    const item = await this.findItem(ref);
     const fields: Record<string, string> = {};
     for (const f of item.fields ?? []) fields[f.name] = f.value;
     return {

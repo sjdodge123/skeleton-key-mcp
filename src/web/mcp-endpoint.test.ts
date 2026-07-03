@@ -72,6 +72,11 @@ describe("stateful MCP endpoint", () => {
     const names = (parseSse(await r.text()).result?.tools ?? []).map((t: { name: string }) => t.name);
     expect(names).toContain("get_started");
     expect(names).toContain("network_scan");
+    // Credential-lifecycle tools are registered.
+    expect(names).toContain("request_credential");
+    expect(names).toContain("credential_request_status");
+    expect(names).toContain("update_target");
+    expect(names).toContain("vault_delete_credential");
   });
 
   it("tears down cleanly on DELETE without recursing, and forgets the session", async () => {

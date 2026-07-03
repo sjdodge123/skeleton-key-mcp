@@ -63,13 +63,14 @@ All mutable state lives under `SKELETON_KEY_DATA_DIR` (`/data` in the image, a D
 **MCP**
 - `src/mcp/server.ts` — `buildMcpServer`: low-level SDK `Server` with `ListTools`/`CallTool` handlers and onboarding `instructions` sent on connect.
 - `src/mcp/tool-registry.ts` — `resolveTools`: composes **global tools** (built once per app, memoized) + **per-target connector tools** into one `ResolvedTool` with a bound `invoke(input)` and `targetName` (null for global). No static tool list.
-- `src/mcp/builtin-tools.ts` — the global tools: `get_started`, `network_scan`, `vault_generate_ssh_key`, `vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`, `register_target`, `list_targets`.
+- `src/mcp/builtin-tools.ts` — the global tools: `get_started`, `network_scan`, `vault_generate_ssh_key`, `vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`, `register_target`, `update_target`, `vault_delete_credential`, `request_credential`, `credential_request_status`, `list_targets`.
 - `src/mcp/approval.ts` — `read`/`execute` annotations + confirmation text for the permission prompt.
 
 **Web / transport**
 - `src/web/server.ts` — the Express app; `mountMcp()` implements the **stateful** Streamable HTTP endpoint (sessions keyed by `Mcp-Session-Id`, idle sweeper + session cap, `tools/list_changed` push). Exported so tests can drive the real session lifecycle.
 - `src/web/auth.ts` — `mcpAuth`: setup-complete gate, then accepts a valid OAuth access token **or** the legacy static bearer; 401s carry the RFC 9728 `WWW-Authenticate` discovery hint. Auth routing is independent of lock state, so an expired token gets a 401→refresh (works while locked) rather than a dead 503. A locked vault is a kill-switch enforced at the tool layer (CallTool locked gate in `src/mcp/server.ts`): only a banner-only `get_started` runs, so clients get actionable "unlock at `<url>`" guidance without a leaked token being able to enumerate targets or scan the LAN before unlock.
 - `src/web/oauth-routes.ts` — OAuth 2.1 authorization server: discovery metadata, dynamic client registration, `/authorize` (TOTP-gated consent screen), `/token`, `/revoke`.
+- `src/web/credential-routes.ts` + `credential-requests.ts` — secure credential hand-off (#18): the `request_credential` tool mints a one-time link served here; the user types the secret into a TOTP-gated form that writes it straight to the scoped vault, so secrets never transit the chat/MCP channel. `CredentialRequestStore` holds only request *metadata* (never the secret), with a 15-min TTL and single-use fulfillment.
 - `src/oauth/oauth-service.ts` — token/code/client store (SQLite). PKCE S256, single-use codes, refresh-token rotation, opaque tokens stored as SHA-256 hashes.
 - `src/web/routes.ts` — wizard + admin REST (store init/unlock, vault connect, checks, discover, TOTP, token, target CRUD, OAuth client list/revoke).
 - `src/web/http-util.ts` — `baseUrl` (prefers `SKELETON_KEY_PUBLIC_URL`, never trusts `X-Forwarded-*`) and `firstStr` (coerces array query/body params).
