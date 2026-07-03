@@ -6,6 +6,9 @@ import { paths } from "../config/paths.js";
 
 const execFileAsync = promisify(execFile);
 
+/** Bitwarden item ids are UUIDs; used to route id-shaped refs to a direct fetch. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Reduce a `bw` failure to a safe, first-line message. We never surface the
  * original execFile error (its `.message` embeds the full argv, which for some
@@ -244,25 +247,36 @@ export class VaultwardenClient {
   }
 
   /**
-   * Fetch one item by credentialRef and map it to a connector-friendly Credential.
-   *
-   * Deliberately NOT `bw get item <name>`: that matches by substring, so a ref
-   * like "PiHole" breaks as soon as an overlapping name ("pihole-ssh") exists.
-   * We resolve in priority order — exact name → item id → unique case-insensitive
-   * name — killing the ambiguity while preserving the old behavior's id and
-   * case-insensitive matches. The bounded `--search` fetch is the fast path; a
-   * full-list fallback covers refs `--search` can't surface (notably item ids).
-   */
-  /**
-   * Resolve a credentialRef to its underlying item. The bounded `--search` fetch
-   * is the fast path; a full-list fallback covers refs `--search` can't surface
-   * (notably item ids). Throws with a clear message when nothing/too much matches.
+   * Resolve a credentialRef to its underlying item, preferring exact name over
+   * id over case-insensitive over unique-substring (see `resolveItem`). A ref
+   * shaped like a Bitwarden item id is fetched directly (bounded, exact) because
+   * `bw list items --search` can't match by id. Otherwise the bounded `--search`
+   * fetch is the fast path, with a full-list fallback for the rare miss. Throws
+   * with a clear message when nothing / too much matches.
    */
   private async findItem(ref: string): Promise<BwItem> {
+    this.assertUnlocked();
+    if (UUID_RE.test(ref)) {
+      // Item ids are exact and unique; one bounded fetch avoids decrypting the
+      // whole collection into memory just to find one credential by id.
+      try {
+        const item = JSON.parse(await this.run(["get", "item", ref])) as BwItem;
+        if (item?.id === ref) return item;
+      } catch {
+        /* not an id we hold — fall through to name resolution */
+      }
+    }
     let item = resolveItem(await this.listItems(ref), ref);
     if (!item) item = resolveItem(await this.listItems(), ref);
     if (!item) throw new Error(`No vault item named "${ref}" in the scoped collection.`);
     return item;
+  }
+
+  /** Resolve a credentialRef to its canonical {id, name} without decrypting the
+   *  secret — used to check dependents before deletion. */
+  async resolveRef(ref: string): Promise<{ id: string; name: string }> {
+    const item = await this.findItem(ref);
+    return { id: item.id, name: item.name };
   }
 
   /** Delete a vault item by credentialRef. Requires connectivity (writes to the
@@ -309,6 +323,16 @@ export function resolveItem<T extends { id: string; name: string }>(candidates: 
   if (ci.length === 1) return ci[0]!;
   if (ci.length > 1) {
     throw new Error(`${ci.length} vault items match "${ref}" case-insensitively — rename them so the credentialRef is unique.`);
+  }
+  // Last resort: a UNIQUE substring match. This preserves the migration path of
+  // the old `bw get item <ref>` (which substring-matched), so a pre-existing
+  // ref like "pihole" still resolves to item "pihole-ssh" — but only when it's
+  // unambiguous. Exact/id/case-insensitive above take priority, so this can't
+  // reintroduce the "PiHole vs pihole-ssh" ambiguity that motivated the rewrite.
+  const sub = candidates.filter((i) => i.name.toLowerCase().includes(ref.toLowerCase()));
+  if (sub.length === 1) return sub[0]!;
+  if (sub.length > 1) {
+    throw new Error(`${sub.length} vault items match "${ref}" — rename them or use the exact name so the credentialRef is unique.`);
   }
   return null;
 }

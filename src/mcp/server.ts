@@ -41,7 +41,12 @@ export function buildMcpServer(app: AppState): Server {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools: Tool[] = resolveTools(app).map((resolved) => {
+    // Mirror the CallTool locked gate: while locked, advertise only the tools
+    // that actually run (banner-only get_started). Otherwise per-target tool
+    // names — and thus registered target names/types — would be enumerable via
+    // tools/list before the admin unlocks, defeating the kill-switch.
+    const resolved = app.locked ? resolveTools(app).filter((t) => t.availableWhenLocked) : resolveTools(app);
+    const tools: Tool[] = resolved.map((resolved) => {
       const ann = annotationsFor(resolved);
       return {
         name: resolved.qualifiedName,
