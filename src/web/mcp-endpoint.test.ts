@@ -64,19 +64,18 @@ async function initialize(): Promise<string> {
 }
 
 describe("stateful MCP endpoint", () => {
-  it("initializes a session and lists tools including onboarding", async () => {
+  it("while locked, tools/list advertises only the banner-only get_started (kill-switch)", async () => {
+    // A fresh AppState is locked, so tools/list must not enumerate the rest of
+    // the toolset (which would leak target names/types) — only get_started.
     const sid = await initialize();
     const SH = { ...H, "mcp-session-id": sid };
     await fetch(base, { method: "POST", headers: SH, body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) });
     const r = await fetch(base, { method: "POST", headers: SH, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) });
     const names = (parseSse(await r.text()).result?.tools ?? []).map((t: { name: string }) => t.name);
     expect(names).toContain("get_started");
-    expect(names).toContain("network_scan");
-    // Credential-lifecycle tools are registered.
-    expect(names).toContain("request_credential");
-    expect(names).toContain("credential_request_status");
-    expect(names).toContain("update_target");
-    expect(names).toContain("vault_delete_credential");
+    expect(names).not.toContain("network_scan");
+    expect(names).not.toContain("request_credential");
+    expect(names).not.toContain("vault_delete_credential");
   });
 
   it("tears down cleanly on DELETE without recursing, and forgets the session", async () => {

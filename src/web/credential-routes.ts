@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { AppState } from "../app.js";
 import type { CredentialRequest } from "./credential-requests.js";
 import { firstStr } from "./http-util.js";
+import { htmlEscape } from "./html.js";
 
 /**
  * Secure credential hand-off (issue #18). The agent creates a request via the
@@ -15,11 +16,7 @@ import { firstStr } from "./http-util.js";
  * an unlocked store+vault (needed to verify TOTP and write the item).
  */
 
-function htmlEscape(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
-
-const STYLE = `:root{color-scheme:dark}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:radial-gradient(1000px 500px at 50% -10%,#182033,#0f1115 60%);color:#e6e9ef;display:flex;min-height:100vh;align-items:center;justify-content:center}
+const STYLE =`:root{color-scheme:dark}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:radial-gradient(1000px 500px at 50% -10%,#182033,#0f1115 60%);color:#e6e9ef;display:flex;min-height:100vh;align-items:center;justify-content:center}
 .box{background:#171a21;border:1px solid #262b36;border-radius:14px;padding:28px;max-width:440px;width:92%;box-shadow:0 10px 30px rgba(0,0,0,.3)}
 h1{font-size:20px;margin:0 0 6px}.mut{color:#8b93a7;font-size:14px}
 .warn{background:#2a1f1f;border:1px solid #4a2b2b;color:#ffb4b4;padding:10px 12px;border-radius:8px;font-size:13px;margin:16px 0}
@@ -147,7 +144,9 @@ export function buildCredentialRouter(app: AppState): Router {
         name: request.name,
         username: request.kind === "password" ? username : undefined,
         password: request.kind === "password" ? secret : undefined,
-        url: `ssh://${request.host}`,
+        // An SSH login gets an ssh:// URI; an API token is not SSH, so leave the
+        // URI off rather than mislabel it.
+        url: request.kind === "password" ? `ssh://${request.host}` : undefined,
         notes: `Stored via Skeleton Key credential hand-off. ${request.reason}`,
         fields: request.kind === "token" ? [{ name: "token", value: secret, hidden: true }] : [],
         collectionName: app.store.get().bwCollectionName,

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
 import { baseUrl, firstStr } from "./http-util.js";
+import { htmlEscape } from "./html.js";
 
 /**
  * OAuth 2.1 endpoints for the MCP authorization flow. Claude discovers these via
@@ -10,10 +11,6 @@ import { baseUrl, firstStr } from "./http-util.js";
  * authorization-code + PKCE flow. Human consent happens on a TOTP-gated screen,
  * so only the admin (with the authenticator) can authorize an agent.
  */
-
-function htmlEscape(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
 
 function consentPage(params: {
   clientName: string;

@@ -74,6 +74,10 @@ export function buildApiRouter(app: AppState): Router {
           masterPassword: s.bwMasterPassword,
         });
       }
+      // Sessions that connected while locked saw only the banner-only toolset
+      // (the locked tools/list gate); nudge them to re-list now the full set is
+      // available, so a live MCP client recovers without reconnecting.
+      if (!app.locked) app.emitToolsChanged();
       res.json({ ok: true, vaultUnlocked: app.vault.unlocked });
     }),
   );

@@ -253,10 +253,19 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       confirm: (input) => `Delete vault item '${(input as { credentialRef: string }).credentialRef}' — any target still using it will lose access`,
       run: async (input, a) => {
         const i = input as { credentialRef: string; force?: boolean };
-        const dependents = a.registry.list().filter((t) => t.credentialRef === i.credentialRef).map((t) => t.name);
+        // Resolve the ref to its canonical identity FIRST, so the dependency
+        // guard can't be bypassed by passing an id or a differently-cased ref
+        // than the targets stored (deleteItem resolves fuzzily — the guard must
+        // match the same way, or we'd delete a still-referenced item unguarded).
+        const resolved = await a.vault.resolveRef(i.credentialRef);
+        const refs = new Set([i.credentialRef, resolved.name, resolved.id]);
+        const dependents = a.registry
+          .list()
+          .filter((t) => t.credentialRef && (refs.has(t.credentialRef) || t.credentialRef.toLowerCase() === resolved.name.toLowerCase()))
+          .map((t) => t.name);
         if (dependents.length && !i.force) {
           return err(
-            `Refusing to delete '${i.credentialRef}': still used by target(s) ${dependents.join(", ")}. ` +
+            `Refusing to delete '${resolved.name}': still used by target(s) ${dependents.join(", ")}. ` +
               "Re-point them first (update_target) or pass force=true.",
           );
         }
@@ -298,7 +307,10 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           credentialRef: i.credentialRef ?? existing.credentialRef,
           host: i.host ?? existing.host,
           port: i.port ?? existing.port,
-          options: i.options ?? existing.options,
+          // Shallow-MERGE options (don't replace): a caller changing one option
+          // must not silently drop others — notably the SSH command allow/deny
+          // guard (options.denyPatterns), a load-bearing safety control.
+          options: i.options ? { ...existing.options, ...i.options } : existing.options,
         };
         await a.registry.upsert(merged);
         a.emitToolsChanged();

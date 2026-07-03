@@ -23,6 +23,12 @@ function clientWithItems(items: Item[]): { client: VaultwardenClient; calls: str
           : items;
       return JSON.stringify(filtered);
     }
+    if (args[0] === "get" && args[1] === "item") {
+      // Mirror `bw get item <id>`: resolve by exact id, else error like the CLI.
+      const found = items.find((i) => i.id === args[2]);
+      if (!found) throw Object.assign(new Error("bw get failed"), { stderr: "Not found." });
+      return JSON.stringify(found);
+    }
     return ""; // delete/sync
   };
   return { client: client as VaultwardenClient, calls };
@@ -51,6 +57,34 @@ describe("getCredential", () => {
     const { client } = clientWithItems([{ id: "abc-123", name: "PiHole", login: { username: "pihole" } }]);
     const cred = await client.getCredential("abc-123");
     expect(cred.username).toBe("pihole");
+  });
+
+  it("resolves a UUID-shaped ref with a bounded `bw get item` (no full-collection decrypt)", async () => {
+    const uuid = "11111111-2222-3333-4444-555555555555";
+    const { client, calls } = clientWithItems([
+      { id: uuid, name: "nas1", login: { username: "root" } },
+      { id: "0", name: "other" },
+    ]);
+    const cred = await client.getCredential(uuid);
+    expect(cred.username).toBe("root");
+    // Fast path used: get item by id, never a full `list items`.
+    expect(calls).toContainEqual(["get", "item", uuid]);
+    expect(calls.some((c) => c[0] === "list" && c.indexOf("--search") === -1)).toBe(false);
+  });
+
+  it("resolves a legacy substring-only ref when unambiguous (migration path)", async () => {
+    const { client } = clientWithItems([{ id: "1", name: "pihole-ssh", login: { username: "pihole" } }]);
+    const cred = await client.getCredential("pihole"); // 'pihole' is a substring of 'pihole-ssh'
+    expect(cred.username).toBe("pihole");
+  });
+
+  it("still prefers an exact match over a substring sibling", async () => {
+    const { client } = clientWithItems([
+      { id: "1", name: "pihole", login: { username: "exact" } },
+      { id: "2", name: "pihole-ssh", login: { username: "sibling" } },
+    ]);
+    const cred = await client.getCredential("pihole");
+    expect(cred.username).toBe("exact");
   });
 
   it("fails clearly when nothing matches", async () => {
@@ -101,10 +135,16 @@ describe("resolveItem", () => {
     expect(resolveItem(items, "pihole")!.id).toBe("1"); // only "PiHole" lowercases to "pihole"
   });
   it("returns null when nothing matches (lets the caller widen the set)", () => {
-    expect(resolveItem(items, "missing")).toBeNull();
+    expect(resolveItem([{ id: "1", name: "unrelated" }], "missing")).toBeNull();
   });
   it("throws on an ambiguous case-insensitive match", () => {
     expect(() => resolveItem([{ id: "1", name: "NAS" }, { id: "2", name: "nas" }], "Nas")).toThrow(/case-insensitively/);
+  });
+  it("falls back to a unique substring match (migration path)", () => {
+    expect(resolveItem([{ id: "1", name: "pihole-ssh" }], "pihole")!.id).toBe("1");
+  });
+  it("throws on an ambiguous substring match with no better candidate", () => {
+    expect(() => resolveItem([{ id: "1", name: "nas-a" }, { id: "2", name: "nas-b" }], "nas")).toThrow(/rename them/);
   });
 });
 
