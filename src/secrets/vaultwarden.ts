@@ -302,8 +302,13 @@ export class VaultwardenClient {
       ref,
       username: item.login?.username,
       password: item.login?.password,
-      // A private key / API token is commonly stored in notes or a custom field.
-      secret: fields["private_key"] ?? fields["token"] ?? fields["api_key"] ?? item.notes ?? undefined,
+      // `secret` is an EXPLICIT secret field only (private key / API token). We do
+      // NOT fall back to `item.notes`: the hand-off writes descriptive notes on
+      // every password login, and treating those as a secret made connectors
+      // misread them as a private key / bearer token (#26). Notes are exposed
+      // separately for connectors that genuinely want them.
+      secret: fields["private_key"] ?? fields["token"] ?? fields["api_key"] ?? undefined,
+      notes: item.notes ?? undefined,
       fields,
       uris: (item.login?.uris ?? []).map((u) => u.uri),
     };

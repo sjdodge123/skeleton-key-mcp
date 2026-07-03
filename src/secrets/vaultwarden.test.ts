@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildLoginItemJson, resolveItem, VaultwardenClient } from "./vaultwarden.js";
 
-type Item = { id: string; name: string; login?: any; fields?: any[] };
+type Item = { id: string; name: string; login?: any; fields?: any[]; notes?: string };
 
 /**
  * An unlocked client backed by a fixed item set. `bw list items` is served from
@@ -92,6 +92,22 @@ describe("getCredential", () => {
       { id: "2", name: "nas" },
     ]);
     await expect(client.getCredential("nas")).rejects.toThrow(/2 vault items are named "nas"/);
+  });
+
+  it("does NOT expose freeform notes as a secret, but does expose them as notes (#26)", async () => {
+    const { client } = clientWithItems([
+      { id: "1", name: "pw-login", login: { username: "u", password: "p" }, notes: "Stored via Skeleton Key credential hand-off. reason" },
+    ]);
+    const cred = await client.getCredential("pw-login");
+    expect(cred.secret).toBeUndefined(); // notes must not become a token/key
+    expect(cred.password).toBe("p");
+    expect(cred.notes).toContain("hand-off");
+  });
+
+  it("uses an explicit token field as the secret (not notes)", async () => {
+    const { client } = clientWithItems([{ id: "1", name: "tok", fields: [{ name: "token", value: "T" }], notes: "just a note" }]);
+    const cred = await client.getCredential("tok");
+    expect(cred.secret).toBe("T");
   });
 });
 
