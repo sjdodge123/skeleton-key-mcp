@@ -69,6 +69,19 @@ export function buildMcpServer(app: AppState): Server {
     const resolved = findTool(app, name);
     const ts = new Date().toISOString();
 
+    // Locked gate FIRST — before we distinguish unknown/known tools or validate
+    // args. While locked, anything that isn't a banner-only availableWhenLocked
+    // tool returns the SAME unlock guidance, whether the tool exists or not, so a
+    // leaked token can't probe tool/target names via "Unknown tool" vs schema
+    // errors vs locked guidance (tools/list is gated the same way).
+    if (app.locked && !resolved?.availableWhenLocked) {
+      app.audit.record({
+        ts, tool: name, target: resolved?.targetName ?? "(global)", tier: resolved?.tier ?? "read",
+        args: rawArgs, status: "denied", detail: "vault locked",
+      });
+      return { content: [{ type: "text", text: app.unlockGuidance() }], isError: true };
+    }
+
     if (!resolved) {
       return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }
@@ -86,19 +99,6 @@ export function buildMcpServer(app: AppState): Server {
         content: [{ type: "text", text: `Invalid input: ${parsed.error.message}` }],
         isError: true,
       };
-    }
-
-    // Locked gate: without credentials most tools can only fail — short-circuit
-    // with recovery guidance instead of surfacing a raw connector error. While
-    // locked, only a banner-only get_started runs (availableWhenLocked); every
-    // other tool (incl. list_targets/network_scan) is withheld so a leaked token
-    // can't enumerate targets or scan the LAN before the admin unlocks.
-    if (app.locked && !resolved.availableWhenLocked) {
-      app.audit.record({
-        ts, tool: name, target: auditTarget, tier: resolved.tier,
-        args: parsed.data, status: "denied", detail: "vault locked",
-      });
-      return { content: [{ type: "text", text: app.unlockGuidance() }], isError: true };
     }
 
     // Approval gate for state-changing tools.

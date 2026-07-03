@@ -67,6 +67,8 @@ export class SetupService {
   async generateBearerToken(): Promise<string> {
     const token = randomBytes(32).toString("base64url");
     await this.app.store.update({ mcpBearerToken: token });
+    // Persist the hash so the bearer stays verifiable while the vault is locked.
+    await this.app.ensureBearerHash();
     return token;
   }
 

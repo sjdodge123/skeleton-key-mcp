@@ -11,44 +11,59 @@ function storeAt(start = 1_000_000): { store: CredentialRequestStore; tick: (ms:
 const sample = { name: "nas1", host: "192.168.0.50", kind: "password" as const, reason: "onboard nas1" };
 
 describe("CredentialRequestStore", () => {
-  it("creates a pending request with a unique id", () => {
+  it("creates a pending request with a unique id and a form (CSRF) token", () => {
     const { store } = storeAt();
     const a = store.create(sample);
     const b = store.create(sample);
     expect(a.status).toBe("pending");
     expect(a.id).not.toBe(b.id);
+    expect(a.formToken).toBeTruthy();
+    expect(a.formToken).not.toBe(b.formToken);
   });
 
-  it("fulfills a pending request exactly once (single-use)", () => {
+  it("claims a pending request exactly once (single-use)", () => {
     const { store } = storeAt();
     const req = store.create(sample);
-    expect(store.fulfill(req.id)).toBe(true);
+    expect(store.claim(req.id)).toBe(true);
     expect(store.get(req.id)!.status).toBe("fulfilled");
     expect(store.get(req.id)!.fulfilledName).toBe("nas1");
-    // Second attempt is rejected — the link can't be reused.
-    expect(store.fulfill(req.id)).toBe(false);
+    // Second concurrent claim is rejected — the link can't be double-written.
+    expect(store.claim(req.id)).toBe(false);
   });
 
-  it("cannot fulfill a declined request", () => {
+  it("release() reverts a claim so the user can retry after a failed write", () => {
+    const { store } = storeAt();
+    const req = store.create(sample);
+    expect(store.claim(req.id)).toBe(true);
+    expect(store.release(req.id)).toBe(true);
+    expect(store.get(req.id)!.status).toBe("pending");
+    expect(store.get(req.id)!.fulfilledName).toBeUndefined();
+    // Now claimable again.
+    expect(store.claim(req.id)).toBe(true);
+    // release only reverts a fulfilled request, not a pending one.
+    expect(store.release("nope")).toBe(false);
+  });
+
+  it("cannot claim a declined request", () => {
     const { store } = storeAt();
     const req = store.create(sample);
     expect(store.decline(req.id)).toBe(true);
-    expect(store.fulfill(req.id)).toBe(false);
+    expect(store.claim(req.id)).toBe(false);
     expect(store.get(req.id)!.status).toBe("declined");
   });
 
-  it("expires a pending request past its TTL and refuses to fulfill it", () => {
+  it("expires a pending request past its TTL and refuses to claim it", () => {
     const { store, tick } = storeAt();
     const req = store.create(sample);
     tick(REQUEST_TTL_MS + 1);
     expect(store.get(req.id)!.status).toBe("expired");
-    expect(store.fulfill(req.id)).toBe(false);
+    expect(store.claim(req.id)).toBe(false);
   });
 
-  it("does not expire a request that was fulfilled before the TTL", () => {
+  it("does not expire a request that was claimed before the TTL", () => {
     const { store, tick } = storeAt();
     const req = store.create(sample);
-    store.fulfill(req.id);
+    store.claim(req.id);
     tick(REQUEST_TTL_MS + 1);
     expect(store.get(req.id)!.status).toBe("fulfilled");
   });

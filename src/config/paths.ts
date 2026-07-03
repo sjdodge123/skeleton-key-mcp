@@ -23,6 +23,9 @@ export const paths = {
   /** Auto-detected public base URL, persisted on first boot. Non-secret and
    *  readable while the vault is locked (unlock guidance needs it). */
   publicUrl: path.join(DATA_DIR, "public-url"),
+  /** SHA-256 hash of the MCP bearer token, so it can be verified while the vault
+   *  is locked. Non-secret (hash of a 256-bit random token). */
+  bearerHash: path.join(DATA_DIR, "mcp-bearer.hash"),
 } as const;
 
 export const env = {

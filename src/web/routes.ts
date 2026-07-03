@@ -75,6 +75,9 @@ export function buildApiRouter(app: AppState): Router {
           masterPassword: s.bwMasterPassword,
         });
       }
+      // Backfill the bearer hash now the token is readable (older deployments /
+      // rotations), so the static bearer is verifiable while locked next time.
+      await app.ensureBearerHash();
       // Sessions that connected while locked saw only the banner-only toolset
       // (the locked tools/list gate); nudge them to re-list now the full set is
       // available, so a live MCP client recovers without reconnecting.

@@ -38,6 +38,7 @@ async function main(): Promise<void> {
         // Best-effort refresh; safe to fail if Vaultwarden is unreachable (offline cache).
         await app.vault.sync().catch(() => {});
       }
+      await app.ensureBearerHash();
       console.log("[skeleton-key] Store unlocked at boot.");
     } catch (err) {
       console.error("[skeleton-key] Boot unlock failed:", err instanceof Error ? err.message : err);

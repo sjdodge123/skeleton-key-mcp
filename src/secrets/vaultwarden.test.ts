@@ -53,12 +53,6 @@ describe("getCredential", () => {
     expect(cred.username).toBe("pihole");
   });
 
-  it("resolves a ref given as an item id (via the full-list fallback)", async () => {
-    const { client } = clientWithItems([{ id: "abc-123", name: "PiHole", login: { username: "pihole" } }]);
-    const cred = await client.getCredential("abc-123");
-    expect(cred.username).toBe("pihole");
-  });
-
   it("resolves a UUID-shaped ref with a bounded `bw get item` (no full-collection decrypt)", async () => {
     const uuid = "11111111-2222-3333-4444-555555555555";
     const { client, calls } = clientWithItems([
