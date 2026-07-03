@@ -8,10 +8,32 @@ export interface SshExecResult {
   code: number | null;
 }
 
+/** True only for text that is actually an SSH private key. Used so freeform
+ *  notes (which `getCredential` exposes via `cred.secret`) aren't mistaken for a
+ *  key and handed to ssh2, which would fail with "Unsupported key format" even
+ *  though the credential is a perfectly good username/password login. */
+function looksLikePrivateKey(v: string | undefined): v is string {
+  return !!v && (v.includes("-----BEGIN") || v.startsWith("PuTTY-User-Key-File"));
+}
+
+/**
+ * Decide SSH auth from a resolved Credential (pure, exported for testing).
+ * A private key is preferred, but ONLY an explicit `private_key` field or a
+ * key-shaped `secret` counts — otherwise we fall back to password auth. This is
+ * what makes password logins from the credential hand-off (whose notes land in
+ * `cred.secret`) work instead of being misread as a broken key.
+ */
+export function resolveSshAuth(cred: Credential): { privateKey?: string; passphrase?: string; password?: string } {
+  const keyField = cred.fields["private_key"];
+  const privateKey = keyField ?? (looksLikePrivateKey(cred.secret) ? cred.secret : undefined);
+  if (privateKey) return { privateKey, passphrase: cred.fields["key_passphrase"] || undefined };
+  if (cred.password) return { password: cred.password };
+  return {};
+}
+
 /**
  * Open a one-shot SSH connection, run a command, and return its output.
- * Auth comes from the target's resolved Credential: a private key (in `secret`
- * or the `private_key` field) is preferred, falling back to password auth.
+ * Auth comes from the target's resolved Credential (see `resolveSshAuth`).
  */
 export function runSsh(
   target: Target,
@@ -20,18 +42,13 @@ export function runSsh(
   opts: { timeoutMs?: number } = {},
 ): Promise<SshExecResult> {
   const timeoutMs = opts.timeoutMs ?? 20_000;
-  const privateKey = cred.fields["private_key"] ?? cred.secret;
-  const usePassword = !privateKey && cred.password;
 
   const config: ConnectConfig = {
     host: target.host,
     port: target.port ?? 22,
     username: cred.username ?? cred.fields["username"] ?? "root",
     readyTimeout: timeoutMs,
-    ...(privateKey
-      ? { privateKey, passphrase: cred.fields["key_passphrase"] || undefined }
-      : {}),
-    ...(usePassword ? { password: cred.password } : {}),
+    ...resolveSshAuth(cred),
   };
 
   return new Promise<SshExecResult>((resolve, reject) => {

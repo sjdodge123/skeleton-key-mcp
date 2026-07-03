@@ -1,0 +1,43 @@
+import { describe, it, expect } from "vitest";
+import { resolveSshAuth, shellQuote } from "./ssh-exec.js";
+import type { Credential } from "../secrets/types.js";
+
+function cred(partial: Partial<Credential>): Credential {
+  return { ref: "x", fields: {}, uris: [], ...partial };
+}
+
+const KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----";
+
+describe("resolveSshAuth", () => {
+  it("uses password auth when the only 'secret' is freeform notes (the hand-off bug)", () => {
+    // getCredential exposes item.notes as cred.secret; it must NOT be read as a key.
+    const auth = resolveSshAuth(cred({ password: "pw", secret: "Stored via Skeleton Key credential hand-off. onboard nas" }));
+    expect(auth).toEqual({ password: "pw" });
+  });
+
+  it("uses the explicit private_key field (with passphrase) as a key", () => {
+    const auth = resolveSshAuth(cred({ fields: { private_key: KEY, key_passphrase: "pp" }, password: "ignored" }));
+    expect(auth).toEqual({ privateKey: KEY, passphrase: "pp" });
+  });
+
+  it("uses a key-shaped secret as a key", () => {
+    const auth = resolveSshAuth(cred({ secret: KEY }));
+    expect(auth).toEqual({ privateKey: KEY, passphrase: undefined });
+  });
+
+  it("prefers a real key over a password when both are present", () => {
+    const auth = resolveSshAuth(cred({ secret: KEY, password: "pw" }));
+    expect(auth.privateKey).toBe(KEY);
+    expect(auth.password).toBeUndefined();
+  });
+
+  it("returns no auth when neither a key nor a password is available", () => {
+    expect(resolveSshAuth(cred({ secret: "just a note" }))).toEqual({});
+  });
+});
+
+describe("shellQuote", () => {
+  it("single-quotes and escapes embedded quotes", () => {
+    expect(shellQuote("a'b")).toBe(`'a'\\''b'`);
+  });
+});
