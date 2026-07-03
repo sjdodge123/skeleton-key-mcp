@@ -1,20 +1,24 @@
 import type { Request } from "express";
-import type { AppState } from "../app.js";
 
 /**
  * Origin used to build OAuth discovery metadata and the WWW-Authenticate hint.
  *
- * Prefer the pinned/auto-detected public URL (`app.publicUrl()`: the
- * `SKELETON_KEY_PUBLIC_URL` env override, else the LAN address detected on first
- * boot) so the OAuth issuer/authorization endpoints — a TOTP-gated flow — can't
- * be steered by a forged `Host` header. Only when no public URL is known at all
- * do we fall back to the request's own protocol+host. We deliberately do NOT
- * trust `X-Forwarded-*`: Skeleton Key is reached directly on the LAN, so
- * honoring proxy headers would only add an attacker-controlled input.
+ * This is MACHINE-facing: the client fetches these URLs and must be able to
+ * reach them. An explicit `SKELETON_KEY_PUBLIC_URL` pins the issuer (the
+ * security control against a forged `Host`); otherwise we use the request's own
+ * protocol+host — the exact address the client reached us on, which is always
+ * reachable by that client. We deliberately do NOT use the auto-detected
+ * `publicUrl()` here: on a bridged Docker container (the documented default)
+ * first-boot detection can only see Docker's internal subnet, so pinning
+ * discovery to it would advertise an unreachable address and break OAuth for
+ * everyone. (Human-facing, phishing-sensitive links — unlock guidance, the
+ * credential hand-off — use `AppState.publicUrl()` instead, which never falls
+ * back to `Host`.) We also do NOT trust `X-Forwarded-*`: reached directly on the
+ * LAN, honoring proxy headers would only add an attacker-controlled input.
  */
-export function baseUrl(req: Request, app?: AppState): string {
-  const pinned = app ? app.publicUrl() : process.env.SKELETON_KEY_PUBLIC_URL?.replace(/\/$/, "") ?? null;
-  if (pinned) return pinned;
+export function baseUrl(req: Request): string {
+  const configured = process.env.SKELETON_KEY_PUBLIC_URL;
+  if (configured) return configured.replace(/\/$/, "");
   return `${req.protocol}://${req.get("host")}`;
 }
 

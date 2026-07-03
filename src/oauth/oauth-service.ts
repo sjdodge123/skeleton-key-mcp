@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
+import { sha256hex } from "../lib/hash.js";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { paths } from "../config/paths.js";
@@ -21,9 +22,7 @@ const REFRESH_TTL_S = 30 * 24 * 3600; // 30 days
 
 export const OAUTH_SCOPE = "mcp";
 
-function sha256(v: string): string {
-  return createHash("sha256").update(v).digest("hex");
-}
+const sha256 = sha256hex;
 function token(bytes = 32): string {
   return randomBytes(bytes).toString("base64url");
 }
