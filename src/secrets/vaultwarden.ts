@@ -134,6 +134,23 @@ export class VaultwardenClient {
     this.session = session;
   }
 
+  /**
+   * Bring the client to an unlocked state from whatever state `bw` is in. The
+   * login/config state persists on disk across restarts, so after a container
+   * restart `bw` is typically "logged in but locked" — in that case we must NOT
+   * call `bw config server` (it errors with "Logout required...") or re-login;
+   * we just unlock. We only set the server + log in when `bw` is unauthenticated
+   * (fresh cache). Idempotent and safe to call on every boot/unlock.
+   */
+  async reestablish(cfg: { serverUrl: string; clientId: string; clientSecret: string; masterPassword: string }): Promise<void> {
+    const st = await this.status();
+    if (st.status === "unauthenticated") {
+      await this.setServer(cfg.serverUrl);
+      await this.loginApiKey(cfg.clientId, cfg.clientSecret);
+    }
+    await this.unlock(cfg.masterPassword);
+  }
+
   /** Refresh the local cache from the server. Requires connectivity. */
   async sync(): Promise<void> {
     this.assertUnlocked();

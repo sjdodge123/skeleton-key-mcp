@@ -67,12 +67,12 @@ export function buildApiRouter(app: AppState): Router {
       // If a Vaultwarden connection was previously saved, re-establish it.
       const s = app.store.get();
       if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
-        await app.vault.setServer(s.bwServerUrl);
-        const st = await app.vault.status();
-        if (st.status === "unauthenticated") {
-          await app.vault.loginApiKey(s.bwClientId, s.bwClientSecret);
-        }
-        await app.vault.unlock(s.bwMasterPassword);
+        await app.vault.reestablish({
+          serverUrl: s.bwServerUrl,
+          clientId: s.bwClientId,
+          clientSecret: s.bwClientSecret,
+          masterPassword: s.bwMasterPassword,
+        });
       }
       res.json({ ok: true, vaultUnlocked: app.vault.unlocked });
     }),

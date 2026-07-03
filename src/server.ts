@@ -14,12 +14,12 @@ async function main(): Promise<void> {
       await app.store.unlock(env.unlockPassphrase);
       const s = app.store.get();
       if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
-        await app.vault.setServer(s.bwServerUrl);
-        const st = await app.vault.status();
-        if (st.status === "unauthenticated") {
-          await app.vault.loginApiKey(s.bwClientId, s.bwClientSecret);
-        }
-        await app.vault.unlock(s.bwMasterPassword);
+        await app.vault.reestablish({
+          serverUrl: s.bwServerUrl,
+          clientId: s.bwClientId,
+          clientSecret: s.bwClientSecret,
+          masterPassword: s.bwMasterPassword,
+        });
         // Best-effort refresh; safe to fail if Vaultwarden is unreachable (offline cache).
         await app.vault.sync().catch(() => {});
       }
