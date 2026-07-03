@@ -1,17 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { Request, Response } from "express";
 import { mcpAuth } from "./auth.js";
 import type { AppState } from "../app.js";
 
 /**
- * mcpAuth behavior matrix, in particular the locked-vault paths: a locked vault
- * must NOT hard-503 authenticated clients (sessions connect; tools degrade with
- * unlock guidance), while an unverifiable static bearer against a locked store
- * gets a 503 whose body says how to recover.
+ * mcpAuth behavior matrix. Key property: auth routing is independent of the vault
+ * lock state — a locked vault never hard-503s an authenticated client, and an
+ * expired/absent token always gets the 401 challenge so the client can silently
+ * refresh (which works while locked) instead of the endpoint going dark.
  */
-
-// The URL assertions below exercise the Host-header fallback path.
-delete process.env.SKELETON_KEY_PUBLIC_URL;
 
 interface FakeOpts {
   setupComplete?: boolean;
@@ -19,11 +16,17 @@ interface FakeOpts {
   vaultUnlocked?: boolean;
   bearer?: string;
   oauthToken?: string;
+  publicUrl?: string;
 }
 
 function fakeApp(opts: FakeOpts): AppState {
+  const locked = (opts.storeLocked ?? false) || !(opts.vaultUnlocked ?? true);
   return {
     isSetupComplete: async () => opts.setupComplete ?? true,
+    get locked() {
+      return locked;
+    },
+    unlockUrl: () => opts.publicUrl ?? null,
     store: {
       locked: opts.storeLocked ?? false,
       get: () => {
@@ -31,7 +34,6 @@ function fakeApp(opts: FakeOpts): AppState {
         return { mcpBearerToken: opts.bearer };
       },
     },
-    vault: { unlocked: opts.vaultUnlocked ?? true },
     oauth: { validateAccessToken: (t: string) => t === opts.oauthToken },
   } as unknown as AppState;
 }
@@ -47,18 +49,9 @@ function fakeReq(token?: string): Request {
 function fakeRes() {
   const out = { status: 0, body: undefined as any, headers: {} as Record<string, string> };
   const res = {
-    status: (code: number) => {
-      out.status = code;
-      return res;
-    },
-    set: (name: string, value: string) => {
-      out.headers[name] = value;
-      return res;
-    },
-    json: (body: unknown) => {
-      out.body = body;
-      return res;
-    },
+    status: (code: number) => ((out.status = code), res),
+    set: (name: string, value: string) => ((out.headers[name] = value), res),
+    json: (body: unknown) => ((out.body = body), res),
   };
   return { res: res as unknown as Response, out };
 }
@@ -72,6 +65,14 @@ async function run(app: AppState, token?: string) {
   return { out, nexted };
 }
 
+beforeEach(() => {
+  // The unlock URL is a property of the fake app; keep the ambient env out of it.
+  vi.stubEnv("SKELETON_KEY_PUBLIC_URL", "");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe("mcpAuth", () => {
   it("passes a valid OAuth token through even while the vault is locked", async () => {
     const app = fakeApp({ storeLocked: true, vaultUnlocked: false, oauthToken: "good-oauth" });
@@ -80,23 +81,35 @@ describe("mcpAuth", () => {
   });
 
   it("passes the static bearer when the store is unlocked", async () => {
-    const app = fakeApp({ bearer: "static-token" });
-    const { nexted } = await run(app, "static-token");
+    const { nexted } = await run(fakeApp({ bearer: "static-token" }), "static-token");
     expect(nexted).toBe(true);
   });
 
-  it("503s with unlock guidance when the store is locked and the token isn't OAuth", async () => {
+  it("challenges (401) — not 503 — when locked with an expired/invalid token, so the client can refresh", async () => {
     const app = fakeApp({ storeLocked: true, vaultUnlocked: false });
-    const { out, nexted } = await run(app, "maybe-the-static-bearer");
+    const { out, nexted } = await run(app, "expired-token");
     expect(nexted).toBe(false);
-    expect(out.status).toBe(503);
+    expect(out.status).toBe(401);
+    expect(out.headers["WWW-Authenticate"]).toContain("oauth-protected-resource");
+  });
+
+  it("adds unlock guidance to the challenge when locked and a public URL is pinned", async () => {
+    const app = fakeApp({ storeLocked: true, vaultUnlocked: false, publicUrl: "https://sk.lan:8787" });
+    const { out } = await run(app, "expired-token");
+    expect(out.status).toBe(401);
     expect(out.body.error).toMatch(/locked/i);
-    expect(out.body.error).toContain("http://192.168.0.229:8787/");
+    expect(out.body.error).toContain("https://sk.lan:8787/");
+  });
+
+  it("does NOT put a Host-derived URL in the unlock guidance", async () => {
+    // No public URL pinned → guidance must stay host-agnostic (anti-phishing).
+    const app = fakeApp({ storeLocked: true, vaultUnlocked: false });
+    const { out } = await run(app, "expired-token");
+    expect(out.body.error).not.toContain("192.168.0.229");
   });
 
   it("401s with the discovery hint on a bad token when unlocked", async () => {
-    const app = fakeApp({ bearer: "static-token" });
-    const { out, nexted } = await run(app, "wrong");
+    const { out, nexted } = await run(fakeApp({ bearer: "static-token" }), "wrong");
     expect(nexted).toBe(false);
     expect(out.status).toBe(401);
     expect(out.headers["WWW-Authenticate"]).toContain("oauth-protected-resource");
@@ -108,10 +121,10 @@ describe("mcpAuth", () => {
     expect(out.status).toBe(401);
   });
 
-  it("503s with the wizard URL until setup completes", async () => {
+  it("503s (without a Host-derived URL) until setup completes", async () => {
     const { out, nexted } = await run(fakeApp({ setupComplete: false }), "anything");
     expect(nexted).toBe(false);
     expect(out.status).toBe(503);
-    expect(out.body.error).toContain("http://192.168.0.229:8787/");
+    expect(out.body.error).not.toContain("192.168.0.229");
   });
 });

@@ -20,7 +20,7 @@ Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connect
 - **LAN discovery fingerprinting** — SSH banner + HTTP content match with confidence levels (replaces port-only guessing).
 - **Packaging & CI** — multi-stage Dockerfile, Portainer compose, CI on every PR, GHCR publish on merge, branch protection.
 - **Exact-name credential lookup** — `getCredential` resolves refs by exact item name (`bw get item` substring-matched, so `PiHole` broke when `pihole-ssh` was created; found live during onboarding).
-- **Locked-vault UX (#13)** — a locked vault no longer 503s authenticated clients; sessions connect, `get_started`/`list_targets`/`network_scan` still work, and every other tool call returns "unlock at `<admin URL>`" guidance instead of an opaque error.
+- **Locked-vault UX (#13)** — a locked vault no longer 503s authenticated clients; sessions connect and a banner-only `get_started` tells the user how to unlock, while every other tool (incl. `list_targets`/`network_scan`) is withheld so a leaked token can't enumerate/scan before unlock. Auth routing is lock-independent (expired token → 401→refresh, not a dead 503); unlock URLs come from `SKELETON_KEY_PUBLIC_URL` only, never the client Host header. Reworked after an adversarial `/code-review` caught the first cut had removed the restart kill-switch.
 
 Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang).
 

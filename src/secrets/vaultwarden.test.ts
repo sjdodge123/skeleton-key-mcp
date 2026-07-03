@@ -1,13 +1,26 @@
 import { describe, it, expect } from "vitest";
-import { buildLoginItemJson, VaultwardenClient } from "./vaultwarden.js";
+import { buildLoginItemJson, resolveItem, VaultwardenClient } from "./vaultwarden.js";
 
-/** An unlocked client whose `bw list items` returns the given items. */
-function clientWithItems(items: unknown[]): VaultwardenClient {
+type Item = { id: string; name: string; login?: any; fields?: any[] };
+
+/**
+ * An unlocked client backed by a fixed item set. `bw list items` is served from
+ * that set, honoring `--search <term>` as a case-insensitive name-substring
+ * filter (matching the real CLI) so the bounded fast path is exercised — and it
+ * asserts getCredential never shells out to `bw get item`.
+ */
+function clientWithItems(items: Item[]): VaultwardenClient {
   const client = new VaultwardenClient("/unused") as any;
   client.session = "test-session";
   client.run = async (args: string[]) => {
-    expect(args).toEqual(["list", "items"]); // getCredential must never `bw get item <name>`
-    return JSON.stringify(items);
+    expect(args[0]).toBe("list");
+    expect(args[1]).toBe("items");
+    const searchIdx = args.indexOf("--search");
+    const filtered =
+      searchIdx >= 0
+        ? items.filter((i) => i.name.toLowerCase().includes(args[searchIdx + 1]!.toLowerCase()))
+        : items;
+    return JSON.stringify(filtered);
   };
   return client as VaultwardenClient;
 }
@@ -25,9 +38,21 @@ describe("getCredential", () => {
     expect(key.secret).toBe("KEY");
   });
 
-  it("fails clearly when no item has that exact name", async () => {
+  it("resolves a case-mismatched ref when it is unambiguous (old bw behavior)", async () => {
+    const client = clientWithItems([{ id: "1", name: "PiHole", login: { username: "pihole" } }]);
+    const cred = await client.getCredential("pihole");
+    expect(cred.username).toBe("pihole");
+  });
+
+  it("resolves a ref given as an item id (via the full-list fallback)", async () => {
+    const client = clientWithItems([{ id: "abc-123", name: "PiHole", login: { username: "pihole" } }]);
+    const cred = await client.getCredential("abc-123");
+    expect(cred.username).toBe("pihole");
+  });
+
+  it("fails clearly when nothing matches", async () => {
     const client = clientWithItems([{ id: "1", name: "pihole-ssh" }]);
-    await expect(client.getCredential("PiHole")).rejects.toThrow(/No vault item named "PiHole"/);
+    await expect(client.getCredential("nope")).rejects.toThrow(/No vault item named "nope"/);
   });
 
   it("fails clearly on true duplicate names", async () => {
@@ -36,6 +61,27 @@ describe("getCredential", () => {
       { id: "2", name: "nas" },
     ]);
     await expect(client.getCredential("nas")).rejects.toThrow(/2 vault items are named "nas"/);
+  });
+});
+
+describe("resolveItem", () => {
+  const items = [
+    { id: "1", name: "PiHole" },
+    { id: "2", name: "pihole-ssh" },
+  ];
+  it("prefers an exact name match over a substring sibling", () => {
+    expect(resolveItem(items, "PiHole")!.id).toBe("1");
+    expect(resolveItem(items, "pihole-ssh")!.id).toBe("2");
+  });
+  it("falls back to item id, then unique case-insensitive name", () => {
+    expect(resolveItem(items, "2")!.id).toBe("2");
+    expect(resolveItem(items, "pihole")!.id).toBe("1"); // only "PiHole" lowercases to "pihole"
+  });
+  it("returns null when nothing matches (lets the caller widen the set)", () => {
+    expect(resolveItem(items, "missing")).toBeNull();
+  });
+  it("throws on an ambiguous case-insensitive match", () => {
+    expect(() => resolveItem([{ id: "1", name: "NAS" }, { id: "2", name: "nas" }], "Nas")).toThrow(/case-insensitively/);
   });
 });
 

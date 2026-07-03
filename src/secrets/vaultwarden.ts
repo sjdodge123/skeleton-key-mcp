@@ -230,9 +230,12 @@ export class VaultwardenClient {
     return { name: input.name };
   }
 
-  private async listItems(): Promise<BwItem[]> {
+  private async listItems(search?: string): Promise<BwItem[]> {
     this.assertUnlocked();
-    const out = await this.run(["list", "items"]);
+    // `--search` bounds the returned set (and how many decrypted credentials we
+    // materialize in memory) instead of serializing the whole collection.
+    const args = search ? ["list", "items", "--search", search] : ["list", "items"];
+    const out = await this.run(args);
     return JSON.parse(out) as BwItem[];
   }
 
@@ -241,19 +244,19 @@ export class VaultwardenClient {
   }
 
   /**
-   * Fetch one item by exact name and map it to a connector-friendly Credential.
+   * Fetch one item by credentialRef and map it to a connector-friendly Credential.
+   *
    * Deliberately NOT `bw get item <name>`: that matches by substring, so a ref
    * like "PiHole" breaks as soon as an overlapping name ("pihole-ssh") exists.
+   * We resolve in priority order — exact name → item id → unique case-insensitive
+   * name — killing the ambiguity while preserving the old behavior's id and
+   * case-insensitive matches. The bounded `--search` fetch is the fast path; a
+   * full-list fallback covers refs `--search` can't surface (notably item ids).
    */
   async getCredential(ref: string): Promise<Credential> {
-    const matches = (await this.listItems()).filter((i) => i.name === ref);
-    if (matches.length === 0) {
-      throw new Error(`No vault item named "${ref}" in the scoped collection.`);
-    }
-    if (matches.length > 1) {
-      throw new Error(`${matches.length} vault items are named "${ref}" — rename them so the credentialRef is unique.`);
-    }
-    const item = matches[0]!;
+    let item = resolveItem(await this.listItems(ref), ref);
+    if (!item) item = resolveItem(await this.listItems(), ref);
+    if (!item) throw new Error(`No vault item named "${ref}" in the scoped collection.`);
     const fields: Record<string, string> = {};
     for (const f of item.fields ?? []) fields[f.name] = f.value;
     return {
@@ -266,6 +269,29 @@ export class VaultwardenClient {
       uris: (item.login?.uris ?? []).map((u) => u.uri),
     };
   }
+}
+
+/**
+ * Resolve a credentialRef against a candidate item set (exported for testing).
+ * Priority: exact name → item id → unique case-insensitive name. Returns null
+ * when nothing matches (so the caller can widen the candidate set and retry);
+ * throws only on a genuinely ambiguous match so a ref never silently resolves to
+ * the wrong secret.
+ */
+export function resolveItem<T extends { id: string; name: string }>(candidates: T[], ref: string): T | null {
+  const exact = candidates.filter((i) => i.name === ref);
+  if (exact.length === 1) return exact[0]!;
+  if (exact.length > 1) {
+    throw new Error(`${exact.length} vault items are named "${ref}" — rename them so the credentialRef is unique.`);
+  }
+  const byId = candidates.filter((i) => i.id === ref);
+  if (byId.length) return byId[0]!; // ids are unique
+  const ci = candidates.filter((i) => i.name.toLowerCase() === ref.toLowerCase());
+  if (ci.length === 1) return ci[0]!;
+  if (ci.length > 1) {
+    throw new Error(`${ci.length} vault items match "${ref}" case-insensitively — rename them so the credentialRef is unique.`);
+  }
+  return null;
 }
 
 /** Pure builder for a Bitwarden Login item JSON (exported for testing). */
