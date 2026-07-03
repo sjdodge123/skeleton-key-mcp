@@ -5,6 +5,7 @@ import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
 import { CredentialRequestStore } from "./web/credential-requests.js";
+import { loadPublicUrl } from "./config/public-url.js";
 import { authenticator } from "otplib";
 import { paths } from "./config/paths.js";
 
@@ -30,7 +31,18 @@ export class AppState {
     const audit = new AuditLog();
     const oauth = new OAuthService();
     const credentialRequests = new CredentialRequestStore();
-    return new AppState(store, vault, registry, audit, oauth, credentialRequests);
+    const app = new AppState(store, vault, registry, audit, oauth, credentialRequests);
+    app.learnedPublicUrl = await loadPublicUrl();
+    return app;
+  }
+
+  /** Persisted, auto-detected public base URL (set at boot; see server.ts).
+   *  Overridden by SKELETON_KEY_PUBLIC_URL. */
+  private learnedPublicUrl: string | null = null;
+
+  /** Record the boot-detected public URL (already persisted by the caller). */
+  setLearnedPublicUrl(url: string | null): void {
+    this.learnedPublicUrl = url;
   }
 
   /** True once the first-run wizard has completed. Until then the MCP endpoint
@@ -60,7 +72,8 @@ export class AppState {
    */
   publicUrl(): string | null {
     const configured = process.env.SKELETON_KEY_PUBLIC_URL;
-    return configured ? configured.replace(/\/$/, "") : null;
+    if (configured) return configured.replace(/\/$/, "");
+    return this.learnedPublicUrl;
   }
 
   /** Admin web UI URL for "go unlock" guidance, or null if not configured. */

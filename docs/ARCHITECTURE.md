@@ -43,6 +43,7 @@ All mutable state lives under `SKELETON_KEY_DATA_DIR` (`/data` in the image, a D
 - `src/server.ts` — process entry. Boots, optionally auto-unlocks (`SKELETON_KEY_PASSPHRASE`), starts an hourly OAuth-token purge, listens, and shuts down cleanly.
 - `src/app.ts` — `AppState`: the shared handles (bootstrap store, Vaultwarden client, target registry, audit log, OAuth service). Also `verifyTotp` (single source of truth for admin 2FA), `credentialFor`, `isSetupComplete`, and the `onToolsChanged`/`emitToolsChanged` event used for live tool-list updates.
 - `src/config/paths.ts` — resolves the data dir and all file paths; reads `SKELETON_KEY_*` env.
+- `src/config/public-url.ts` — the public base URL for user-facing links (unlock guidance, credential hand-off). Auto-detects the LAN address on first boot and persists it (`data/public-url`); `AppState.publicUrl()` resolves `SKELETON_KEY_PUBLIC_URL` → persisted value → null. Never derived from a request `Host` header (those links ask for secrets — anti-phishing).
 
 **Secrets**
 - `src/secrets/bootstrap-store.ts` — a libsodium `crypto_secretbox` file holding *only* Skeleton Key's own secrets (bw API key, master password, MCP bearer token, TOTP seed). Key derived from a passphrase via argon2id. Locked at rest; unlocked in memory.

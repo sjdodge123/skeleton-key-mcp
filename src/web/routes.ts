@@ -34,6 +34,7 @@ export function buildApiRouter(app: AppState): Router {
         storeExists: await app.store.exists(),
         storeLocked: app.store.locked,
         vaultUnlocked: app.vault.unlocked,
+        publicUrl: app.publicUrl(),
         targetCount: app.registry.list().length,
         toolCount: app.store.locked ? 0 : resolveTools(app).length,
         connectors: listConnectors().map((c) => ({

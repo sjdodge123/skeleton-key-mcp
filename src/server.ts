@@ -2,10 +2,25 @@ import sodium from "./lib/sodium.js";
 import { AppState } from "./app.js";
 import { buildHttpApp } from "./web/server.js";
 import { env, paths } from "./config/paths.js";
+import { detectLanBaseUrl, savePublicUrl } from "./config/public-url.js";
 
 async function main(): Promise<void> {
   await sodium.ready;
   const app = await AppState.create();
+
+  // Determine a public base URL on first boot so user-facing links (unlock
+  // guidance, credential hand-off) are clickable out of the box. An explicit
+  // SKELETON_KEY_PUBLIC_URL always wins; otherwise, if we haven't persisted one
+  // yet, auto-detect the LAN address and remember it. The user can override any
+  // time via the env var (which takes priority over the persisted value).
+  if (!process.env.SKELETON_KEY_PUBLIC_URL && !app.publicUrl()) {
+    const detected = detectLanBaseUrl(env.port);
+    if (detected) {
+      await savePublicUrl(detected).catch(() => {});
+      app.setLearnedPublicUrl(detected);
+      console.log(`[skeleton-key] Auto-detected public URL: ${detected} (override with SKELETON_KEY_PUBLIC_URL).`);
+    }
+  }
 
   // If a store already exists and a passphrase was provided via env, unlock at
   // boot; otherwise the web UI prompts for it (the wizard handles first-run).

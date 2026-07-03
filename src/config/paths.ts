@@ -20,6 +20,9 @@ export const paths = {
   bwCacheDir: path.join(DATA_DIR, "bw-cache"),
   /** Marker written when the first-run wizard completes. */
   setupComplete: path.join(DATA_DIR, "setup-complete.json"),
+  /** Auto-detected public base URL, persisted on first boot. Non-secret and
+   *  readable while the vault is locked (unlock guidance needs it). */
+  publicUrl: path.join(DATA_DIR, "public-url"),
 } as const;
 
 export const env = {

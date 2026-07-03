@@ -23,6 +23,13 @@ services:
     environment:
       SKELETON_KEY_PORT: "8787"
       SKELETON_KEY_BIND_HOST: "0.0.0.0" # inside the container; the port map above scopes it to the LAN
+      # Optional: the absolute URL clients reach this box at. Skeleton Key
+      # auto-detects a LAN address on first boot, so this is only needed to
+      # override it (e.g. a hostname, a different port, or when auto-detection
+      # picks the wrong interface). Used for the clickable unlock and
+      # credential-hand-off links; deliberately never taken from a request Host
+      # header. Example:
+      # SKELETON_KEY_PUBLIC_URL: "http://192.168.1.10:8787"
       # Optional: unlock the encrypted store automatically at boot. If unset, the
       # web UI prompts for the passphrase after a restart. Prefer a Docker/
       # Portainer secret over an inline value.
