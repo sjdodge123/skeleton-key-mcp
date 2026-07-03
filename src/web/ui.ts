@@ -250,7 +250,7 @@ function btn(label,fn,cls){
 }
 const val = (id)=> (el(id)?.value||"").trim();
 async function registerTarget(t){ try{ await api("/targets",t); await refreshTargets(); }catch(e){ err(e.message); } }
-window.addSvc = async (i)=>{ const s=S.discovered[i]; const name=prompt("Name for "+s.host+":", s.host.replace(/\\./g,"-")); if(!name)return; const cred=prompt("Vault item name for credentials (blank if none):")||undefined; await registerTarget({name,type:s.connectorType,host:s.host,port:s.port,credentialRef:cred}); };
+window.addSvc = async (i)=>{ const s=S.discovered[i]; const name=prompt("Name for "+s.host+":", s.host.replace(/\\./g,"-")); if(!name)return; const cred=prompt("Vault item name for credentials (blank if none):")||undefined; await registerTarget({name,type:(s.registerType||s.connectorType),host:s.host,port:s.port,credentialRef:cred}); };
 async function refreshTargets(){ const list=el("tlist"); if(!list)return; const r=await api("/targets"); list.innerHTML = r.targets.length? '<h3>Registered</h3>'+r.targets.map(t=>'<div class="svc"><code>'+t.name+'</code> ('+t.type+') → '+t.host+'</div>').join(""):""; }
 async function render(){ renderSteps(); try{ el("view").innerHTML = await views[S.step](); if(S.step===5) refreshTargets(); }catch(e){ err(e.message); } }
 render();

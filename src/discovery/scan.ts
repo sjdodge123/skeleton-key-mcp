@@ -42,9 +42,9 @@ const PORT_PROBES: PortProbe[] = [
   { port: 5001, kind: "https", hint: { type: "synology", label: "Synology DSM" } },
   { port: 8006, kind: "https", hint: { type: "proxmox", label: "Proxmox VE" } },
   { port: 8123, kind: "http", hint: { type: "home-assistant", label: "Home Assistant" } },
-  { port: 8443, kind: "https" },
-  { port: 9000, kind: "http" },
-  { port: 9443, kind: "https" },
+  { port: 8443, kind: "https", hint: { type: "unifi", label: "UniFi" } },
+  { port: 9000, kind: "http" }, // too common (MinIO, SonarQube, …) — content-match only
+  { port: 9443, kind: "https", hint: { type: "portainer", label: "Portainer" } },
   { port: 32400, kind: "http", hint: { type: "plex", label: "Plex" } },
 ];
 
@@ -54,7 +54,7 @@ export const HTTP_FINGERPRINTS: { type: string; label: string; re: RegExp }[] = 
   { type: "home-assistant", label: "Home Assistant", re: /home\s*assistant|homeassistant|hass-frontend/i },
   { type: "portainer", label: "Portainer", re: /portainer/i },
   { type: "synology", label: "Synology DSM", re: /synology|diskstation|synohdpack|synowebfmanager/i },
-  { type: "unifi", label: "UniFi", re: /\bunifi\b|ubnt/i },
+  { type: "unifi", label: "UniFi", re: /\bunifi\b/i }, // 'ubnt' dropped — too short, matched substrings anywhere
   { type: "pihole", label: "Pi-hole", re: /pi-?hole/i },
   { type: "plex", label: "Plex Media Server", re: /plex media server|x-plex/i },
 ];
@@ -62,13 +62,14 @@ export const HTTP_FINGERPRINTS: { type: string; label: string; re: RegExp }[] = 
 /** Match an HTTP response against the fingerprints. Exported for testing. */
 export function matchHttp(headers: Record<string, string | string[] | undefined>, body: string): { type: string; label: string } | null {
   const title = body.match(/<title>([^<]*)<\/title>/i)?.[1] ?? "";
+  // Note: the redirect `location` header is deliberately excluded — a redirect
+  // target path/vhost containing "plex"/"unifi"/… would cause a false positive.
   const hay = [
     body.slice(0, 8192),
     title,
     String(headers["server"] ?? ""),
     String(headers["x-powered-by"] ?? ""),
     String(headers["www-authenticate"] ?? ""),
-    String(headers["location"] ?? ""),
   ].join(" ");
   for (const f of HTTP_FINGERPRINTS) if (f.re.test(hay)) return { type: f.type, label: f.label };
   return null;
@@ -101,24 +102,6 @@ export function localSubnets(): string[] {
   return [...subnets];
 }
 
-function tcpOpen(host: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let settled = false;
-    const done = (open: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(open);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-    socket.connect(port, host);
-  });
-}
-
 /** Read an SSH server's greeting banner (sent immediately on connect). */
 function sshBanner(host: string, port: number, timeoutMs: number): Promise<string | null> {
   return new Promise((resolve) => {
@@ -138,8 +121,10 @@ function sshBanner(host: string, port: number, timeoutMs: number): Promise<strin
   });
 }
 
-/** GET / and capture status, headers, and a bounded body slice. Null if no HTTP response. */
-function httpProbe(
+const BODY_CAP = 8192;
+
+/** GET / and capture headers + a bounded body slice. Null if no HTTP response. Exported for testing. */
+export function httpProbe(
   host: string,
   port: number,
   useHttps: boolean,
@@ -147,22 +132,37 @@ function httpProbe(
 ): Promise<{ headers: Record<string, string | string[] | undefined>; body: string } | null> {
   return new Promise((resolve) => {
     const mod = useHttps ? https : http;
+    let settled = false;
+    let body = "";
+    // Single resolution point that ALWAYS settles the promise. The earlier
+    // version called req.destroy() past the size cap without resolving, which
+    // hung the worker forever (and, once enough such hosts were hit, the whole
+    // scan). On the cap we resolve with the captured body — it already holds the
+    // <title>/fingerprint — rather than discarding it.
+    const finish = (v: { headers: Record<string, string | string[] | undefined>; body: string } | null) => {
+      if (settled) return;
+      settled = true;
+      try {
+        req.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(v);
+    };
     const req = mod.request(
       { host, port, path: "/", method: "GET", timeout: timeoutMs, rejectUnauthorized: false, headers: { "user-agent": "skeleton-key-scan" } },
       (res) => {
-        let body = "";
+        const headers = res.headers;
         res.on("data", (chunk: Buffer) => {
-          if (body.length < 8192) body += chunk.toString("utf8");
-          else req.destroy();
+          body += chunk.toString("utf8");
+          if (body.length >= BODY_CAP) finish({ headers, body: body.slice(0, BODY_CAP) });
         });
-        res.on("end", () => resolve({ headers: res.headers, body }));
+        res.on("end", () => finish({ headers, body }));
+        res.on("error", () => finish(null));
       },
     );
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(null);
-    });
-    req.on("error", () => resolve(null));
+    req.on("timeout", () => finish(null));
+    req.on("error", () => finish(null));
     req.end();
   });
 }
@@ -192,9 +192,11 @@ export interface ScanOptions {
 }
 
 /**
- * Scan the configured private subnets: TCP-connect each candidate port, then
- * fingerprint the open ones. LAN-scoped only (RFC1918). Per host, drops generic
- * "HTTP service" entries when a real service was identified, to cut noise.
+ * Scan the configured private subnets by fingerprinting each candidate port
+ * (SSH banner or HTTP content). LAN-scoped only (RFC1918). Returns every
+ * identified/open service — the fingerprinting itself keeps false positives
+ * down, so we don't drop honestly-labeled "open" entries (a host may run SSH
+ * *and* an unrecognized web UI, and the user should see both).
  */
 export async function scanLan(opts: ScanOptions = {}): Promise<DiscoveredService[]> {
   const detected = localSubnets();
@@ -204,8 +206,8 @@ export async function scanLan(opts: ScanOptions = {}): Promise<DiscoveredService
 
   const start = opts.start ?? 1;
   const end = opts.end ?? 254;
-  const timeoutMs = opts.timeoutMs ?? 700;
-  const concurrency = opts.concurrency ?? 96;
+  const timeoutMs = opts.timeoutMs ?? 600;
+  const concurrency = opts.concurrency ?? 128;
 
   const jobs: { host: string; probe: PortProbe }[] = [];
   for (const subnet of subnets) {
@@ -221,29 +223,13 @@ export async function scanLan(opts: ScanOptions = {}): Promise<DiscoveredService
     while (cursor < jobs.length) {
       const job = jobs[cursor++];
       if (!job) return;
-      // Cheap TCP check first; only fingerprint if the port is actually open.
-      if (!(await tcpOpen(job.host, job.probe.port, Math.min(timeoutMs, 400)))) continue;
+      // Fingerprint directly — sshBanner/httpProbe already fail fast on a closed
+      // port, so a separate TCP pre-check would just double the connections.
       const svc = await fingerprint(job.host, job.probe, timeoutMs);
       if (svc) found.push(svc);
     }
   }
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
-  // Per host: if anything was identified (confirmed/likely), drop the generic
-  // "open" HTTP entries so the gateway doesn't list four things it isn't.
-  const byHost = new Map<string, DiscoveredService[]>();
-  for (const svc of found) {
-    const list = byHost.get(svc.host) ?? [];
-    list.push(svc);
-    byHost.set(svc.host, list);
-  }
-  const result: DiscoveredService[] = [];
-  for (const list of byHost.values()) {
-    const identified = list.some((s) => s.confidence !== "open");
-    for (const s of list) {
-      if (identified && s.confidence === "open") continue;
-      result.push(s);
-    }
-  }
-  return result.sort((a, b) => (a.host === b.host ? a.port - b.port : a.host.localeCompare(b.host)));
+  return found.sort((a, b) => (a.host === b.host ? a.port - b.port : a.host.localeCompare(b.host)));
 }
