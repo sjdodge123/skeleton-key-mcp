@@ -2,7 +2,7 @@
 
 Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
 
-_Last updated: 2026-07-02._
+_Last updated: 2026-07-03._
 
 ## TL;DR
 
@@ -19,19 +19,22 @@ Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connect
 - **Self-guiding onboarding** — server `instructions` on connect + live `tools/list_changed` push on target registration.
 - **LAN discovery fingerprinting** — SSH banner + HTTP content match with confidence levels (replaces port-only guessing).
 - **Packaging & CI** — multi-stage Dockerfile, Portainer compose, CI on every PR, GHCR publish on merge, branch protection.
-- **Exact-name credential lookup** — `getCredential` resolves refs by exact item name (`bw get item` substring-matched, so `PiHole` broke when `pihole-ssh` was created; found live during onboarding).
-- **Locked-vault UX (#13)** — a locked vault no longer 503s authenticated clients; sessions connect and a banner-only `get_started` tells the user how to unlock, while every other tool (incl. `list_targets`/`network_scan`) is withheld so a leaked token can't enumerate/scan before unlock. Auth routing is lock-independent (expired token → 401→refresh, not a dead 503); unlock URLs come from `SKELETON_KEY_PUBLIC_URL` only, never the client Host header. Reworked after an adversarial `/code-review` caught the first cut had removed the restart kill-switch.
+- **Exact-name credential lookup (#14)** — `getCredential` resolves refs by exact item name → id → case-insensitive → unique-substring (`bw get item` substring-matched, so `PiHole` broke when `pihole-ssh` was created; found live during onboarding). Bounded via `bw list items --search` (id-shaped refs use a direct `bw get item`).
+- **Locked-vault UX (#13/#14)** — a locked vault no longer 503s authenticated clients; sessions connect and a banner-only `get_started` tells the user how to unlock, while every other tool is withheld from **both** `tools/call` and `tools/list` so a leaked token can't enumerate/scan before unlock. Unlock emits `tools/list_changed` so live sessions recover. Auth routing is lock-independent (expired token → 401→refresh, not a dead 503); unlock URLs come from the pinned/auto-detected public URL only, never the client Host header. Reworked twice after adversarial `/code-review` (first cut removed the restart kill-switch; second missed the `tools/list` gate).
+- **Credential lifecycle (#15–#18)** — `update_target` re-points a target's credentialRef (options shallow-merged so the SSH deny-list survives); `vault_delete_credential` retires an item (guarded against deleting one a target still uses); **`request_credential`/`credential_request_status`** hand off secrets via a one-time, TOTP-gated web form (`src/web/credential-routes.ts`) so passwords/tokens never transit the chat/MCP channel; `get_started`/instructions now teach both onboarding flows and the never-ask-secrets-in-chat rule.
+- **Public URL auto-detect (#21)** — the base URL for user-facing (secret-asking) links is auto-detected from the LAN on first boot and persisted, with `SKELETON_KEY_PUBLIC_URL` as override; never derived from the client Host header.
 
-Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang).
+Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang, locked-state kill-switch gaps, credential-delete guard bypass).
 
 ## Open PRs
 
-- **#14** (`fix/locked-vault-ux-and-cred-lookup`) — exact-name credentialRef lookup + locked-vault UX. Auth-path; awaiting owner review/merge. Reworked after an adversarial `/code-review`.
-- **feat/credential-lifecycle** (stacked on #14) — credential lifecycle: `update_target` (#17), `vault_delete_credential` (#16), secure credential hand-off `request_credential`/`credential_request_status` (#18, TOTP-gated web form so secrets never transit chat), and two-flow onboarding guidance (#15). Base = the #14 branch until #14 merges; then retarget to `main`.
+None. `main` is the source of truth.
 
 ## Known gaps / good next tasks
 
 Roughly in priority order — pick up any of these:
+
+0. **Verify bearer while locked (#20)** — a valid legacy static bearer gets a 401 (not a clear "locked") while the store is locked, because it can only be verified against the locked store. Fix: hash it lock-independently (like OAuth tokens) so it can be verified — and safely admitted to the banner-only `get_started` — while locked.
 
 1. **Bespoke connectors** (the biggest value). Only generic `ssh`/`http` exist. Discovery already surfaces `synology`, `proxmox`, `unifi`, `home-assistant`, `portainer`, `pihole` and maps them to `http` for now. Implement real adapters (see `docs/SCOPE.md` connector table and `CLAUDE.md` connector notes). Suggested order: **Portainer** (Docker container mgmt — headline ask), **Home Assistant** (REST + long-lived token), **Proxmox** (API token). Each is a `Connector` in `src/connectors/`.
 2. **Admin console** — the web UI is first-run-wizard only. Grow it into an authenticated admin page: audit-log viewer, target CRUD, OAuth client list/revoke (endpoints already exist under `/api/oauth/clients`), token rotation, vault re-unlock. Reuse the wizard's TOTP/verify components.
