@@ -1,14 +1,6 @@
 import type { Request, Response, NextFunction } from "express";
-import { timingSafeEqual } from "node:crypto";
 import type { AppState } from "../app.js";
 import { baseUrl } from "./http-util.js";
-
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
 
 /**
  * Gate the MCP endpoint: setup must be complete, then the request must present
@@ -44,7 +36,7 @@ export function mcpAuth(app: AppState) {
         : "";
       res
         .status(401)
-        .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`)
+        .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req, app)}/.well-known/oauth-protected-resource"`)
         .json({ error: `Missing or invalid credentials.${detail}` });
     };
 
@@ -60,16 +52,13 @@ export function mcpAuth(app: AppState) {
         next();
         return;
       }
-      // 2. Legacy static bearer token (kept for existing connections). Only
-      //    verifiable while the store is unlocked; while locked we can't confirm
-      //    it, so fall through to the challenge (which lets an OAuth client
-      //    refresh, and tells a locked client to unlock).
-      if (!app.store.locked) {
-        const expected = app.store.get().mcpBearerToken;
-        if (expected && safeEqual(token, expected)) {
-          next();
-          return;
-        }
+      // 2. Legacy static bearer token (kept for existing connections). Verifiable
+      //    while locked too (against the persisted hash), so a valid bearer isn't
+      //    401'd after a restart — it's admitted to the banner-only get_started
+      //    like an OAuth token, per the locked tool gate.
+      if (app.verifyBearer(token)) {
+        next();
+        return;
       }
       challenge();
     } catch {

@@ -23,6 +23,9 @@ export interface CredentialRequest {
   reason: string;
   createdAt: number;
   status: RequestStatus;
+  /** CSRF token: rendered only in the same-origin form, required on POST so a
+   *  blind cross-site POST (which can't read the page) can't act on the link. */
+  formToken: string;
   /** Set once fulfilled — the vault item name the agent can now register with. */
   fulfilledName?: string;
 }
@@ -61,6 +64,7 @@ export class CredentialRequestStore {
       reason: input.reason,
       createdAt: this.now(),
       status: "pending",
+      formToken: randomUUID(),
     };
     this.requests.set(req.id, req);
     return req;
@@ -76,13 +80,27 @@ export class CredentialRequestStore {
     return req;
   }
 
-  /** Mark a pending request fulfilled. Returns false if it isn't claimable
-   *  (already used, declined, expired, or unknown) — enforces single-use. */
-  fulfill(id: string): boolean {
+  /**
+   * Atomically claim a pending request (pending → fulfilled), returning true for
+   * exactly one caller — enforces single-use and closes the TOCTOU where two
+   * concurrent submits both pass the pending check and both write to the vault.
+   * The caller must `release()` if the subsequent vault write fails.
+   */
+  claim(id: string): boolean {
     const req = this.get(id);
     if (!req || req.status !== "pending") return false;
     req.status = "fulfilled";
     req.fulfilledName = req.name;
+    return true;
+  }
+
+  /** Revert a claimed request to pending after a failed vault write, so the user
+   *  can retry the same link. No-op unless the request is currently fulfilled. */
+  release(id: string): boolean {
+    const req = this.requests.get(id);
+    if (!req || req.status !== "fulfilled") return false;
+    req.status = "pending";
+    req.fulfilledName = undefined;
     return true;
   }
 

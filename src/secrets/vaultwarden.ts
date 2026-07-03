@@ -256,20 +256,26 @@ export class VaultwardenClient {
    */
   private async findItem(ref: string): Promise<BwItem> {
     this.assertUnlocked();
+    // Name resolution first, on the bounded `--search` set, so an exact (or
+    // substring) NAME match always wins over an id match — a ref that happens to
+    // be UUID-shaped but is actually an item's name must resolve to that name.
+    // `--search` matches names/notes by substring, so it surfaces every exact /
+    // case-insensitive / substring name ref; there is no need to fall back to a
+    // full `bw list items` (which would decrypt the entire scoped collection).
+    const byName = resolveItem(await this.listItems(ref), ref);
+    if (byName) return byName;
+    // Not found by name: if the ref is a Bitwarden item id (UUID), fetch it
+    // directly — `--search` can't match by id, and a single `bw get item` stays
+    // bounded to one item.
     if (UUID_RE.test(ref)) {
-      // Item ids are exact and unique; one bounded fetch avoids decrypting the
-      // whole collection into memory just to find one credential by id.
       try {
-        const item = JSON.parse(await this.run(["get", "item", ref])) as BwItem;
-        if (item?.id === ref) return item;
+        const byId = JSON.parse(await this.run(["get", "item", ref])) as BwItem;
+        if (byId?.id === ref) return byId;
       } catch {
-        /* not an id we hold — fall through to name resolution */
+        /* not an id we hold */
       }
     }
-    let item = resolveItem(await this.listItems(ref), ref);
-    if (!item) item = resolveItem(await this.listItems(), ref);
-    if (!item) throw new Error(`No vault item named "${ref}" in the scoped collection.`);
-    return item;
+    throw new Error(`No vault item named "${ref}" in the scoped collection.`);
   }
 
   /** Resolve a credentialRef to its canonical {id, name} without decrypting the

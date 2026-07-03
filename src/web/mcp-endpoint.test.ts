@@ -147,6 +147,15 @@ describe("stateful MCP endpoint", () => {
       expect(isError).toBe(true);
     });
 
+    it("returns identical locked guidance for an unknown/per-target tool name (no enumeration)", async () => {
+      const sid = await initialize();
+      // A name that would reveal a target if the error differed from a real tool's.
+      const { text, isError } = await callTool(sid, "ssh.secret-nas.run_command", 15);
+      expect(isError).toBe(true);
+      expect(text).toContain("locked");
+      expect(text).not.toContain("Unknown tool"); // must not distinguish existence
+    });
+
     it("does not echo the request Host into unlock guidance", async () => {
       const sid = await initialize();
       const { text } = await callTool(sid, "vault_list_credentials", 14);

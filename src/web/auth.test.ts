@@ -17,23 +17,29 @@ interface FakeOpts {
   bearer?: string;
   oauthToken?: string;
   publicUrl?: string;
+  /** Simulate a persisted bearer hash, so the bearer verifies even while locked. */
+  bearerHashPersisted?: boolean;
 }
 
 function fakeApp(opts: FakeOpts): AppState {
-  const locked = (opts.storeLocked ?? false) || !(opts.vaultUnlocked ?? true);
+  const storeLocked = opts.storeLocked ?? false;
+  const locked = storeLocked || !(opts.vaultUnlocked ?? true);
   return {
     isSetupComplete: async () => opts.setupComplete ?? true,
     get locked() {
       return locked;
     },
     unlockUrl: () => opts.publicUrl ?? null,
+    publicUrl: () => opts.publicUrl ?? null,
     store: {
-      locked: opts.storeLocked ?? false,
+      locked: storeLocked,
       get: () => {
-        if (opts.storeLocked) throw new Error("store is locked");
+        if (storeLocked) throw new Error("store is locked");
         return { mcpBearerToken: opts.bearer };
       },
     },
+    // Mirrors AppState.verifyBearer: unlocked → compare token; locked → hash.
+    verifyBearer: (t: string) => !!opts.bearer && t === opts.bearer && (!storeLocked || !!opts.bearerHashPersisted),
     oauth: { validateAccessToken: (t: string) => t === opts.oauthToken },
   } as unknown as AppState;
 }
@@ -82,6 +88,12 @@ describe("mcpAuth", () => {
 
   it("passes the static bearer when the store is unlocked", async () => {
     const { nexted } = await run(fakeApp({ bearer: "static-token" }), "static-token");
+    expect(nexted).toBe(true);
+  });
+
+  it("passes a valid static bearer while locked when its hash is persisted (#20)", async () => {
+    const app = fakeApp({ storeLocked: true, vaultUnlocked: false, bearer: "static-token", bearerHashPersisted: true });
+    const { nexted } = await run(app, "static-token");
     expect(nexted).toBe(true);
   });
 

@@ -259,9 +259,17 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         // match the same way, or we'd delete a still-referenced item unguarded).
         const resolved = await a.vault.resolveRef(i.credentialRef);
         const refs = new Set([i.credentialRef, resolved.name, resolved.id]);
+        const resolvedName = resolved.name.toLowerCase();
+        // A target depends on this item if its credentialRef resolves to it —
+        // mirror ALL of resolveItem's rules (exact/id/case-insensitive AND
+        // unique-substring), or a target using e.g. ref "pihole" → item
+        // "pihole-ssh" would be silently orphaned. Over-matching only means we
+        // (safely) require force=true.
+        const dependsOn = (ref: string): boolean =>
+          refs.has(ref) || ref.toLowerCase() === resolvedName || resolvedName.includes(ref.toLowerCase());
         const dependents = a.registry
           .list()
-          .filter((t) => t.credentialRef && (refs.has(t.credentialRef) || t.credentialRef.toLowerCase() === resolved.name.toLowerCase()))
+          .filter((t) => t.credentialRef && dependsOn(t.credentialRef))
           .map((t) => t.name);
         if (dependents.length && !i.force) {
           return err(

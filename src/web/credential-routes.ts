@@ -53,6 +53,7 @@ function formPage(req: CredentialRequest, error?: string): string {
   </div>
   <div class="warn">Only continue if <b>you</b> just asked Claude to onboard this host. This stores a credential in your vault.</div>
   <form method="post" action="/credential/${htmlEscape(req.id)}">
+    <input type="hidden" name="formToken" value="${htmlEscape(req.formToken)}"/>
     ${req.kind === "password" ? usernameField : ""}
     <label>${secretLabel}</label>
     <input type="password" name="secret" autocomplete="off" autofocus/>
@@ -114,6 +115,13 @@ export function buildCredentialRouter(app: AppState): Router {
       return;
     }
 
+    // CSRF: the form token is only present in the same-origin rendered page, so
+    // a blind cross-site POST (which can't read the page) can't act on the link.
+    if (firstStr(req.body.formToken) !== request.formToken) {
+      res.status(403).type("html").send(messagePage("Expired form", "This form is stale — reopen the link and try again."));
+      return;
+    }
+
     if (firstStr(req.body.action) === "decline") {
       app.credentialRequests.decline(request.id);
       res.type("html").send(messagePage("Cancelled", "No credential was stored. You can close this tab."));
@@ -139,6 +147,13 @@ export function buildCredentialRouter(app: AppState): Router {
     }
     const username = firstStr(req.body.username) || request.username;
 
+    // Claim BEFORE the vault write, so two concurrent valid submits can't both
+    // write the item (TOCTOU). The loser sees the already-provided page.
+    if (!app.credentialRequests.claim(request.id)) {
+      res.type("html").send(messagePage("Already provided", "This credential was just stored. You can close this tab."));
+      return;
+    }
+
     try {
       await app.vault.createLoginItem({
         name: request.name,
@@ -152,12 +167,13 @@ export function buildCredentialRouter(app: AppState): Router {
         collectionName: app.store.get().bwCollectionName,
       });
     } catch (err) {
+      // Roll the claim back so the user can retry the same link.
+      app.credentialRequests.release(request.id);
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).type("html").send(formPage(request, `Could not store the credential: ${message}`));
       return;
     }
 
-    app.credentialRequests.fulfill(request.id);
     // Audit the fulfillment — never the secret value.
     app.audit.record({
       ts: new Date().toISOString(),

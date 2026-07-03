@@ -6,7 +6,9 @@ import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
 import { CredentialRequestStore } from "./web/credential-requests.js";
 import { loadPublicUrl } from "./config/public-url.js";
+import { hashBearer, loadBearerHash, saveBearerHash } from "./config/bearer-hash.js";
 import { authenticator } from "otplib";
+import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
 
 /**
@@ -33,7 +35,41 @@ export class AppState {
     const credentialRequests = new CredentialRequestStore();
     const app = new AppState(store, vault, registry, audit, oauth, credentialRequests);
     app.learnedPublicUrl = await loadPublicUrl();
+    app.bearerHash = await loadBearerHash();
     return app;
+  }
+
+  /** SHA-256 of the MCP bearer token, so it's verifiable while locked. */
+  private bearerHash: string | null = null;
+
+  /**
+   * Verify a presented static bearer token. Works while the store is unlocked
+   * (compare the token itself) AND while locked (compare against the persisted
+   * hash) — so a valid legacy bearer isn't 401'd after a restart. Timing-safe.
+   */
+  verifyBearer(token: string): boolean {
+    if (!token) return false;
+    if (!this.store.locked) {
+      const expected = this.store.get().mcpBearerToken;
+      return !!expected && safeEqualStr(token, expected);
+    }
+    return !!this.bearerHash && safeEqualStr(hashBearer(token), this.bearerHash);
+  }
+
+  /**
+   * Ensure the persisted bearer hash matches the current token (backfills older
+   * deployments and follows rotation). No-op while locked or if unset. Call after
+   * any unlock / bearer generation.
+   */
+  async ensureBearerHash(): Promise<void> {
+    if (this.store.locked) return;
+    const token = this.store.get().mcpBearerToken;
+    if (!token) return;
+    const want = hashBearer(token);
+    if (want !== this.bearerHash) {
+      await saveBearerHash(want);
+      this.bearerHash = want;
+    }
   }
 
   /** Persisted, auto-detected public base URL (set at boot; see server.ts).
@@ -122,4 +158,12 @@ export class AppState {
     }
     return this.vault.getCredential(credentialRef);
   }
+}
+
+/** Constant-time string compare (avoids leaking length/prefix via timing). */
+function safeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
 }
