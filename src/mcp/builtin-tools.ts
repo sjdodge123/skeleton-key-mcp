@@ -258,19 +258,25 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         // than the targets stored (deleteItem resolves fuzzily — the guard must
         // match the same way, or we'd delete a still-referenced item unguarded).
         const resolved = await a.vault.resolveRef(i.credentialRef);
-        const refs = new Set([i.credentialRef, resolved.name, resolved.id]);
-        const resolvedName = resolved.name.toLowerCase();
-        // A target depends on this item if its credentialRef resolves to it —
-        // mirror ALL of resolveItem's rules (exact/id/case-insensitive AND
-        // unique-substring), or a target using e.g. ref "pihole" → item
-        // "pihole-ssh" would be silently orphaned. Over-matching only means we
-        // (safely) require force=true.
-        const dependsOn = (ref: string): boolean =>
-          refs.has(ref) || ref.toLowerCase() === resolvedName || resolvedName.includes(ref.toLowerCase());
-        const dependents = a.registry
-          .list()
-          .filter((t) => t.credentialRef && dependsOn(t.credentialRef))
-          .map((t) => t.name);
+        const exact = new Set([i.credentialRef, resolved.name, resolved.id]);
+        // A target depends on this item iff its credentialRef RESOLVES to it.
+        // A cheap exact-identity check first; otherwise resolve the target's ref
+        // and compare ids — precise for case-insensitive and unique-substring
+        // refs, without the false positives a plain substring test would give
+        // (e.g. ref "ssh" must not look like a dependent of item "pihole-ssh").
+        const dependents: string[] = [];
+        for (const t of a.registry.list()) {
+          if (!t.credentialRef) continue;
+          if (exact.has(t.credentialRef)) {
+            dependents.push(t.name);
+            continue;
+          }
+          try {
+            if ((await a.vault.resolveRef(t.credentialRef)).id === resolved.id) dependents.push(t.name);
+          } catch {
+            /* ref no longer resolves — not a dependent of this item */
+          }
+        }
         if (dependents.length && !i.force) {
           return err(
             `Refusing to delete '${resolved.name}': still used by target(s) ${dependents.join(", ")}. ` +

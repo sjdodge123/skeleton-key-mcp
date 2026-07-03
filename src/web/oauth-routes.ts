@@ -58,7 +58,7 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Discovery metadata ---
   router.get("/.well-known/oauth-authorization-server", (req, res) => {
-    const b = baseUrl(req, app);
+    const b = baseUrl(req);
     res.json({
       issuer: b,
       authorization_endpoint: `${b}/oauth/authorize`,
@@ -74,7 +74,7 @@ export function buildOAuthRouter(app: AppState): Router {
   });
 
   router.get("/.well-known/oauth-protected-resource", (req, res) => {
-    const b = baseUrl(req, app);
+    const b = baseUrl(req);
     res.json({ resource: `${b}/mcp`, authorization_servers: [b], scopes_supported: [OAUTH_SCOPE] });
   });
 

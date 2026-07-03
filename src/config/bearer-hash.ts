@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { paths } from "./paths.js";
+import { sha256hex } from "../lib/hash.js";
 
 /**
  * The static MCP bearer token lives (in the clear) only inside the encrypted
@@ -13,7 +13,7 @@ import { paths } from "./paths.js";
  */
 
 export function hashBearer(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
+  return sha256hex(token);
 }
 
 export async function loadBearerHash(file: string = paths.bearerHash): Promise<string | null> {

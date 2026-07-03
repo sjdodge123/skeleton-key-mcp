@@ -36,7 +36,7 @@ export function mcpAuth(app: AppState) {
         : "";
       res
         .status(401)
-        .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req, app)}/.well-known/oauth-protected-resource"`)
+        .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`)
         .json({ error: `Missing or invalid credentials.${detail}` });
     };
 
