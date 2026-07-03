@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
-import { listConnectors, getConnector } from "../connectors/index.js";
+import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 
 /** Wrap an async handler so thrown errors become 400s with a message. */
@@ -129,7 +129,8 @@ export function buildApiRouter(app: AppState): Router {
           timeoutMs: z.number().int().optional(),
         })
         .parse(req.body ?? {});
-      res.json({ services: await scanLan(opts) });
+      const services = (await scanLan(opts)).map((s) => ({ ...s, registerType: registerableType(s.connectorType, s.port) }));
+      res.json({ services });
     }),
   );
 

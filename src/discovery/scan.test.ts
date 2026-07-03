@@ -1,5 +1,41 @@
 import { describe, it, expect } from "vitest";
-import { isPrivateSubnet, matchHttp } from "./scan.js";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import { isPrivateSubnet, matchHttp, httpProbe } from "./scan.js";
+
+describe("httpProbe body cap (must not hang)", () => {
+  it("resolves with a bounded body when a large multi-chunk body is streamed", async () => {
+    // Server that streams >8KB across many chunks and never ends promptly — the
+    // pre-fix code destroyed the request past the cap without resolving, hanging.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      const chunk = "<div>proxmox filler</div>".repeat(50); // ~1.25KB
+      let sent = 0;
+      const timer = setInterval(() => {
+        res.write(chunk);
+        if (++sent > 100) {
+          clearInterval(timer);
+        }
+      }, 5);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const res = await httpProbe("127.0.0.1", port, false, 3000);
+      expect(res).not.toBeNull();
+      expect(res!.body.length).toBeLessThanOrEqual(8192);
+      expect(res!.body).toContain("proxmox");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("resolves null when nothing is listening (no hang)", async () => {
+    // Port 1 is virtually never open; connection refused should resolve null fast.
+    const res = await httpProbe("127.0.0.1", 1, false, 800);
+    expect(res).toBeNull();
+  });
+});
 
 describe("isPrivateSubnet", () => {
   it("accepts RFC1918 /24 prefixes", () => {
@@ -47,5 +83,15 @@ describe("matchHttp (service fingerprinting)", () => {
     expect(matchHttp({ server: "Apache" }, "<html><body>It works!</body></html>")).toBeNull();
     // A plain login page that names none of the known products stays unidentified.
     expect(matchHttp({}, "<title>Sign in</title>")).toBeNull();
+  });
+
+  it("does not match the short unanchored 'ubnt' substring", () => {
+    expect(matchHttp({}, "customwords ubntx and things")).toBeNull();
+  });
+
+  it("ignores the redirect Location header (avoids false positives)", () => {
+    // A redirect target path containing a product name must NOT trigger a match.
+    expect(matchHttp({ location: "https://host/plex/web" }, "<title>Redirecting</title>")).toBeNull();
+    expect(matchHttp({ location: "/unifi/manage" }, "generic body")).toBeNull();
   });
 });

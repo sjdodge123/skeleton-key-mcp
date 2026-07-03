@@ -3,7 +3,7 @@ import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../connectors/ssh-keygen.js";
 import { scanLan } from "../discovery/scan.js";
-import { getConnector } from "../connectors/index.js";
+import { getConnector, registerableType } from "../connectors/index.js";
 import { runSsh, shellQuote } from "../connectors/ssh-exec.js";
 
 /** Safe, filename-like identifier for vault item names (they double as credentialRefs). */
@@ -170,9 +170,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         const services = await scanLan(i.subnet ? { subnets: [i.subnet] } : {});
         if (!services.length) return ok("No services detected. In a bridged container, pass your real subnet (e.g. '192.168.0').");
         const lines = services.map((s) => {
-          // Only ssh/http connectors exist today; map bespoke detections to a
-          // registerable fallback so register_target actually accepts them.
-          const registerType = getConnector(s.connectorType) ? s.connectorType : s.port === 22 ? "ssh" : "http";
+          const registerType = registerableType(s.connectorType, s.port);
           const note = registerType === s.connectorType ? "" : ` (no bespoke ${s.connectorType} connector yet)`;
           // Flag lower-confidence guesses so they're taken with a grain of salt.
           const conf = s.confidence === "confirmed" ? "" : s.confidence === "likely" ? "  (likely — verify)" : "  (open port, unidentified)";
