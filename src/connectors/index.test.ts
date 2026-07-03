@@ -18,8 +18,9 @@ describe("registerableType", () => {
     expect(registerableType("proxmox", 22, "confirmed")).toBe("ssh");
   });
 
-  it("keeps the bespoke connector when no confidence is supplied (back-compat)", () => {
-    expect(registerableType("portainer", 9000)).toBe("portainer");
+  it("treats missing confidence as unconfirmed (falls back)", () => {
+    expect(registerableType("portainer", 9000)).toBe("http");
+    expect(registerableType("ssh", 22)).toBe("ssh"); // port-22 fallback still applies
   });
 
   it("portainer is a registered connector", () => {
