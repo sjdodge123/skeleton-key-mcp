@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { resolveSshAuth, shellQuote } from "./ssh-exec.js";
+import { resolveSshAuth, buildConnectConfig, shellQuote } from "./ssh-exec.js";
 import type { Credential } from "../secrets/types.js";
+import type { Target } from "./types.js";
 
 function cred(partial: Partial<Credential>): Credential {
   return { ref: "x", fields: {}, uris: [], ...partial };
@@ -33,6 +34,31 @@ describe("resolveSshAuth", () => {
 
   it("returns no auth when neither a key nor a password is available", () => {
     expect(resolveSshAuth(cred({ secret: "just a note" }))).toEqual({});
+  });
+});
+
+describe("buildConnectConfig", () => {
+  const target = (partial: Partial<Target> = {}): Target => ({ name: "t", type: "ssh", host: "10.0.0.9", ...partial });
+
+  it("enables keyboard-interactive alongside password auth (for PAM/hardened servers)", () => {
+    const cfg = buildConnectConfig(target({ port: 2222 }), cred({ username: "sam", password: "pw" }), 5000);
+    expect(cfg.password).toBe("pw");
+    expect(cfg.tryKeyboard).toBe(true);
+    expect(cfg.username).toBe("sam");
+    expect(cfg.port).toBe(2222);
+  });
+
+  it("does NOT enable keyboard-interactive for key auth", () => {
+    const cfg = buildConnectConfig(target(), cred({ fields: { private_key: KEY } }), 5000);
+    expect(cfg.privateKey).toBe(KEY);
+    expect(cfg.tryKeyboard).toBeUndefined();
+    expect(cfg.password).toBeUndefined();
+  });
+
+  it("defaults port 22 and username 'root' when unset", () => {
+    const cfg = buildConnectConfig(target(), cred({ password: "pw" }), 5000);
+    expect(cfg.port).toBe(22);
+    expect(cfg.username).toBe("root");
   });
 });
 

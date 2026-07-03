@@ -32,6 +32,26 @@ export function resolveSshAuth(cred: Credential): { privateKey?: string; passphr
 }
 
 /**
+ * Build the ssh2 ConnectConfig for a target (pure, exported for testing). When
+ * authenticating with a password we ALSO enable keyboard-interactive: many
+ * hardened / PAM-configured servers accept only the "keyboard-interactive"
+ * method (not the plain "password" method), so a correct password would
+ * otherwise fail with "All configured authentication methods failed" — even
+ * though a normal `ssh` client (which falls back to keyboard-interactive) works.
+ */
+export function buildConnectConfig(target: Target, cred: Credential, timeoutMs: number): ConnectConfig {
+  const auth = resolveSshAuth(cred);
+  return {
+    host: target.host,
+    port: target.port ?? 22,
+    username: cred.username ?? cred.fields["username"] ?? "root",
+    readyTimeout: timeoutMs,
+    ...auth,
+    ...(auth.password ? { tryKeyboard: true } : {}),
+  };
+}
+
+/**
  * Open a one-shot SSH connection, run a command, and return its output.
  * Auth comes from the target's resolved Credential (see `resolveSshAuth`).
  */
@@ -42,14 +62,7 @@ export function runSsh(
   opts: { timeoutMs?: number } = {},
 ): Promise<SshExecResult> {
   const timeoutMs = opts.timeoutMs ?? 20_000;
-
-  const config: ConnectConfig = {
-    host: target.host,
-    port: target.port ?? 22,
-    username: cred.username ?? cred.fields["username"] ?? "root",
-    readyTimeout: timeoutMs,
-    ...resolveSshAuth(cred),
-  };
+  const config = buildConnectConfig(target, cred, timeoutMs);
 
   return new Promise<SshExecResult>((resolve, reject) => {
     const conn = new Client();
@@ -57,6 +70,14 @@ export function runSsh(
       conn.end();
       reject(new Error(`SSH to ${target.name} (${target.host}) timed out after ${timeoutMs}ms.`));
     }, timeoutMs);
+
+    // Answer keyboard-interactive prompts with the password (the server-prompted
+    // equivalent of password auth). Only wired up when we're doing password auth.
+    if (config.tryKeyboard && config.password) {
+      conn.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => {
+        finish(prompts.map(() => config.password ?? ""));
+      });
+    }
 
     conn
       .on("ready", () => {
