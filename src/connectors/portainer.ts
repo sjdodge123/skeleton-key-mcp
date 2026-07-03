@@ -108,13 +108,17 @@ class Portainer {
     return res.json as T;
   }
 
-  /** The Docker environment id for container ops (option, else the first endpoint). */
+  /** The Docker environment id for container ops (option, else the best endpoint). */
   private async endpointId(): Promise<number> {
     const opt = options(this.target).endpointId;
     if (opt) return opt;
-    const endpoints = await this.get<{ Id: number }[]>("/api/endpoints");
+    const endpoints = await this.get<{ Id: number; Type?: number; Status?: number }[]>("/api/endpoints");
     if (!endpoints.length) throw new Error("No Portainer endpoints found; set endpointId in the target options.");
-    return endpoints[0]!.Id;
+    // Prefer a running (Status 1) Docker environment (Type 1 local / 2 agent) over
+    // blindly taking the first, which may be down or a non-Docker (k8s/edge) env.
+    const up = endpoints.filter((e) => e.Status === 1);
+    const dockerUp = up.filter((e) => e.Type === 1 || e.Type === 2);
+    return (dockerUp[0] ?? up[0] ?? endpoints[0]!).Id;
   }
 
   async listEndpoints(): Promise<string> {
@@ -200,15 +204,22 @@ export function summarizeContainers(cs: DockerContainer[]): string {
  * return it as-is. Exported for testing.
  */
 export function demuxDockerLogs(buf: Buffer): string {
-  const looksFramed = buf.length >= 8 && buf[0]! <= 2 && buf[1] === 0 && buf[2] === 0 && buf[3] === 0;
-  if (!looksFramed) return buf.toString("utf8");
+  // A valid frame header at offset o: 8 bytes available, stream ∈ {0,1,2}, and
+  // the three reserved bytes are zero.
+  const isHeader = (o: number): boolean =>
+    o + 8 <= buf.length && buf[o]! <= 2 && buf[o + 1] === 0 && buf[o + 2] === 0 && buf[o + 3] === 0;
+  // TTY containers send raw bytes (no framing): if the start isn't a header, raw.
+  if (!isHeader(0)) return buf.toString("utf8");
   const parts: string[] = [];
   let i = 0;
-  while (i + 8 <= buf.length) {
-    const stream = buf[i]!;
+  while (i < buf.length) {
+    // Validate EVERY frame's header and require it to fit exactly within the
+    // buffer. Any truncation/malformation (a short trailing header, an oversized
+    // size, nonzero reserved bytes) means the stream isn't cleanly framed, so
+    // return the raw bytes rather than silently dropping or half-parsing them.
+    if (!isHeader(i)) return buf.toString("utf8");
     const size = buf.readUInt32BE(i + 4);
-    // A malformed/oversized frame means it wasn't really framed — bail to raw.
-    if (stream > 2 || i + 8 + size > buf.length + 4) return buf.toString("utf8");
+    if (i + 8 + size > buf.length) return buf.toString("utf8");
     parts.push(buf.toString("utf8", i + 8, i + 8 + size));
     i += 8 + size;
   }

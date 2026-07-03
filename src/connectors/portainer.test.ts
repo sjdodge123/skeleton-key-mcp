@@ -58,10 +58,26 @@ describe("pure helpers", () => {
   });
 
   it("demuxDockerLogs strips 8-byte frame headers and passes TTY streams through", () => {
-    const payload = "hello\n";
-    const frame = Buffer.concat([Buffer.from([1, 0, 0, 0, 0, 0, 0, payload.length]), Buffer.from(payload)]);
-    expect(demuxDockerLogs(frame)).toBe("hello\n");
+    const frame = (payload: string, stream = 1) => Buffer.concat([Buffer.from([stream, 0, 0, 0, 0, 0, 0, payload.length]), Buffer.from(payload)]);
+    expect(demuxDockerLogs(Buffer.concat([frame("out\n", 1), frame("err\n", 2)]))).toBe("out\nerr\n");
     expect(demuxDockerLogs(Buffer.from("raw tty line\n"))).toBe("raw tty line\n");
+  });
+
+  it("demuxDockerLogs falls back to raw on truncation/malformation (never silently drops)", () => {
+    // Header declares 10 bytes but only 6 follow → truncated → raw.
+    const truncated = Buffer.concat([Buffer.from([1, 0, 0, 0, 0, 0, 0, 10]), Buffer.from("abcdef")]);
+    expect(demuxDockerLogs(truncated)).toBe(truncated.toString("utf8"));
+    // Valid frame then a partial (4-byte) trailing header → raw.
+    const good = Buffer.concat([Buffer.from([1, 0, 0, 0, 0, 0, 0, 2]), Buffer.from("hi")]);
+    const trailingPartial = Buffer.concat([good, Buffer.from([1, 0, 0, 0])]);
+    expect(demuxDockerLogs(trailingPartial)).toBe(trailingPartial.toString("utf8"));
+    // Second frame with nonzero reserved bytes → raw (not half-parsed).
+    const badReserved = Buffer.concat([good, Buffer.from([1, 2, 3, 4, 0, 0, 0, 1]), Buffer.from("A")]);
+    expect(demuxDockerLogs(badReserved)).toBe(badReserved.toString("utf8"));
+  });
+
+  it("deriveBaseUrl (via baseUrl) brackets IPv6 literal hosts", () => {
+    expect(baseUrl({ name: "n", type: "portainer", host: "fd00::10", port: 9443 })).toBe("https://[fd00::10]:9443");
   });
 });
 
@@ -91,6 +107,24 @@ describe("auth", () => {
     const res = await tool("list_stacks").run({}, ctx(cred({ secret: "just notes" })));
     expect(res.isError).toBe(true);
     expect(res.text).toMatch(/API key|username/);
+  });
+});
+
+describe("endpoint auto-detection", () => {
+  it("picks a running Docker endpoint over a down/first one when endpointId is unset", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.endsWith("/api/endpoints"), reply: { json: [
+        { Id: 1, Type: 1, Status: 2 }, // down
+        { Id: 5, Type: 1, Status: 1 }, // up docker ← should win
+      ] } },
+      { match: (u) => u.includes("/api/endpoints/5/docker/containers/json"), reply: { json: [{ Names: ["/c"], State: "running" }] } },
+    ]);
+    // No endpointId option → must auto-detect.
+    const t: Target = { name: "nas", type: "portainer", host: "10.0.0.5", port: 9000, credentialRef: "k" };
+    const listContainers = portainerConnector.buildTools(t).find((x) => x.name === "list_containers")!;
+    const res = await listContainers.run({ all: true }, { target: t, getCredential: async () => cred({ fields: { token: "k" } }) });
+    expect(res.isError).toBeFalsy();
+    expect(calls.some((c) => c.url.includes("/api/endpoints/5/docker/containers/json"))).toBe(true);
   });
 });
 

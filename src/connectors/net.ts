@@ -10,5 +10,8 @@ export function deriveBaseUrl(target: Target, opts: { baseUrl?: string; httpsPor
   if (opts.baseUrl) return opts.baseUrl.replace(/\/$/, "");
   const httpsPorts = opts.httpsPorts ?? [443];
   const scheme = target.port && httpsPorts.includes(target.port) ? "https" : "http";
-  return `${scheme}://${target.host}${target.port ? `:${target.port}` : ""}`;
+  // Bracket IPv6 literals so `host:port` is a valid URL (fetch can't parse a bare
+  // `fd00::10:9443`).
+  const host = target.host.includes(":") && !target.host.startsWith("[") ? `[${target.host}]` : target.host;
+  return `${scheme}://${host}${target.port ? `:${target.port}` : ""}`;
 }

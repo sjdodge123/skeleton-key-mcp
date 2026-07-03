@@ -33,8 +33,10 @@ export function listConnectors(): Connector[] {
  * wizard and the MCP register flow so they agree on the registerable type.
  */
 export function registerableType(connectorType: string, port?: number, confidence?: string): string {
-  const trusted = confidence === undefined || confidence === "confirmed";
-  if (trusted && getConnector(connectorType)) return connectorType;
+  // Only a fingerprint-confirmed detection routes to a bespoke connector; an
+  // unconfirmed guess OR a missing confidence conservatively falls back, so we
+  // never suggest registering a port-only hint as e.g. a broken portainer target.
+  if (confidence === "confirmed" && getConnector(connectorType)) return connectorType;
   return port === 22 ? "ssh" : "http";
 }
 
