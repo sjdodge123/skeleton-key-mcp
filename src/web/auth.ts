@@ -11,20 +11,22 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 /**
- * Gate the MCP endpoint: setup must be complete and the vault unlocked, then the
- * request must present either a valid OAuth 2.1 access token (preferred) or the
- * legacy static bearer token. On failure, emit the RFC 9728 `WWW-Authenticate`
- * hint so OAuth-capable clients (Claude) can discover the authorization server
- * and start the browser consent flow automatically. Fails closed throughout.
+ * Gate the MCP endpoint: setup must be complete, then the request must present
+ * either a valid OAuth 2.1 access token (preferred) or the legacy static bearer
+ * token. On failure, emit the RFC 9728 `WWW-Authenticate` hint so OAuth-capable
+ * clients (Claude) can discover the authorization server and start the browser
+ * consent flow automatically. Fails closed throughout.
+ *
+ * A locked vault does NOT block authenticated clients: sessions still connect
+ * and tool calls return actionable "unlock at <url>" errors (see the CallTool
+ * locked gate) instead of the endpoint going dark with an opaque 503 that
+ * clients render as "failed to reconnect".
  */
 export function mcpAuth(app: AppState) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const adminUi = `${baseUrl(req)}/`;
     if (!(await app.isSetupComplete())) {
-      res.status(503).json({ error: "Setup not complete. Open the web UI to finish onboarding." });
-      return;
-    }
-    if (app.store.locked || !app.vault.unlocked) {
-      res.status(503).json({ error: "Vault is locked. Unlock via the web UI." });
+      res.status(503).json({ error: `Setup not complete. Open ${adminUi} to finish onboarding.` });
       return;
     }
     const header = req.header("authorization") ?? "";
@@ -43,18 +45,30 @@ export function mcpAuth(app: AppState) {
     }
 
     try {
-      // 1. OAuth access token (preferred).
+      // 1. OAuth access token (preferred). Verifiable even while the store is
+      //    locked — token hashes live in oauth.sqlite, not the bootstrap store.
       if (app.oauth.validateAccessToken(token)) {
         next();
         return;
       }
-      // 2. Legacy static bearer token (kept for existing connections).
-      const expected = app.store.get().mcpBearerToken;
-      if (expected && safeEqual(token, expected)) {
-        next();
+      // 2. Legacy static bearer token (kept for existing connections). Only
+      //    verifiable while the store is unlocked.
+      if (!app.store.locked) {
+        const expected = app.store.get().mcpBearerToken;
+        if (expected && safeEqual(token, expected)) {
+          next();
+          return;
+        }
+        challenge();
         return;
       }
-      challenge();
+      // Store locked and the token isn't a valid OAuth token — it may be the
+      // static bearer, which we cannot verify right now. Say so (with the fix)
+      // instead of a 401 that would push the client into an OAuth flow that
+      // dead-ends: consent needs TOTP, which also needs the unlocked store.
+      res.status(503).json({
+        error: `Skeleton Key is locked (container restarted?). Open ${adminUi} and enter the master passphrase to unlock, then retry.`,
+      });
     } catch {
       // Fail closed on any error (e.g. a transient DB failure) rather than hang.
       challenge();

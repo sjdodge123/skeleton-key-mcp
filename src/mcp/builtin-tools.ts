@@ -20,12 +20,26 @@ export interface GlobalTool {
   description: string;
   tier: ToolTier;
   inputSchema: z.ZodTypeAny;
+  /** Still callable while the vault is locked (needs no credentials). Locked
+   *  calls to every other tool short-circuit with unlock guidance. */
+  availableWhenLocked?: boolean;
   confirm?: (input: unknown) => string;
   run: (input: unknown, app: AppState) => Promise<ToolResult>;
 }
 
 const ok = (text: string): ToolResult => ({ text });
 const err = (text: string): ToolResult => ({ text, isError: true });
+
+/** Leading banner for get_started while locked, so a fresh session's first
+ *  status call already tells the user how to recover. */
+function lockedBanner(a: AppState): string {
+  if (!a.locked) return "";
+  const url = a.unlockUrl();
+  return (
+    "🔒 The vault is LOCKED (this happens after the container restarts). Tools that need credentials will fail until it is unlocked.\n" +
+    `→ Have the user open ${url ? `${url}/` : "the Skeleton Key web UI"} in a browser and enter the master passphrase, then retry.\n\n`
+  );
+}
 
 export function buildGlobalTools(app: AppState): GlobalTool[] {
   return [
@@ -34,11 +48,13 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       description: "Show onboarding status and the recommended next step. Call this when a session starts or the user asks what they can do.",
       tier: "read",
       inputSchema: z.object({}),
+      availableWhenLocked: true,
       run: async (_input, a) => {
         const targets = a.registry.list();
         if (targets.length === 0) {
           return ok(
-            "No targets are registered yet — nothing to manage until you add some.\n\n" +
+            lockedBanner(a) +
+              "No targets are registered yet — nothing to manage until you add some.\n\n" +
               "Recommended onboarding (offer to do this with the user):\n" +
               "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services.\n" +
               "2. vault_generate_ssh_key for a host → give them the public key to install.\n" +
@@ -48,7 +64,8 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         }
         const lines = targets.map((t) => `- ${t.name} (${t.type}) → ${t.host}`);
         return ok(
-          `${targets.length} target(s) registered:\n${lines.join("\n")}\n\n` +
+          lockedBanner(a) +
+            `${targets.length} target(s) registered:\n${lines.join("\n")}\n\n` +
             "Their per-target tools (e.g. ssh.<name>.tail_log) are available. " +
             "Use network_scan to find more, or list_targets / vault_list_credentials to review.",
         );
@@ -162,6 +179,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       name: "network_scan",
       description: "Scan the LAN for known homelab services (Synology, Proxmox, UniFi, Home Assistant, Portainer, Pi-hole, SSH). Returns suggestions to confirm; nothing is registered automatically.",
       tier: "read",
+      availableWhenLocked: true,
       inputSchema: z.object({
         subnet: z.string().optional().describe("First three octets of your LAN, e.g. '192.168.0'. Needed when running in a bridged container. Blank = auto-detect."),
       }),
@@ -229,6 +247,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       name: "list_targets",
       description: "List the currently registered targets.",
       tier: "read",
+      availableWhenLocked: true,
       inputSchema: z.object({}),
       run: async (_input, a) => {
         const targets = a.registry.list();

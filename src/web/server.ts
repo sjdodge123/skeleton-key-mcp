@@ -7,6 +7,7 @@ import { buildMcpServer } from "../mcp/server.js";
 import { buildApiRouter } from "./routes.js";
 import { buildOAuthRouter } from "./oauth-routes.js";
 import { mcpAuth } from "./auth.js";
+import { baseUrl } from "./http-util.js";
 import { WIZARD_HTML } from "./ui.js";
 
 interface McpSession {
@@ -61,6 +62,9 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
   sweeper.unref();
 
   server.post("/mcp", auth, async (req, res) => {
+    // Remember how the client reaches us so locked-vault guidance can point at
+    // the right admin-UI URL even without SKELETON_KEY_PUBLIC_URL.
+    app.notePublicOrigin(baseUrl(req));
     let registeredId: string | undefined;
     try {
       const sid = req.header("mcp-session-id");

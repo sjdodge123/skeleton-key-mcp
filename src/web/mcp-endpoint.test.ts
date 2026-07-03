@@ -96,4 +96,44 @@ describe("stateful MCP endpoint", () => {
     expect(r.status).toBe(400);
     expect((await r.json()).error.code).toBe(-32000);
   });
+
+  // A fresh AppState is locked (store + vault), which is exactly the post-restart
+  // state the locked-vault UX is about.
+  describe("while the vault is locked", () => {
+    async function callTool(sid: string, name: string, id: number): Promise<{ text: string; isError?: boolean }> {
+      const r = await fetch(base, {
+        method: "POST",
+        headers: { ...H, "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: {} } }),
+      });
+      const result = parseSse(await r.text()).result;
+      return { text: result?.content?.[0]?.text ?? "", isError: result?.isError };
+    }
+
+    it("short-circuits credential-needing tools with unlock guidance naming the admin URL", async () => {
+      delete process.env.SKELETON_KEY_PUBLIC_URL;
+      const sid = await initialize();
+      const { text, isError } = await callTool(sid, "vault_list_credentials", 10);
+      expect(isError).toBe(true);
+      expect(text).toContain("locked");
+      expect(text).toContain("master passphrase");
+      // The admin-UI URL is learned from the request itself (no PUBLIC_URL set).
+      expect(text).toContain("http://127.0.0.1:");
+    });
+
+    it("keeps get_started working and leads with how to unlock", async () => {
+      const sid = await initialize();
+      const { text, isError } = await callTool(sid, "get_started", 11);
+      expect(isError).toBeFalsy();
+      expect(text).toContain("LOCKED");
+      expect(text).toContain("master passphrase");
+    });
+
+    it("keeps list_targets working", async () => {
+      const sid = await initialize();
+      const { text, isError } = await callTool(sid, "list_targets", 12);
+      expect(isError).toBeFalsy();
+      expect(text).toContain("No targets registered yet");
+    });
+  });
 });
