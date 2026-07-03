@@ -57,6 +57,7 @@ All mutable state lives under `SKELETON_KEY_DATA_DIR` (`/data` in the image, a D
 - `src/connectors/command-policy.ts` — deny-list (rm -rf, mkfs, dd, fork bombs, …) + a read-only allowlist.
 - `src/connectors/ssh-keygen.ts` — shells out to `ssh-keygen` for OpenSSH-format ed25519 keys (reliably parsed by ssh2); keys generated in a throwaway temp dir.
 - `src/connectors/http.ts` — generic HTTP/REST connector (fallback for any web service).
+- `src/connectors/portainer.ts` — bespoke **Portainer** connector (Docker mgmt). Auth via a Portainer API key (`X-API-Key`, read from an explicit `token`/`api_key` field) or username/password → JWT. Read tools: `list_endpoints`, `list_containers`, `container_logs` (Docker log-frame demux), `list_stacks`, `get_stack_file`. Execute tools: `start/stop/restart_container` and `update_stack` (redeploy a stack from an edited compose file — how Skeleton Key can change its own stack's env and recreate it).
 
 **Discovery**
 - `src/discovery/scan.ts` — opt-in LAN scan (RFC1918-gated). Fingerprints each open port: SSH banner for 22; HTTP GET + content-signature match for web ports. Emits a `confidence` (confirmed/likely/open). `matchHttp` is the pure matcher; `httpProbe` always settles (bounded body read).

@@ -1,6 +1,7 @@
 import type { Connector } from "./types.js";
 import { sshConnector } from "./ssh.js";
 import { httpConnector } from "./http.js";
+import { portainerConnector } from "./portainer.js";
 
 /**
  * Registry of available connector *types*. Adding support for a new service
@@ -38,3 +39,4 @@ export function registerableType(connectorType: string, port?: number): string {
 // here in later phases.
 registerConnector(sshConnector);
 registerConnector(httpConnector);
+registerConnector(portainerConnector);
