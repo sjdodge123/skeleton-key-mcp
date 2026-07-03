@@ -17,26 +17,35 @@ function safeEqual(a: string, b: string): boolean {
  * clients (Claude) can discover the authorization server and start the browser
  * consent flow automatically. Fails closed throughout.
  *
- * A locked vault does NOT block authenticated clients: sessions still connect
- * and tool calls return actionable "unlock at <url>" errors (see the CallTool
- * locked gate) instead of the endpoint going dark with an opaque 503 that
- * clients render as "failed to reconnect".
+ * Auth routing is deliberately INDEPENDENT of the vault lock state. A locked
+ * vault (post-restart) is enforced at the *tool* layer (only a banner-only
+ * get_started runs while locked — see the CallTool locked gate), not here. In
+ * particular, an expired access token must still get the 401 challenge so the
+ * client silently refreshes (the refresh grant needs only oauth.sqlite and works
+ * while locked) instead of a dead 503 — otherwise the endpoint appears to "go
+ * dark after a restart", the very bug this path exists to prevent.
  */
 export function mcpAuth(app: AppState) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const adminUi = `${baseUrl(req)}/`;
     if (!(await app.isSetupComplete())) {
-      res.status(503).json({ error: `Setup not complete. Open ${adminUi} to finish onboarding.` });
+      res.status(503).json({ error: "Setup not complete. Open the Skeleton Key web UI to finish onboarding." });
       return;
     }
     const header = req.header("authorization") ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : "";
 
     const challenge = (): void => {
+      // When locked, hint that unlocking may be the fix (a fresh client can't
+      // complete consent until the store is unlocked); include the pinned URL
+      // only, never a Host-derived one.
+      const url = app.locked ? app.unlockUrl() : null;
+      const detail = app.locked
+        ? ` Skeleton Key may be locked; ${url ? `unlock at ${url}/` : "unlock it via the web UI"} first.`
+        : "";
       res
         .status(401)
         .set("WWW-Authenticate", `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`)
-        .json({ error: "Missing or invalid credentials." });
+        .json({ error: `Missing or invalid credentials.${detail}` });
     };
 
     if (!token) {
@@ -52,23 +61,17 @@ export function mcpAuth(app: AppState) {
         return;
       }
       // 2. Legacy static bearer token (kept for existing connections). Only
-      //    verifiable while the store is unlocked.
+      //    verifiable while the store is unlocked; while locked we can't confirm
+      //    it, so fall through to the challenge (which lets an OAuth client
+      //    refresh, and tells a locked client to unlock).
       if (!app.store.locked) {
         const expected = app.store.get().mcpBearerToken;
         if (expected && safeEqual(token, expected)) {
           next();
           return;
         }
-        challenge();
-        return;
       }
-      // Store locked and the token isn't a valid OAuth token — it may be the
-      // static bearer, which we cannot verify right now. Say so (with the fix)
-      // instead of a 401 that would push the client into an OAuth flow that
-      // dead-ends: consent needs TOTP, which also needs the unlocked store.
-      res.status(503).json({
-        error: `Skeleton Key is locked (container restarted?). Open ${adminUi} and enter the master passphrase to unlock, then retry.`,
-      });
+      challenge();
     } catch {
       // Fail closed on any error (e.g. a transient DB failure) rather than hang.
       challenge();

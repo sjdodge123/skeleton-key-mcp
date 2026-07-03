@@ -27,21 +27,6 @@ const SERVER_INSTRUCTIONS = [
 ].join("\n");
 
 /**
- * Actionable error for tool calls made while the vault is locked (e.g. after a
- * container restart). Tells the agent exactly how the user recovers, instead of
- * a bare failure that reads as "Skeleton Key is broken".
- */
-function lockedNotice(app: AppState): string {
-  const url = app.unlockUrl();
-  const where = url ? `${url}/` : "the Skeleton Key web UI (same host and port as this MCP endpoint)";
-  return (
-    "🔒 Skeleton Key is locked — the credential vault re-locks whenever the container restarts.\n" +
-    `Tell the user to open ${where} in a browser and enter their master passphrase, then retry this call. ` +
-    "get_started, list_targets, and network_scan still work while locked."
-  );
-}
-
-/**
  * Build the MCP server. Tools are resolved dynamically on every `tools/list` and
  * `tools/call`, so the set reflects whatever targets are currently registered.
  */
@@ -95,13 +80,16 @@ export function buildMcpServer(app: AppState): Server {
     }
 
     // Locked gate: without credentials most tools can only fail — short-circuit
-    // with recovery guidance instead of surfacing a raw connector error.
+    // with recovery guidance instead of surfacing a raw connector error. While
+    // locked, only a banner-only get_started runs (availableWhenLocked); every
+    // other tool (incl. list_targets/network_scan) is withheld so a leaked token
+    // can't enumerate targets or scan the LAN before the admin unlocks.
     if (app.locked && !resolved.availableWhenLocked) {
       app.audit.record({
         ts, tool: name, target: auditTarget, tier: resolved.tier,
         args: parsed.data, status: "denied", detail: "vault locked",
       });
-      return { content: [{ type: "text", text: lockedNotice(app) }], isError: true };
+      return { content: [{ type: "text", text: app.unlockGuidance() }], isError: true };
     }
 
     // Approval gate for state-changing tools.

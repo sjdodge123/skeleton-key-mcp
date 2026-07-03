@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import express from "express";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,6 +20,8 @@ let handle: { stop: () => void };
 let base: string;
 
 beforeEach(async () => {
+  // Keep unlock guidance deterministic (host-agnostic) regardless of ambient env.
+  vi.stubEnv("SKELETON_KEY_PUBLIC_URL", "");
   dir = await mkdtemp(path.join(tmpdir(), "skmcp-mcp-"));
   process.env.SKELETON_KEY_DATA_DIR = dir;
   app = await AppState.create();
@@ -34,6 +36,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   handle.stop();
   httpServer.close();
   app.audit.close();
@@ -110,30 +113,41 @@ describe("stateful MCP endpoint", () => {
       return { text: result?.content?.[0]?.text ?? "", isError: result?.isError };
     }
 
-    it("short-circuits credential-needing tools with unlock guidance naming the admin URL", async () => {
-      delete process.env.SKELETON_KEY_PUBLIC_URL;
+    it("short-circuits credential-needing tools with unlock guidance", async () => {
       const sid = await initialize();
       const { text, isError } = await callTool(sid, "vault_list_credentials", 10);
       expect(isError).toBe(true);
       expect(text).toContain("locked");
       expect(text).toContain("master passphrase");
-      // The admin-UI URL is learned from the request itself (no PUBLIC_URL set).
-      expect(text).toContain("http://127.0.0.1:");
     });
 
-    it("keeps get_started working and leads with how to unlock", async () => {
+    it("keeps get_started working, leads with how to unlock, and reveals no targets", async () => {
       const sid = await initialize();
       const { text, isError } = await callTool(sid, "get_started", 11);
       expect(isError).toBeFalsy();
-      expect(text).toContain("LOCKED");
+      expect(text).toContain("locked");
       expect(text).toContain("master passphrase");
+      expect(text).toContain("no targets or tools are available");
     });
 
-    it("keeps list_targets working", async () => {
+    it("withholds list_targets while locked (no enumeration before unlock)", async () => {
       const sid = await initialize();
       const { text, isError } = await callTool(sid, "list_targets", 12);
-      expect(isError).toBeFalsy();
-      expect(text).toContain("No targets registered yet");
+      expect(isError).toBe(true);
+      expect(text).toContain("locked");
+    });
+
+    it("withholds network_scan while locked", async () => {
+      const sid = await initialize();
+      const { isError } = await callTool(sid, "network_scan", 13);
+      expect(isError).toBe(true);
+    });
+
+    it("does not echo the request Host into unlock guidance", async () => {
+      const sid = await initialize();
+      const { text } = await callTool(sid, "vault_list_credentials", 14);
+      // No SKELETON_KEY_PUBLIC_URL in tests → guidance stays host-agnostic.
+      expect(text).not.toContain("127.0.0.1");
     });
   });
 });

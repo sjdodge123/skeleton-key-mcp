@@ -48,19 +48,27 @@ export class AppState {
     return this.store.locked || !this.vault.unlocked;
   }
 
-  private lastSeenOrigin: string | null = null;
-
-  /** Remember the origin a client actually reached us on, as a fallback for
-   *  building user-facing links when SKELETON_KEY_PUBLIC_URL isn't set. */
-  notePublicOrigin(origin: string): void {
-    this.lastSeenOrigin = origin;
-  }
-
-  /** Admin web UI URL for "go unlock" guidance, or null if we can't know it. */
+  /**
+   * Admin web UI URL for "go unlock" guidance, or null if not configured.
+   * Deliberately NOT derived from the request `Host` header: this URL is where
+   * we tell the admin to type their master passphrase, so an attacker-controlled
+   * Host must never steer it (phishing). Only a pinned SKELETON_KEY_PUBLIC_URL is
+   * trusted; otherwise callers fall back to host-agnostic guidance text.
+   */
   unlockUrl(): string | null {
     const configured = process.env.SKELETON_KEY_PUBLIC_URL;
-    if (configured) return configured.replace(/\/$/, "");
-    return this.lastSeenOrigin;
+    return configured ? configured.replace(/\/$/, "") : null;
+  }
+
+  /** Single source of truth for the "vault is locked, here's how to fix it"
+   *  message shown across MCP tool errors, get_started, and the auth layer. */
+  unlockGuidance(): string {
+    const url = this.unlockUrl();
+    const where = url ? `${url}/` : "the Skeleton Key admin web UI (same host and port as this MCP endpoint)";
+    return (
+      "🔒 Skeleton Key is locked — the credential vault re-locks whenever the container restarts.\n" +
+      `Have the user open ${where} in a browser and enter the master passphrase to unlock, then retry.`
+    );
   }
 
   private readonly toolChangeListeners = new Set<() => void>();
@@ -89,10 +97,7 @@ export class AppState {
   /** Resolve a target's credential from the vault (offline-cache backed). */
   async credentialFor(credentialRef: string) {
     if (!this.vault.unlocked) {
-      const url = this.unlockUrl();
-      throw new Error(
-        `Vault is locked; cannot resolve credentials. Unlock via the admin web UI${url ? ` at ${url}/` : ""}.`,
-      );
+      throw new Error(this.unlockGuidance());
     }
     return this.vault.getCredential(credentialRef);
   }
