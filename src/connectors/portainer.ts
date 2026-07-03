@@ -173,6 +173,35 @@ class Portainer {
     if (!res.ok) throw new Error(`HTTP ${res.status} updating stack #${id}: ${res.text.slice(0, 400)}`);
     return `Stack '${cur.Name}' (#${id}) redeployed with the updated compose file.`;
   }
+
+  /**
+   * Run a command inside a container (Docker exec via Portainer): create an exec
+   * instance, then start it and demux the multiplexed output. `argv` is exact
+   * argument tokens (no shell) — many images (e.g. watchtower) have no /bin/sh.
+   */
+  async exec(ref: string, argv: string[]): Promise<string> {
+    const eid = await this.endpointId();
+    const created = await this.fetch(`/api/endpoints/${eid}/docker/containers/${encodeURIComponent(ref)}/exec`, {
+      method: "POST",
+      body: { AttachStdout: true, AttachStderr: true, Cmd: argv },
+    });
+    if (!created.ok) throw new Error(`HTTP ${created.status} creating exec on '${ref}': ${created.text.slice(0, 300)}`);
+    const execId = (created.json as { Id?: string })?.Id;
+    if (!execId) throw new Error(`Portainer returned no exec id for '${ref}'.`);
+    const started = await this.fetch(`/api/endpoints/${eid}/docker/exec/${execId}/start`, {
+      method: "POST",
+      body: { Detach: false, Tty: false },
+      raw: true,
+    });
+    if (!started.ok) throw new Error(`HTTP ${started.status} starting exec on '${ref}'.`);
+    return demuxDockerLogs(started.buf ?? Buffer.alloc(0)) || "(no output)";
+  }
+}
+
+/** Split a command line into exact argv tokens on whitespace (no shell / no
+ *  quoting — minimal images have no shell). Exported for testing. */
+export function toArgv(command: string): string[] {
+  return command.trim().split(/\s+/).filter(Boolean);
 }
 
 interface DockerContainer {
@@ -323,6 +352,23 @@ function buildTools(target: Target): ConnectorTool[] {
       }),
       confirm: (input, t) => `Redeploy Portainer stack #${(input as { stackId: number }).stackId} on ${t.name} with an edited compose file`,
       run: run((p, i) => p.updateStack(i.stackId, i.stackFileContent, i.pullImage)),
+    },
+    {
+      name: "exec_container",
+      description:
+        `Run a command inside a container on ${target.name} (Docker exec). ` +
+        `Command is split into exact argv tokens on whitespace — no shell, no quoting (many images have no /bin/sh). ` +
+        `E.g. trigger a scoped Watchtower update: container 'watchtower', command '/watchtower --run-once skeleton-key'.`,
+      tier: "execute",
+      inputSchema: z.object({
+        container: z.string().describe("Container name or id."),
+        command: z.string().describe("Command with arguments, split on whitespace (no shell)."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { container: string; command: string };
+        return `Exec '${i.command}' inside container '${i.container}' on ${t.name}`;
+      },
+      run: run((p, i) => p.exec(i.container, toArgv(i.command))),
     },
   ];
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { portainerConnector, baseUrl, apiKeyFrom, summarizeContainers, demuxDockerLogs } from "./portainer.js";
+import { portainerConnector, baseUrl, apiKeyFrom, summarizeContainers, demuxDockerLogs, toArgv } from "./portainer.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 
 function target(options: Record<string, unknown> = {}, port = 9000): Target {
@@ -24,7 +24,10 @@ function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: 
       ok: status >= 200 && status < 300,
       status,
       text: async () => (route.reply.json !== undefined ? JSON.stringify(route.reply.json) : ""),
-      arrayBuffer: async () => (route.reply.buf ?? Buffer.alloc(0)).buffer,
+      arrayBuffer: async () => {
+        const b = route.reply.buf ?? Buffer.alloc(0);
+        return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); // exact bytes, not the shared pool
+      },
     } as any;
   });
   vi.stubGlobal("fetch", fn);
@@ -142,6 +145,37 @@ describe("update_stack", () => {
     expect(body.stackFileContent).toContain("image: x");
     expect(body.env).toEqual([{ name: "TZ", value: "UTC" }]); // preserved
     expect(body.prune).toBe(false);
+  });
+});
+
+describe("exec_container", () => {
+  it("creates an exec instance, starts it, and demuxes the output", async () => {
+    const out = "refreshed\n";
+    const frame = Buffer.concat([Buffer.from([1, 0, 0, 0, 0, 0, 0, out.length]), Buffer.from(out)]);
+    const calls = mockFetch([
+      { match: (u, i) => /\/watchtower\/exec$/.test(u) && i.method === "POST", reply: { json: { Id: "exec123" } } },
+      { match: (u, i) => u.includes("/docker/exec/exec123/start") && i.method === "POST", reply: { buf: frame } },
+    ]);
+    const t: Target = { name: "nas", type: "portainer", host: "10.0.0.5", port: 9000, credentialRef: "k", options: { endpointId: 1 } };
+    const execTool = portainerConnector.buildTools(t).find((x) => x.name === "exec_container")!;
+    const res = await execTool.run({ container: "watchtower", command: "/watchtower --run-once skeleton-key" }, ctx(cred({ fields: { token: "k" } }), t));
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toBe("refreshed\n");
+    // Exec Cmd is exact argv tokens (no shell wrapper).
+    const create = calls.find((c) => c.url.endsWith("/watchtower/exec"))!;
+    expect(JSON.parse(create.init.body).Cmd).toEqual(["/watchtower", "--run-once", "skeleton-key"]);
+  });
+
+  it("is execute-tier", () => {
+    const tool = portainerConnector.buildTools(target()).find((x) => x.name === "exec_container")!;
+    expect(tool.tier).toBe("execute");
+  });
+});
+
+describe("toArgv", () => {
+  it("splits on whitespace into exact tokens", () => {
+    expect(toArgv("/watchtower --run-once skeleton-key")).toEqual(["/watchtower", "--run-once", "skeleton-key"]);
+    expect(toArgv("  ls  -la  ")).toEqual(["ls", "-la"]);
   });
 });
 
