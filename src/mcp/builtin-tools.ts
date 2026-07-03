@@ -30,6 +30,31 @@ const err = (text: string): ToolResult => ({ text, isError: true });
 export function buildGlobalTools(app: AppState): GlobalTool[] {
   return [
     {
+      name: "get_started",
+      description: "Show onboarding status and the recommended next step. Call this when a session starts or the user asks what they can do.",
+      tier: "read",
+      inputSchema: z.object({}),
+      run: async (_input, a) => {
+        const targets = a.registry.list();
+        if (targets.length === 0) {
+          return ok(
+            "No targets are registered yet — nothing to manage until you add some.\n\n" +
+              "Recommended onboarding (offer to do this with the user):\n" +
+              "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services.\n" +
+              "2. vault_generate_ssh_key for a host → give them the public key to install.\n" +
+              "3. register_target to add it.\n" +
+              "4. vault_validate_ssh to confirm access.",
+          );
+        }
+        const lines = targets.map((t) => `- ${t.name} (${t.type}) → ${t.host}`);
+        return ok(
+          `${targets.length} target(s) registered:\n${lines.join("\n")}\n\n` +
+            "Their per-target tools (e.g. ssh.<name>.tail_log) are available. " +
+            "Use network_scan to find more, or list_targets / vault_list_credentials to review.",
+        );
+      },
+    },
+    {
       name: "vault_generate_ssh_key",
       description:
         "Generate a dedicated ed25519 SSH keypair and store the PRIVATE key in the scoped Vaultwarden collection as a Login item. Returns the PUBLIC key and the authorized_keys line to install on the target host. The private key is never returned.",
@@ -188,6 +213,9 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         }
         const target = { name: i.name, type: i.type, host: i.host, port: i.port, credentialRef: i.credentialRef, options: i.options };
         await a.registry.upsert(target);
+        // Tell live sessions the tool set changed so the new per-target tools
+        // appear without reconnecting.
+        a.emitToolsChanged();
         // Best-effort tool count against the full target; never fail the (already
         // persisted) registration just because counting threw.
         let count = "";
