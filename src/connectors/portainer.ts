@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
-import { deriveBaseUrl } from "./net.js";
+import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
  * Portainer connector — manage Docker through a Portainer CE/BE instance.
@@ -24,6 +24,9 @@ const optionsSchema = z
     baseUrl: z.string().url().optional(),
     /** Docker environment ("endpoint") id for container ops. Auto-detected if unset. */
     endpointId: z.number().int().positive().optional(),
+    /** Skip TLS verification for THIS target only (self-signed Portainer on :9443).
+     *  Per-request via an undici dispatcher, never process-global. */
+    insecureTLS: z.boolean().default(false),
   })
   .default({});
 
@@ -83,11 +86,11 @@ class Portainer {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (!opts.noAuth) Object.assign(headers, await this.authHeaders());
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
-    const res = await fetch(`${this.base}${path}`, {
-      method: opts.method ?? "GET",
-      headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    });
+    const res = await tlsFetch(
+      `${this.base}${path}`,
+      { method: opts.method ?? "GET", headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined },
+      options(this.target).insecureTLS,
+    );
     if (opts.raw) {
       const buf = Buffer.from(await res.arrayBuffer());
       return { ok: res.ok, status: res.status, text: "", buf };

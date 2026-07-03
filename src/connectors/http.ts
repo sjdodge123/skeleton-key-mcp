@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, Credential, Target, ToolContext } from "./types.js";
-import { deriveBaseUrl } from "./net.js";
+import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
  * Generic HTTP/REST connector — the fallback for any service that speaks HTTP
@@ -17,6 +17,10 @@ const optionsSchema = z
     auth: z.enum(["none", "bearer", "basic", "header"]).default("none"),
     /** Header name when auth === "header" (e.g. "X-API-Key"). */
     headerName: z.string().optional(),
+    /** Skip TLS verification for THIS target's requests only (self-signed LAN
+     *  cert, e.g. Proxmox :8006). Scoped per-request via an undici dispatcher —
+     *  never mutates the process-global TLS setting. */
+    insecureTLS: z.boolean().default(false),
   })
   .default({});
 
@@ -53,12 +57,13 @@ async function request(
   }
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
+  const opts = optionsSchema.parse(ctx.target.options ?? {});
   const url = `${baseUrl(ctx.target)}${path.startsWith("/") ? path : `/${path}`}`;
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  const res = await tlsFetch(
+    url,
+    { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined },
+    opts.insecureTLS,
+  );
   const text = await res.text();
   return {
     text: `HTTP ${res.status} ${res.statusText}\n${text.slice(0, 20_000)}`,

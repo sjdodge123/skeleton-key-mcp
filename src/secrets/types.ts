@@ -5,8 +5,12 @@ export interface Credential {
   ref: string;
   username?: string;
   password?: string;
-  /** e.g. an API token, long-lived token, or private key. */
+  /** An explicit secret field — API token, long-lived token, or private key.
+   *  Deliberately NOT the item's freeform notes (see getCredential): treating
+   *  notes as a secret let a password login's notes be misread as a token/key. */
   secret?: string;
+  /** The item's freeform notes, exposed separately from `secret`. */
+  notes?: string;
   /** Arbitrary custom fields stored on the vault item. */
   fields: Record<string, string>;
   /** URIs stored on the item, if any. */

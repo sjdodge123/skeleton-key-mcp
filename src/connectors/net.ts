@@ -1,4 +1,25 @@
 import type { Target } from "./types.js";
+import { Agent, fetch as undiciFetch } from "undici";
+
+let insecureAgent: Agent | undefined;
+
+/**
+ * fetch() that can skip TLS verification for **this request only** (an opt-in
+ * per-target `insecureTLS`), via an undici dispatcher — instead of mutating the
+ * process-global `NODE_TLS_REJECT_UNAUTHORIZED`, which would silently disable
+ * TLS verification for the whole process (including the bw Vaultwarden sync).
+ * Needed for self-signed LAN services (Proxmox :8006, UniFi, Synology, …).
+ *
+ * The secure path uses Node's global `fetch`. The insecure path MUST use
+ * undici's own `fetch` with the Agent from the SAME undici — passing this
+ * package's Agent as a `dispatcher` to Node's built-in fetch fails with
+ * UND_ERR_INVALID_ARG (its bundled undici rejects a foreign dispatcher).
+ */
+export function tlsFetch(url: string, init: RequestInit, insecureTLS = false): Promise<Response> {
+  if (!insecureTLS) return fetch(url, init);
+  insecureAgent ??= new Agent({ connect: { rejectUnauthorized: false } });
+  return undiciFetch(url, { ...(init as Record<string, unknown>), dispatcher: insecureAgent }) as unknown as Promise<Response>;
+}
 
 /**
  * Derive a base URL for an HTTP(S) target. An explicit `baseUrl` option wins;
