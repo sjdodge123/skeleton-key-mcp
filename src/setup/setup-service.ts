@@ -25,12 +25,12 @@ export class SetupService {
   /** Step: connect + verify the scoped Vaultwarden service account. */
   async connectVault(input: VaultConnectInput): Promise<CheckResult[]> {
     const { vault, store } = this.app;
-    await vault.setServer(input.serverUrl);
-    const status = await vault.status();
-    if (status.status === "unauthenticated") {
-      await vault.loginApiKey(input.clientId, input.clientSecret);
-    }
-    await vault.unlock(input.masterPassword);
+    await vault.reestablish({
+      serverUrl: input.serverUrl,
+      clientId: input.clientId,
+      clientSecret: input.clientSecret,
+      masterPassword: input.masterPassword,
+    });
     await vault.sync();
 
     await store.update({
