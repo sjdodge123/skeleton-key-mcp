@@ -54,9 +54,12 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
             "No targets are registered yet — nothing to manage until you add some.\n\n" +
               "Recommended onboarding (offer to do this with the user):\n" +
               "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services.\n" +
-              "2. vault_generate_ssh_key for a host → give them the public key to install.\n" +
-              "3. register_target to add it.\n" +
-              "4. vault_validate_ssh to confirm access.",
+              "2. Get a credential for the host, WITHOUT asking for secrets in chat:\n" +
+              "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status.\n" +
+              "   • SSH host you already have access to? Call vault_generate_ssh_key, then either install the returned key via that host's run_command (if you already have a working credential) or give the user the one-liner to install it themselves.\n" +
+              "3. register_target to add the host so its tools appear.\n" +
+              "4. vault_validate_ssh (for ssh) to confirm access.\n\n" +
+              "Managing existing creds: update_target re-points a host at a new credentialRef (e.g. password → key); vault_delete_credential retires an old item.",
           );
         }
         const lines = targets.map((t) => `- ${t.name} (${t.type}) → ${t.host}`);
@@ -236,6 +239,125 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           count = ` ${connector.buildTools(target).length} tools are now available for it.`;
         } catch { /* ignore */ }
         return ok(`Registered '${i.name}' (${i.type} @ ${i.host}).${count} Tools are namespaced ${i.type}.${i.name}.*`);
+      },
+    },
+    {
+      name: "vault_delete_credential",
+      description:
+        "Delete an item from the scoped vault by credentialRef (e.g. retire an old password after upgrading a host to SSH keys). Refuses if a registered target still references it, unless force=true.",
+      tier: "execute",
+      inputSchema: z.object({
+        credentialRef: z.string().describe("Vault item name (or id) to delete."),
+        force: z.boolean().optional().describe("Delete even if a registered target still references it."),
+      }),
+      confirm: (input) => `Delete vault item '${(input as { credentialRef: string }).credentialRef}' — any target still using it will lose access`,
+      run: async (input, a) => {
+        const i = input as { credentialRef: string; force?: boolean };
+        const dependents = a.registry.list().filter((t) => t.credentialRef === i.credentialRef).map((t) => t.name);
+        if (dependents.length && !i.force) {
+          return err(
+            `Refusing to delete '${i.credentialRef}': still used by target(s) ${dependents.join(", ")}. ` +
+              "Re-point them first (update_target) or pass force=true.",
+          );
+        }
+        const { name } = await a.vault.deleteItem(i.credentialRef);
+        const warn = dependents.length ? ` Warning: ${dependents.join(", ")} referenced it and will fail until re-pointed.` : "";
+        return ok(`Deleted vault item "${name}".${warn}`);
+      },
+    },
+    {
+      name: "update_target",
+      description:
+        "Update a registered target's credentialRef (and optionally host/port/options) — e.g. re-point a host from a password login to a generated SSH key. A new credentialRef must resolve to an existing vault item.",
+      tier: "execute",
+      inputSchema: z.object({
+        name: safeName,
+        credentialRef: z.string().optional().describe("New vault item name to use for this target."),
+        host: z.string().optional(),
+        port: z.number().int().positive().optional(),
+        options: z.record(z.unknown()).optional(),
+      }),
+      confirm: (input) => {
+        const i = input as { name: string; credentialRef?: string };
+        return `Update target '${i.name}'${i.credentialRef ? ` → credential '${i.credentialRef}'` : ""}`;
+      },
+      run: async (input, a) => {
+        const i = input as { name: string; credentialRef?: string; host?: string; port?: number; options?: Record<string, unknown> };
+        const existing = a.registry.get(i.name);
+        if (!existing) return err(`No target named '${i.name}'. Use register_target to add it, or list_targets to see names.`);
+        if (i.credentialRef) {
+          // Verify the new ref resolves before committing, so a typo can't brick a working target.
+          try {
+            await a.credentialFor(i.credentialRef);
+          } catch (e) {
+            return err(`credentialRef '${i.credentialRef}' didn't resolve: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        const merged = {
+          ...existing,
+          credentialRef: i.credentialRef ?? existing.credentialRef,
+          host: i.host ?? existing.host,
+          port: i.port ?? existing.port,
+          options: i.options ?? existing.options,
+        };
+        await a.registry.upsert(merged);
+        a.emitToolsChanged();
+        return ok(
+          `Updated '${i.name}' (${merged.type} @ ${merged.host}${merged.port ? ":" + merged.port : ""})` +
+            `${merged.credentialRef ? ` [cred: ${merged.credentialRef}]` : ""}.`,
+        );
+      },
+    },
+    {
+      name: "request_credential",
+      description:
+        "Ask the user to provide a credential (password or API token) for a host WITHOUT it passing through the chat. Returns a one-time, TOTP-gated web link; the user enters the secret in their browser and it is stored straight in the vault. Poll credential_request_status to know when it's done, then register_target with the item name.",
+      tier: "execute",
+      inputSchema: z.object({
+        name: safeName.describe("Vault item name to create (also the future credentialRef)."),
+        host: z.string().describe("Host/IP the credential is for."),
+        kind: z.enum(["password", "token"]).describe("password = username/password login; token = API token/key."),
+        reason: z.string().describe("Short reason shown to the user, e.g. 'SSH access to onboard nas1'."),
+        username: z.string().optional().describe("Remote username, for password logins."),
+      }),
+      confirm: (input) => {
+        const i = input as { name: string; host: string };
+        return `Create a one-time credential-request link for '${i.name}' (${i.host})`;
+      },
+      run: async (input, a) => {
+        const i = input as { name: string; host: string; kind: "password" | "token"; reason: string; username?: string };
+        const names = await a.vault.listItemNames();
+        if (names.includes(i.name)) return err(`A vault item named '${i.name}' already exists — pick a different name.`);
+        const request = a.credentialRequests.create({ name: i.name, host: i.host, username: i.username, kind: i.kind, reason: i.reason });
+        const base = a.publicUrl();
+        const link = `${base ?? ""}/credential/${request.id}`;
+        const shown = base ? link : `${link}  (open on your Skeleton Key host; set SKELETON_KEY_PUBLIC_URL for absolute links)`;
+        return ok(
+          `Ask the user to open this one-time link and enter the ${i.kind} for ${i.host} — you will not see the value:\n\n${shown}\n\n` +
+            `The link is TOTP-gated and expires in 15 minutes. After they submit, call credential_request_status with id "${request.id}"; ` +
+            `once it reports 'fulfilled', register the target with credentialRef '${i.name}'.`,
+        );
+      },
+    },
+    {
+      name: "credential_request_status",
+      description: "Check whether a credential-request link (from request_credential) has been completed. Returns pending, fulfilled, expired, or declined.",
+      tier: "read",
+      inputSchema: z.object({ id: z.string().describe("The request id returned by request_credential.") }),
+      run: async (input, a) => {
+        const i = input as { id: string };
+        const request = a.credentialRequests.get(i.id);
+        if (!request) return err(`No credential request with id '${i.id}' (it may have expired and been evicted). Create a new one with request_credential.`);
+        switch (request.status) {
+          case "fulfilled":
+            return ok(`✅ fulfilled — credential '${request.fulfilledName}' is in the vault. Register the target with credentialRef '${request.fulfilledName}'.`);
+          case "pending":
+            return ok(`⏳ pending — the user hasn't submitted the credential for '${request.name}' yet. Ask them to open the link, or check again shortly.`);
+          case "expired":
+            return ok(`⌛ expired — the link for '${request.name}' timed out. Create a new one with request_credential.`);
+          case "declined":
+            return err(`🚫 declined — the user cancelled the request for '${request.name}'.`);
+        }
       },
     },
     {

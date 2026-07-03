@@ -6,6 +6,7 @@ import type { AppState } from "../app.js";
 import { buildMcpServer } from "../mcp/server.js";
 import { buildApiRouter } from "./routes.js";
 import { buildOAuthRouter } from "./oauth-routes.js";
+import { buildCredentialRouter } from "./credential-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
 
@@ -143,6 +144,9 @@ export function buildHttpApp(app: AppState): express.Express {
 
   // OAuth 2.1 authorization server (discovery, registration, consent, token).
   server.use(buildOAuthRouter(app));
+
+  // Secure credential hand-off pages (TOTP-gated; secrets go browser→vault).
+  server.use(buildCredentialRouter(app));
 
   // MCP endpoint (stateful — see mountMcp).
   mountMcp(server, app, mcpAuth(app));

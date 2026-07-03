@@ -4,6 +4,7 @@ import { VaultwardenClient } from "./secrets/vaultwarden.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
+import { CredentialRequestStore } from "./web/credential-requests.js";
 import { authenticator } from "otplib";
 import { paths } from "./config/paths.js";
 
@@ -19,6 +20,7 @@ export class AppState {
     readonly registry: TargetRegistry,
     readonly audit: AuditLog,
     readonly oauth: OAuthService,
+    readonly credentialRequests: CredentialRequestStore,
   ) {}
 
   static async create(): Promise<AppState> {
@@ -27,7 +29,8 @@ export class AppState {
     const registry = await TargetRegistry.load();
     const audit = new AuditLog();
     const oauth = new OAuthService();
-    return new AppState(store, vault, registry, audit, oauth);
+    const credentialRequests = new CredentialRequestStore();
+    return new AppState(store, vault, registry, audit, oauth, credentialRequests);
   }
 
   /** True once the first-run wizard has completed. Until then the MCP endpoint
@@ -49,15 +52,20 @@ export class AppState {
   }
 
   /**
-   * Admin web UI URL for "go unlock" guidance, or null if not configured.
-   * Deliberately NOT derived from the request `Host` header: this URL is where
-   * we tell the admin to type their master passphrase, so an attacker-controlled
-   * Host must never steer it (phishing). Only a pinned SKELETON_KEY_PUBLIC_URL is
-   * trusted; otherwise callers fall back to host-agnostic guidance text.
+   * The pinned public base URL (SKELETON_KEY_PUBLIC_URL) with no trailing slash,
+   * or null if unset. This is the ONLY origin we put in user-facing links that
+   * ask for a secret (unlock guidance, credential-request links): deriving it
+   * from the request `Host` header would let an attacker steer the admin to a
+   * forged origin to type their master passphrase or a target credential.
    */
-  unlockUrl(): string | null {
+  publicUrl(): string | null {
     const configured = process.env.SKELETON_KEY_PUBLIC_URL;
     return configured ? configured.replace(/\/$/, "") : null;
+  }
+
+  /** Admin web UI URL for "go unlock" guidance, or null if not configured. */
+  unlockUrl(): string | null {
+    return this.publicUrl();
   }
 
   /** Single source of truth for the "vault is locked, here's how to fix it"

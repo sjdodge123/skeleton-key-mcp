@@ -9,25 +9,28 @@ type Item = { id: string; name: string; login?: any; fields?: any[] };
  * filter (matching the real CLI) so the bounded fast path is exercised — and it
  * asserts getCredential never shells out to `bw get item`.
  */
-function clientWithItems(items: Item[]): VaultwardenClient {
+function clientWithItems(items: Item[]): { client: VaultwardenClient; calls: string[][] } {
+  const calls: string[][] = [];
   const client = new VaultwardenClient("/unused") as any;
   client.session = "test-session";
   client.run = async (args: string[]) => {
-    expect(args[0]).toBe("list");
-    expect(args[1]).toBe("items");
-    const searchIdx = args.indexOf("--search");
-    const filtered =
-      searchIdx >= 0
-        ? items.filter((i) => i.name.toLowerCase().includes(args[searchIdx + 1]!.toLowerCase()))
-        : items;
-    return JSON.stringify(filtered);
+    calls.push(args);
+    if (args[0] === "list" && args[1] === "items") {
+      const searchIdx = args.indexOf("--search");
+      const filtered =
+        searchIdx >= 0
+          ? items.filter((i) => i.name.toLowerCase().includes(args[searchIdx + 1]!.toLowerCase()))
+          : items;
+      return JSON.stringify(filtered);
+    }
+    return ""; // delete/sync
   };
-  return client as VaultwardenClient;
+  return { client: client as VaultwardenClient, calls };
 }
 
 describe("getCredential", () => {
   it("resolves by exact name even when another item name overlaps", async () => {
-    const client = clientWithItems([
+    const { client } = clientWithItems([
       { id: "1", name: "PiHole", login: { username: "pihole", password: "pw" } },
       { id: "2", name: "pihole-ssh", login: { username: "pihole" }, fields: [{ name: "private_key", value: "KEY" }] },
     ]);
@@ -39,28 +42,48 @@ describe("getCredential", () => {
   });
 
   it("resolves a case-mismatched ref when it is unambiguous (old bw behavior)", async () => {
-    const client = clientWithItems([{ id: "1", name: "PiHole", login: { username: "pihole" } }]);
+    const { client } = clientWithItems([{ id: "1", name: "PiHole", login: { username: "pihole" } }]);
     const cred = await client.getCredential("pihole");
     expect(cred.username).toBe("pihole");
   });
 
   it("resolves a ref given as an item id (via the full-list fallback)", async () => {
-    const client = clientWithItems([{ id: "abc-123", name: "PiHole", login: { username: "pihole" } }]);
+    const { client } = clientWithItems([{ id: "abc-123", name: "PiHole", login: { username: "pihole" } }]);
     const cred = await client.getCredential("abc-123");
     expect(cred.username).toBe("pihole");
   });
 
   it("fails clearly when nothing matches", async () => {
-    const client = clientWithItems([{ id: "1", name: "pihole-ssh" }]);
+    const { client } = clientWithItems([{ id: "1", name: "pihole-ssh" }]);
     await expect(client.getCredential("nope")).rejects.toThrow(/No vault item named "nope"/);
   });
 
   it("fails clearly on true duplicate names", async () => {
-    const client = clientWithItems([
+    const { client } = clientWithItems([
       { id: "1", name: "nas" },
       { id: "2", name: "nas" },
     ]);
     await expect(client.getCredential("nas")).rejects.toThrow(/2 vault items are named "nas"/);
+  });
+});
+
+describe("deleteItem", () => {
+  it("resolves the ref to its id and deletes by id", async () => {
+    const { client, calls } = clientWithItems([
+      { id: "1", name: "PiHole" },
+      { id: "2", name: "pihole-ssh" },
+    ]);
+    const { name } = await client.deleteItem("PiHole");
+    expect(name).toBe("PiHole");
+    // Must delete the exact resolved id, not the overlapping sibling.
+    expect(calls).toContainEqual(["delete", "item", "1"]);
+    expect(calls).not.toContainEqual(["delete", "item", "2"]);
+  });
+
+  it("throws (deletes nothing) when the ref doesn't resolve", async () => {
+    const { client, calls } = clientWithItems([{ id: "1", name: "PiHole" }]);
+    await expect(client.deleteItem("missing")).rejects.toThrow(/No vault item named "missing"/);
+    expect(calls.some((c) => c[0] === "delete")).toBe(false);
   });
 });
 

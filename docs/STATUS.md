@@ -26,7 +26,8 @@ Each feature PR went through an adversarial `/code-review`; findings were fixed 
 
 ## Open PRs
 
-None. `main` is the source of truth.
+- **#14** (`fix/locked-vault-ux-and-cred-lookup`) — exact-name credentialRef lookup + locked-vault UX. Auth-path; awaiting owner review/merge. Reworked after an adversarial `/code-review`.
+- **feat/credential-lifecycle** (stacked on #14) — credential lifecycle: `update_target` (#17), `vault_delete_credential` (#16), secure credential hand-off `request_credential`/`credential_request_status` (#18, TOTP-gated web form so secrets never transit chat), and two-flow onboarding guidance (#15). Base = the #14 branch until #14 merges; then retarget to `main`.
 
 ## Known gaps / good next tasks
 
