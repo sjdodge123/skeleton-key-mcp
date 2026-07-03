@@ -41,6 +41,19 @@ export class AppState {
     }
   }
 
+  private readonly toolChangeListeners = new Set<() => void>();
+
+  /** Subscribe to tool-set changes (e.g. a target registered). Returns an unsubscribe fn. */
+  onToolsChanged(cb: () => void): () => void {
+    this.toolChangeListeners.add(cb);
+    return () => this.toolChangeListeners.delete(cb);
+  }
+
+  /** Notify subscribers that the available tool set changed, so live MCP sessions can refresh. */
+  emitToolsChanged(): void {
+    for (const cb of this.toolChangeListeners) cb();
+  }
+
   /**
    * Single source of truth for admin TOTP verification. Fails closed if the
    * store is locked (no secret available). Used by every 2FA-gated action.

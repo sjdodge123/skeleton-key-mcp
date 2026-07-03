@@ -1,5 +1,7 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { AppState } from "../app.js";
 import { buildMcpServer } from "../mcp/server.js";
 import { buildApiRouter } from "./routes.js";
@@ -7,9 +9,15 @@ import { buildOAuthRouter } from "./oauth-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
 
+interface McpSession {
+  transport: StreamableHTTPServerTransport;
+  mcp: ReturnType<typeof buildMcpServer>;
+  unsubscribe: () => void;
+}
+
 /**
  * Single Express app serving three things on one LAN-bound port:
- *   /mcp   — the MCP Streamable HTTP endpoint (bearer-authed, stateless)
+ *   /mcp   — the MCP Streamable HTTP endpoint (OAuth/bearer-authed, stateful)
  *   /api   — wizard + admin REST API
  *   /      — the setup wizard UI
  */
@@ -22,16 +30,48 @@ export function buildHttpApp(app: AppState): express.Express {
   // OAuth 2.1 authorization server (discovery, registration, consent, token).
   server.use(buildOAuthRouter(app));
 
-  // MCP endpoint. Stateless: a fresh Server+transport per request keeps the
-  // dynamic tool set correct and avoids session bookkeeping for a single user.
+  // MCP endpoint. Stateful so the server can push `tools/list_changed` when the
+  // tool set changes mid-session (e.g. register_target) — the new tools then
+  // appear in the client without a reconnect. Sessions are keyed by the
+  // Mcp-Session-Id header the transport assigns on initialize.
+  const sessions = new Map<string, McpSession>();
+
   server.post("/mcp", mcpAuth(app), async (req, res) => {
-    const mcp = buildMcpServer(app);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    res.on("close", () => {
-      transport.close();
-      mcp.close();
-    });
     try {
+      const sid = req.header("mcp-session-id");
+      const existing = sid ? sessions.get(sid) : undefined;
+      if (existing) {
+        await existing.transport.handleRequest(req, res, req.body);
+        return;
+      }
+      if (!isInitializeRequest(req.body)) {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "No valid session; send an initialize request first." },
+          id: null,
+        });
+        return;
+      }
+      // New session.
+      const mcp = buildMcpServer(app);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => {
+          // Push tools/list_changed to this session whenever the tool set changes.
+          const unsubscribe = app.onToolsChanged(() => {
+            mcp.sendToolListChanged().catch(() => {});
+          });
+          sessions.set(id, { transport, mcp, unsubscribe });
+        },
+      });
+      transport.onclose = () => {
+        const id = transport.sessionId;
+        if (id) {
+          sessions.get(id)?.unsubscribe();
+          sessions.delete(id);
+        }
+        mcp.close();
+      };
       await mcp.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
@@ -41,9 +81,18 @@ export function buildHttpApp(app: AppState): express.Express {
     }
   });
 
-  // Streamable HTTP GET/DELETE are unused in stateless mode.
-  server.get("/mcp", (_req, res) => res.status(405).json({ error: "Method not allowed (stateless)." }));
-  server.delete("/mcp", (_req, res) => res.status(405).json({ error: "Method not allowed (stateless)." }));
+  // GET opens the server→client SSE stream; DELETE terminates the session.
+  const bySession = async (req: express.Request, res: express.Response): Promise<void> => {
+    const sid = req.header("mcp-session-id");
+    const session = sid ? sessions.get(sid) : undefined;
+    if (!session) {
+      res.status(400).json({ error: "Unknown or missing Mcp-Session-Id." });
+      return;
+    }
+    await session.transport.handleRequest(req, res);
+  };
+  server.get("/mcp", mcpAuth(app), bySession);
+  server.delete("/mcp", mcpAuth(app), bySession);
 
   server.use("/api", buildApiRouter(app));
 
