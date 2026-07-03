@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**Skeleton Key MCP** — an MCP server (TypeScript/Node) that gives Claude full, audited access to a homelab: read logs on any server, execute changes with approval, and manage common services (SSH hosts, Synology, UniFi, Home Assistant, Proxmox, Pi-hole, Docker via Portainer). Credentials come from a **scoped Vaultwarden collection**; a LAN-only admin web UI manages targets. It's a framework — users register their own targets; nothing is hard-coded. See `docs/SCOPE.md` for the full architecture and roadmap.
+**Skeleton Key MCP** — an MCP server (TypeScript/Node) that gives Claude full, audited access to a homelab: read logs on any server, execute changes with approval, and manage common services (SSH hosts, Synology, UniFi, Home Assistant, Proxmox, Pi-hole, Docker via Portainer). Credentials come from a **scoped Vaultwarden collection**; a LAN-only admin web UI manages targets. It's a framework — users register their own targets; nothing is hard-coded.
+
+**New here? Read these first:** `docs/ARCHITECTURE.md` (module map + data flows), `docs/STATUS.md` (what's done, what's open, next tasks, working agreements), `docs/SCOPE.md` (product scope + security model). Phase 1 is complete and deployed; `main` is the source of truth.
 
 **This project holds the "keys to the city."** Treat every design choice through a security lens: the whole point is broad infrastructure access, so the guardrails (encryption, 2FA, approval gate, audit log, LAN-only) are load-bearing, not optional polish.
 

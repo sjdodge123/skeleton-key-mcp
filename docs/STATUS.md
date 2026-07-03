@@ -1,0 +1,50 @@
+# Status & Handoff
+
+Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
+
+_Last updated: 2026-07-03._
+
+## TL;DR
+
+Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connected over OAuth against a live instance on the owner's NAS and has driven the conversational onboarding tools end-to-end (network scan, key generation, target registration, validation). Everything below "Done" is merged to `main`; the image auto-publishes to GHCR and is picked up by Watchtower.
+
+## Done (merged to `main`)
+
+- **Core skeleton** — Express app, stateful Streamable-HTTP MCP endpoint, dynamic tool registry (global ⊕ per-target), append-only audit log.
+- **Secrets** — libsodium bootstrap store; scoped-Vaultwarden client over the `bw` CLI with offline cache; secrets kept off argv/logs; `reestablish()` unlock logic.
+- **Generic SSH connector** — read tools + gated execute with a command deny-list; generic HTTP connector.
+- **First-run wizard** — passphrase, vault connect + scoping/durability checks, LAN discovery, TOTP, connect-Claude step; clickable steps, submit spinners.
+- **OAuth 2.1 auth** — discovery, dynamic client registration, PKCE, TOTP-gated consent, rotating refresh tokens, per-client revocation; static bearer retained as fallback.
+- **Conversational onboarding tools** — `get_started`, `network_scan`, `vault_generate_ssh_key`, `vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`, `register_target`, `list_targets`.
+- **Self-guiding onboarding** — server `instructions` on connect + live `tools/list_changed` push on target registration.
+- **LAN discovery fingerprinting** — SSH banner + HTTP content match with confidence levels (replaces port-only guessing).
+- **Packaging & CI** — multi-stage Dockerfile, Portainer compose, CI on every PR, GHCR publish on merge, branch protection.
+
+Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang).
+
+## Open PRs
+
+None. `main` is the source of truth.
+
+## Known gaps / good next tasks
+
+Roughly in priority order — pick up any of these:
+
+1. **Bespoke connectors** (the biggest value). Only generic `ssh`/`http` exist. Discovery already surfaces `synology`, `proxmox`, `unifi`, `home-assistant`, `portainer`, `pihole` and maps them to `http` for now. Implement real adapters (see `docs/SCOPE.md` connector table and `CLAUDE.md` connector notes). Suggested order: **Portainer** (Docker container mgmt — headline ask), **Home Assistant** (REST + long-lived token), **Proxmox** (API token). Each is a `Connector` in `src/connectors/`.
+2. **Admin console** — the web UI is first-run-wizard only. Grow it into an authenticated admin page: audit-log viewer, target CRUD, OAuth client list/revoke (endpoints already exist under `/api/oauth/clients`), token rotation, vault re-unlock. Reuse the wizard's TOTP/verify components.
+3. **Scan accuracy round 2** — fingerprints are content-based now but still imperfect (e.g., SPA shells that don't self-identify show as "likely"/"open"). Consider secondary probes (Portainer `/api/status`, Pi-hole `/admin`) and de-noising the results list.
+4. **Operational polish** — auto-unlock trade-off is documented (`SKELETON_KEY_PASSPHRASE`); consider a web unlock screen improvement and a scan progress indicator (the fingerprinting scan is slower than the old port scan).
+5. **Per-target command policies & dry-run** — the deny-list is global; add per-target allow/deny and optional dry-run for execute tools.
+
+## Environment notes (not in the repo on purpose)
+
+- The repo is **public** and deliberately carries **no real hostnames/IPs** — use generic placeholders (`<NAS_LAN_IP>:8787`, `192.168.x`) in code and docs.
+- The live deployment specifics (actual LAN IP, Vaultwarden internal URL, which hosts exist) live only with the owner. Don't hard-code them.
+- Watchtower on the NAS auto-pulls new `:latest`; a container restart re-locks the vault (unlock via the web UI unless `SKELETON_KEY_PASSPHRASE` is set).
+
+## Working agreements (how this project has been run)
+
+- **Every non-trivial change:** branch → PR → CI green. Merges are the owner's call.
+- **Security-sensitive PRs** (anything touching auth, secrets, the connection path) get an adversarial `/code-review` and are **not** auto-merged — leave them for the owner to review/merge. Docs/mechanical changes may auto-merge after CI.
+- **`main` is protected** (PR + passing CI required, linear history). Don't push to it directly.
+- Verify behavior, don't just typecheck — the review passes have repeatedly caught runtime bugs that compiled fine (transport teardown recursion, scan hang). Add tests that exercise the real path.
