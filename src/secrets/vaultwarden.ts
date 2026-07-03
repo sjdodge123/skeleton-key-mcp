@@ -214,8 +214,8 @@ export class VaultwardenClient {
     collectionName?: string;
   }): Promise<{ name: string }> {
     this.assertUnlocked();
-    // Names double as credentialRefs, and `bw get item <name>` fails on
-    // duplicates — so refuse to create a second item with an existing name.
+    // Names double as credentialRefs, which must resolve to exactly one item —
+    // so refuse to create a second item with an existing name.
     const existing = await this.listItemNames();
     if (existing.includes(input.name)) {
       throw new Error(`A vault item named "${input.name}" already exists — pick a different name.`);
@@ -230,18 +230,30 @@ export class VaultwardenClient {
     return { name: input.name };
   }
 
-  async listItemNames(): Promise<string[]> {
+  private async listItems(): Promise<BwItem[]> {
     this.assertUnlocked();
     const out = await this.run(["list", "items"]);
-    const items = JSON.parse(out) as BwItem[];
-    return items.map((i) => i.name);
+    return JSON.parse(out) as BwItem[];
   }
 
-  /** Fetch one item by name and map it to a connector-friendly Credential. */
+  async listItemNames(): Promise<string[]> {
+    return (await this.listItems()).map((i) => i.name);
+  }
+
+  /**
+   * Fetch one item by exact name and map it to a connector-friendly Credential.
+   * Deliberately NOT `bw get item <name>`: that matches by substring, so a ref
+   * like "PiHole" breaks as soon as an overlapping name ("pihole-ssh") exists.
+   */
   async getCredential(ref: string): Promise<Credential> {
-    this.assertUnlocked();
-    const out = await this.run(["get", "item", ref]);
-    const item = JSON.parse(out) as BwItem;
+    const matches = (await this.listItems()).filter((i) => i.name === ref);
+    if (matches.length === 0) {
+      throw new Error(`No vault item named "${ref}" in the scoped collection.`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`${matches.length} vault items are named "${ref}" — rename them so the credentialRef is unique.`);
+    }
+    const item = matches[0]!;
     const fields: Record<string, string> = {};
     for (const f of item.fields ?? []) fields[f.name] = f.value;
     return {

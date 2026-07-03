@@ -1,5 +1,43 @@
 import { describe, it, expect } from "vitest";
-import { buildLoginItemJson } from "./vaultwarden.js";
+import { buildLoginItemJson, VaultwardenClient } from "./vaultwarden.js";
+
+/** An unlocked client whose `bw list items` returns the given items. */
+function clientWithItems(items: unknown[]): VaultwardenClient {
+  const client = new VaultwardenClient("/unused") as any;
+  client.session = "test-session";
+  client.run = async (args: string[]) => {
+    expect(args).toEqual(["list", "items"]); // getCredential must never `bw get item <name>`
+    return JSON.stringify(items);
+  };
+  return client as VaultwardenClient;
+}
+
+describe("getCredential", () => {
+  it("resolves by exact name even when another item name overlaps", async () => {
+    const client = clientWithItems([
+      { id: "1", name: "PiHole", login: { username: "pihole", password: "pw" } },
+      { id: "2", name: "pihole-ssh", login: { username: "pihole" }, fields: [{ name: "private_key", value: "KEY" }] },
+    ]);
+    const cred = await client.getCredential("PiHole");
+    expect(cred.username).toBe("pihole");
+    expect(cred.password).toBe("pw");
+    const key = await client.getCredential("pihole-ssh");
+    expect(key.secret).toBe("KEY");
+  });
+
+  it("fails clearly when no item has that exact name", async () => {
+    const client = clientWithItems([{ id: "1", name: "pihole-ssh" }]);
+    await expect(client.getCredential("PiHole")).rejects.toThrow(/No vault item named "PiHole"/);
+  });
+
+  it("fails clearly on true duplicate names", async () => {
+    const client = clientWithItems([
+      { id: "1", name: "nas" },
+      { id: "2", name: "nas" },
+    ]);
+    await expect(client.getCredential("nas")).rejects.toThrow(/2 vault items are named "nas"/);
+  });
+});
 
 describe("buildLoginItemJson", () => {
   it("builds a login item scoped to the org collection", () => {
