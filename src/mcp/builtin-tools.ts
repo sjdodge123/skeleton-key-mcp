@@ -148,10 +148,16 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           // Only ssh/http connectors exist today; map bespoke detections to a
           // registerable fallback so register_target actually accepts them.
           const registerType = getConnector(s.connectorType) ? s.connectorType : s.port === 22 ? "ssh" : "http";
-          const note = registerType === s.connectorType ? "" : ` — register as '${registerType}' (no bespoke ${s.connectorType} connector yet)`;
-          return `- ${s.host}:${s.port}  →  ${s.label}  [register_target type: ${registerType}]${note}`;
+          const note = registerType === s.connectorType ? "" : ` (no bespoke ${s.connectorType} connector yet)`;
+          // Flag lower-confidence guesses so they're taken with a grain of salt.
+          const conf = s.confidence === "confirmed" ? "" : s.confidence === "likely" ? "  (likely — verify)" : "  (open port, unidentified)";
+          return `- ${s.host}:${s.port}  →  ${s.label}${conf}  [register_target type: ${registerType}]${note}`;
         });
-        return ok(`Discovered ${services.length} service(s):\n${lines.join("\n")}\n\nRegister any with register_target using the shown type.`);
+        const confirmed = services.filter((s) => s.confidence === "confirmed").length;
+        return ok(
+          `Discovered ${services.length} service(s) (${confirmed} confirmed by fingerprint):\n${lines.join("\n")}\n\n` +
+            "Register any with register_target using the shown type.",
+        );
       },
     },
     {
