@@ -207,12 +207,14 @@ const views = {
   7: async ()=>{
     const a = await api("/store/autounlock/status",{});
     return card("Boot auto-unlock (optional)",
-      '<p class="muted">By default, every container restart <b>re-locks</b> the vault until you type your passphrase here — a deliberate kill-switch. Enabling auto-unlock trades that away for convenience: Skeleton Key generates a <b>random unlock key</b> (never your passphrase) and stores it in a file at <code>'+a.keyFile+'</code>, which must be a <b>host-mounted directory</b> (see the volumes example in docker-compose.yml). Restarts then unlock on their own.</p>'+
+      '<p class="muted">By default, every container restart <b>re-locks</b> the vault until you type your passphrase here — a deliberate kill-switch. Enabling auto-unlock trades that away for convenience: Skeleton Key generates a <b>random unlock key</b> (never your passphrase) and stores it in a file at <code>'+a.keyFile+'</code>, which must be a <b>host-mounted directory</b>. Restarts then unlock on their own.</p>'+
+      autoUnlockPrepHtml(a.keyFile)+
       (a.enabled? '<p class="muted">✓ Currently <b>enabled</b>.</p>':'')+
       '<div class="row">'+
       btn(a.enabled?"Re-enroll key":"Enable auto-unlock", async()=>{ await api("/store/autounlock/enable",{}); go(8); })+
       btn(a.enabled?"Continue":"Skip — stay locked on restart", ()=>go(8),"ghost")+
-      '</div>');
+      '</div>'+
+      '<p class="muted">You can enable or disable this any time later from this page (it will ask for your authenticator code once 2FA is active).</p>');
   },
   8: async ()=>{
     const url = location.protocol+"//"+location.host+"/mcp";
@@ -263,7 +265,8 @@ async function adminCard(){
   const done = (msg)=>{ S.au=null; S.auTotp=null; render(); setTimeout(()=>err(msg),0); };
   return card("Boot auto-unlock",
     '<p class="muted">'+status+'</p>'+
-    '<p class="muted">Enabling stores a <b>random unlock key</b> — never your passphrase — in a host-mounted file ('+a.keyFile+'), so container restarts unlock automatically. Requires the compose file to mount a writable host directory there; see docker-compose.yml.</p>'+
+    '<p class="muted">Enabling stores a <b>random unlock key</b> — never your passphrase — in a host-mounted file ('+a.keyFile+'), so container restarts unlock automatically.</p>'+
+    autoUnlockPrepHtml(a.keyFile)+
     '<div class="row">'+
     (a.enabled
       ? btn("Disable auto-unlock", async()=>{ await api("/store/autounlock/disable",{totp:S.auTotp}); done("Auto-unlock disabled — restarts now require your passphrase."); })
@@ -273,6 +276,20 @@ async function adminCard(){
 }
 
 function card(title, inner){ return '<div class="card"><h2>'+title+'</h2>'+inner+'</div>'; }
+/** One-time host prep for boot auto-unlock, shown wherever it can be enabled.
+ *  keyFile is the container-side path; the dir above it is what gets mounted. */
+function autoUnlockPrepHtml(keyFile){
+  const mountDir = keyFile.slice(0, keyFile.lastIndexOf("/")) || "/run/secrets/skeleton-key";
+  return '<details><summary class="muted">One-time host setup (required before enabling)</summary>'+
+    '<p class="muted">On the Docker host, create a small directory for the key — <b>outside</b> the /data volume, owned by the container user (uid 1000, not root), private:</p>'+
+    '<pre>mkdir -p /volume1/docker/secrets/skeleton-key\\n'+
+    'chown 1000:1000 /volume1/docker/secrets/skeleton-key\\n'+
+    'chmod 700 /volume1/docker/secrets/skeleton-key</pre>'+
+    '<p class="muted">Then — <b>not a shell command</b> — add this line under the <code>volumes:</code> section of your compose file / Portainer stack editor and redeploy the stack:</p>'+
+    '<pre>    volumes:\\n      - skeleton-key-data:/data\\n      - /volume1/docker/secrets/skeleton-key:'+mountDir+'   # &lt;- add this</pre>'+
+    '<p class="muted">Adjust <code>/volume1/docker/secrets/skeleton-key</code> to wherever you keep host secrets. If the mount is missing, enabling fails with a clear error — nothing is half-configured.</p>'+
+    '</details>';
+}
 function field(id,label,type,ph){ return '<label>'+label+'</label><input id="'+id+'" class="form-control" type="'+(type||"text")+'" placeholder="'+(ph||"")+'"/>'; }
 function pwField(id,label,ph){ return '<label>'+label+'</label><div class="pwwrap"><input id="'+id+'" class="form-control" type="password" placeholder="'+(ph||"")+'"/><button type="button" class="btn btn-outline btn-sm btn-reveal" onclick="togglePw(\\''+id+'\\',this)">Show</button></div>'; }
 window.togglePw=(id,b)=>{ const i=el(id); if(!i)return; const show=i.type==="password"; i.type=show?"text":"password"; b.textContent=show?"Hide":"Show"; };
