@@ -53,7 +53,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           return ok(
             "No targets are registered yet — nothing to manage until you add some.\n\n" +
               "Recommended onboarding (offer to do this with the user):\n" +
-              "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services.\n" +
+              "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services. If it finds the router/gateway (e.g. UniFi), start there — its API names every other device on the network, so the rest of the scan stops being anonymous IPs.\n" +
               "2. Get a credential for the host, WITHOUT asking for secrets in chat:\n" +
               "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status.\n" +
               "   • SSH host you already have access to? Call vault_generate_ssh_key, then either install the returned key via that host's run_command (if you already have a working credential) or give the user the one-liner to install it themselves.\n" +
@@ -199,8 +199,16 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           return `- ${s.host}:${s.port}  →  ${s.label}${conf}  [register_target type: ${registerType}]${note}`;
         });
         const confirmed = services.filter((s) => s.confidence === "confirmed").length;
+        // The gateway is the network's own inventory: once registered, its API
+        // names every device on the LAN, turning the scan's anonymous SSH/HTTP
+        // entries into identified hosts. Worth calling out as the first target.
+        const gateway = services.find((s) => s.connectorType === "unifi" && s.confidence === "confirmed");
+        const gatewayTip = gateway
+          ? `💡 Recommended first target: the router/gateway (${gateway.label} at ${gateway.host}). Registering it first lets its API name every device on the network, identifying the anonymous entries above. For UniFi: register as http with options {auth: "header", headerName: "X-API-Key", insecureTLS: true} and an API key from the Network app's Integrations panel (plug icon).\n\n`
+          : "";
         return ok(
           `Discovered ${services.length} service(s) (${confirmed} confirmed by fingerprint):\n${lines.join("\n")}\n\n` +
+            gatewayTip +
             "Register any with register_target using the shown type.",
         );
       },
