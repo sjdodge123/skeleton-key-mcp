@@ -44,8 +44,12 @@ services:
     volumes:
       - skeleton-key-data:/data
       # Pair with SKELETON_KEY_PASSPHRASE_FILE above: create the file on the host
-      # as root with `chmod 600` (e.g. /volume1/secrets/skeleton_key_passphrase,
-      # single line, no quotes) and bind-mount it read-only:
+      # (e.g. /volume1/secrets/skeleton_key_passphrase — single line, no quotes)
+      # and make it readable ONLY by the container's runtime user. The image runs
+      # as `node` (uid 1000), NOT root, so a root-owned chmod-600 file is
+      # unreadable inside the container and auto-unlock would fail closed:
+      #   chown 1000 skeleton_key_passphrase && chmod 400 skeleton_key_passphrase
+      # Then bind-mount it read-only:
       # - /volume1/secrets/skeleton_key_passphrase:/run/secrets/skeleton_key_passphrase:ro
     labels:
       # Opt this container into Watchtower auto-updates. When CI publishes a new

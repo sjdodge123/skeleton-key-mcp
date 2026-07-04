@@ -11,6 +11,10 @@ describe("resolveUnlockPassphrase", () => {
   beforeEach(async () => {
     dir = await mkdtemp(path.join(tmpdir(), "sk-passphrase-"));
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Neutralize any ambient values from the developer's/CI shell so each test
+    // controls exactly what is set.
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE_FILE", "");
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE", "");
   });
   afterEach(async () => {
     vi.unstubAllEnvs();
@@ -39,6 +43,23 @@ describe("resolveUnlockPassphrase", () => {
     // Only the final newline goes; inner ones and a second trailing one stay.
     vi.stubEnv("SKELETON_KEY_PASSPHRASE_FILE", await passphraseFile("s3cret\n\n"));
     expect(resolveUnlockPassphrase()).toBe("s3cret\n");
+  });
+
+  it("strips a lone trailing CR and a leading UTF-8 BOM (Windows editor artifacts)", async () => {
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE_FILE", await passphraseFile("s3cret\r"));
+    expect(resolveUnlockPassphrase()).toBe("s3cret");
+
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE_FILE", await passphraseFile("\uFEFFs3cret\r\n"));
+    expect(resolveUnlockPassphrase()).toBe("s3cret");
+  });
+
+  it("treats an empty or newline-only file as a config error: logs and returns undefined", async () => {
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE_FILE", await passphraseFile("\n"));
+    vi.stubEnv("SKELETON_KEY_PASSPHRASE", "inline-secret");
+
+    expect(resolveUnlockPassphrase()).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledOnce();
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain("is empty");
   });
 
   it("preserves meaningful leading/trailing spaces (no full trim)", async () => {
