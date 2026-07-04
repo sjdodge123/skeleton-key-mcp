@@ -228,6 +228,62 @@ describe("auth selection", () => {
   });
 });
 
+describe("set_gateway_feature (surgical toggle)", () => {
+  function mock(settings: unknown[], putKey: string, putId: string, putReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
+    return mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u, i) => u.includes("/rest/setting") && (i?.method ?? "GET") === "GET", reply: { json: { data: settings } } },
+      { match: (u, i) => u.includes(`/rest/setting/${putKey}/${putId}`) && i?.method === "PUT", reply: putReply },
+    ]);
+  }
+
+  it("disables DPI by flipping the top-level enabled field", async () => {
+    const calls = mock([{ key: "dpi", _id: "d1", enabled: true, fingerprintingEnabled: false }], "dpi", "d1");
+    const res = await tool("set_gateway_feature").run({ feature: "dpi", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("DPI / Traffic Identification set to DISABLED");
+    expect(res.text).toContain("was 'true'");
+    const body = JSON.parse(calls.find((c) => c.init.method === "PUT")!.init.body);
+    expect(body.enabled).toBe(false);
+    expect(body.fingerprintingEnabled).toBe(false); // untouched
+  });
+
+  it("toggles the nested GeoIP ip_filtering.enabled without disturbing siblings", async () => {
+    const usgGeo = { key: "usg_geo", _id: "g1", ip_filtering: { action: "block", countries: "CN,RU", enabled: true, traffic_direction: "both" } };
+    const calls = mock([usgGeo], "usg_geo", "g1");
+    const res = await tool("set_gateway_feature").run({ feature: "geoip", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(calls.find((c) => c.init.method === "PUT")!.init.body);
+    expect(body.ip_filtering.enabled).toBe(false);
+    expect(body.ip_filtering.countries).toBe("CN,RU"); // siblings preserved
+  });
+
+  it("disables all hardware-offload fields at once", async () => {
+    const usg = { key: "usg", _id: "u1", offload_sch: true, offload_accounting: true, offload_l2_blocking: true, upnp_enabled: false };
+    const calls = mock([usg], "usg", "u1");
+    await tool("set_gateway_feature").run({ feature: "offload", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    const body = JSON.parse(calls.find((c) => c.init.method === "PUT")!.init.body);
+    expect(body.offload_sch).toBe(false);
+    expect(body.offload_accounting).toBe(false);
+    expect(body.offload_l2_blocking).toBe(false);
+    expect(body.upnp_enabled).toBe(false); // untouched
+  });
+
+  it("errors when the setting group for the feature is absent", async () => {
+    mock([{ key: "dpi", _id: "d1", enabled: true }], "usg_geo", "g1");
+    const res = await tool("set_gateway_feature").run({ feature: "geoip", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no 'usg_geo' setting group");
+  });
+
+  it("surfaces a meta.rc='error' envelope on the PUT as a failure", async () => {
+    mock([{ key: "dpi", _id: "d1", enabled: true }], "dpi", "d1", { status: 200, json: { meta: { rc: "error", msg: "api.err.NoSiteContext" } } });
+    const res = await tool("set_gateway_feature").run({ feature: "dpi", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("api.err.NoSiteContext");
+  });
+});
+
 describe("username/password login", () => {
   it("logs in via UniFi OS, captures the TOKEN cookie + CSRF, and sends them on a mutating call", async () => {
     const netObj = { _id: "n1", name: "Default", ipv6_interface_type: "pd" };
