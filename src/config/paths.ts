@@ -30,16 +30,17 @@ export const paths = {
 } as const;
 
 /**
- * Resolve the bootstrap-store unlock passphrase for optional auto-unlock at boot.
+ * DEPRECATED boot-unlock path: resolve the master passphrase from
+ * `SKELETON_KEY_PASSPHRASE_FILE` (preferred of the two) or
+ * `SKELETON_KEY_PASSPHRASE`. Superseded by web-UI-managed auto-unlock (a random
+ * key file that never contains the passphrase — see BootstrapStore keyslots);
+ * still honored so existing deployments keep booting, with a warning at boot.
  *
- * `SKELETON_KEY_PASSPHRASE_FILE` (the Docker `_FILE` secret convention) is
- * preferred: the compose file then holds only a path, keeping the passphrase
- * itself out of portainer.db and world-readable stack files. Exactly one
- * trailing newline is stripped (editors/`echo` append one) — no full trim, a
- * passphrase may contain meaningful spaces. If the file is set but unreadable,
- * this fails closed to `undefined` (manual web-UI unlock) rather than silently
- * using a possibly stale inline `SKELETON_KEY_PASSPHRASE`; the passphrase value
- * is never logged.
+ * File handling: exactly one trailing newline is stripped (editors/`echo`
+ * append one) plus a leading UTF-8 BOM — no full trim, a passphrase may contain
+ * meaningful spaces. If the file is set but unreadable/empty, this fails closed
+ * to `undefined` (manual web-UI unlock) rather than silently using a possibly
+ * stale inline `SKELETON_KEY_PASSPHRASE`; the passphrase value is never logged.
  */
 export function resolveUnlockPassphrase(): string | undefined {
   const file = process.env.SKELETON_KEY_PASSPHRASE_FILE;
@@ -77,9 +78,15 @@ export const env = {
    *  container; the compose file maps it to the LAN only. */
   bindHost: process.env.SKELETON_KEY_BIND_HOST ?? "0.0.0.0",
   port: Number(process.env.SKELETON_KEY_PORT ?? 8787),
-  /** Passphrase used to unlock the bootstrap store. In v1 it may be supplied at
-   *  container start; later the web UI prompts for it. Resolved lazily so the
-   *  file (if any) is read at boot, not at import. */
+  /** Where the boot auto-unlock key lives (a non-secret *path*; the key itself
+   *  is written there by the web UI when auto-unlock is enabled). Must point
+   *  into a host mount OUTSIDE the data volume — never store the key next to
+   *  the encrypted store it unlocks. */
+  get unlockKeyFile(): string {
+    return process.env.SKELETON_KEY_UNLOCK_KEY_FILE ?? "/run/secrets/skeleton-key/unlock-key";
+  },
+  /** DEPRECATED passphrase-in-environment boot unlock (see resolveUnlockPassphrase).
+   *  Resolved lazily so the file (if any) is read at boot, not at import. */
   get unlockPassphrase(): string | undefined {
     return resolveUnlockPassphrase();
   },

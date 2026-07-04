@@ -1,6 +1,10 @@
+import { existsSync } from "node:fs";
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
+import sodium from "../lib/sodium.js";
 import type { AppState } from "../app.js";
+import { env } from "../config/paths.js";
+import { saveUnlockKey, removeUnlockKey } from "../secrets/unlock-key-file.js";
 import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
@@ -65,24 +69,85 @@ export function buildApiRouter(app: AppState): Router {
     h(async (req, res) => {
       const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body);
       await app.store.unlock(passphrase);
-      // If a Vaultwarden connection was previously saved, re-establish it.
-      const s = app.store.get();
-      if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
-        await app.vault.reestablish({
-          serverUrl: s.bwServerUrl,
-          clientId: s.bwClientId,
-          clientSecret: s.bwClientSecret,
-          masterPassword: s.bwMasterPassword,
-        });
-      }
-      // Backfill the bearer hash now the token is readable (older deployments /
-      // rotations), so the static bearer is verifiable while locked next time.
-      await app.ensureBearerHash();
-      // Sessions that connected while locked saw only the banner-only toolset
-      // (the locked tools/list gate); nudge them to re-list now the full set is
-      // available, so a live MCP client recovers without reconnecting.
-      if (!app.locked) app.emitToolsChanged();
+      // Re-establish the saved vault session, keep the bearer hash current, and
+      // nudge locked sessions to re-list tools — shared with the boot paths.
+      await app.postUnlock();
       res.json({ ok: true, vaultUnlocked: app.vault.unlocked });
+    }),
+  );
+
+  // --- Boot auto-unlock (keyslot + host-mounted key file) ---
+  // Sensitive: post-setup, enabling/disabling requires a fresh TOTP code (like
+  // OAuth revocation). During the wizard the store was just created by the
+  // person at the keyboard and TOTP may not be enrolled yet, so it's open —
+  // consistent with the other pre-setup mutations.
+  const guardAutoUnlock = async (req: Request, res: Response): Promise<boolean> => {
+    if (app.store.locked) {
+      res.status(409).json({ error: "Unlock the store first." });
+      return false;
+    }
+    if (await app.isSetupComplete()) {
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
+      if (!app.verifyTotp(totp)) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return false;
+      }
+    }
+    return true;
+  };
+
+  router.get(
+    "/store/autounlock",
+    h(async (_req, res) => {
+      res.json({
+        enabled: await app.store.autoUnlockEnabled(),
+        keyFile: env.unlockKeyFile,
+        keyFilePresent: existsSync(env.unlockKeyFile),
+      });
+    }),
+  );
+
+  router.post(
+    "/store/autounlock/enable",
+    h(async (req, res) => {
+      if (!(await guardAutoUnlock(req, res))) return;
+      const key = await app.store.enableAutoUnlock();
+      try {
+        await saveUnlockKey(env.unlockKeyFile, key);
+      } catch (err) {
+        // No key file → the slot is useless; roll it back so state stays honest.
+        await app.store.disableAutoUnlock().catch(() => {});
+        res.status(400).json({
+          error:
+            `Could not write the unlock key file (${env.unlockKeyFile}): ` +
+            `${err instanceof Error ? err.message : String(err)}. ` +
+            "Mount a writable host directory there (see docker-compose.yml) or set SKELETON_KEY_UNLOCK_KEY_FILE.",
+        });
+        return;
+      } finally {
+        sodium.memzero(key);
+      }
+      app.audit.record({
+        ts: new Date().toISOString(), tool: "store.autounlock_enable", target: "bootstrap-store",
+        tier: "execute", args: { keyFile: env.unlockKeyFile }, status: "ok",
+        detail: "boot auto-unlock enabled (keyslot + key file)",
+      });
+      res.json({ ok: true, keyFile: env.unlockKeyFile });
+    }),
+  );
+
+  router.post(
+    "/store/autounlock/disable",
+    h(async (req, res) => {
+      if (!(await guardAutoUnlock(req, res))) return;
+      await app.store.disableAutoUnlock();
+      const keyFileRemoved = await removeUnlockKey(env.unlockKeyFile);
+      app.audit.record({
+        ts: new Date().toISOString(), tool: "store.autounlock_disable", target: "bootstrap-store",
+        tier: "execute", args: { keyFile: env.unlockKeyFile, keyFileRemoved }, status: "ok",
+        detail: "boot auto-unlock disabled (keyslot removed)",
+      });
+      res.json({ ok: true, keyFileRemoved });
     }),
   );
 

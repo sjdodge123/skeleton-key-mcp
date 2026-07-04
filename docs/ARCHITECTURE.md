@@ -40,13 +40,13 @@ All mutable state lives under `SKELETON_KEY_DATA_DIR` (`/data` in the image, a D
 ## Module responsibilities
 
 **Entry / state**
-- `src/server.ts` — process entry. Boots, optionally auto-unlocks (`SKELETON_KEY_PASSPHRASE_FILE` / `SKELETON_KEY_PASSPHRASE`), starts an hourly OAuth-token purge, listens, and shuts down cleanly.
+- `src/server.ts` — process entry. Boots, optionally auto-unlocks — preferring the web-UI-managed unlock key file (`SKELETON_KEY_UNLOCK_KEY_FILE`, a random keyslot key; the passphrase never touches disk) over the deprecated `SKELETON_KEY_PASSPHRASE_FILE` / `SKELETON_KEY_PASSPHRASE` env path — starts an hourly OAuth-token purge, listens, and shuts down cleanly.
 - `src/app.ts` — `AppState`: the shared handles (bootstrap store, Vaultwarden client, target registry, audit log, OAuth service). Also `verifyTotp` (single source of truth for admin 2FA), `credentialFor`, `isSetupComplete`, and the `onToolsChanged`/`emitToolsChanged` event used for live tool-list updates.
 - `src/config/paths.ts` — resolves the data dir and all file paths; reads `SKELETON_KEY_*` env.
 - `src/config/public-url.ts` — the public base URL for user-facing links (unlock guidance, credential hand-off). Auto-detects the LAN address on first boot and persists it (`data/public-url`); `AppState.publicUrl()` resolves `SKELETON_KEY_PUBLIC_URL` → persisted value → null. Never derived from a request `Host` header (those links ask for secrets — anti-phishing).
 
 **Secrets**
-- `src/secrets/bootstrap-store.ts` — a libsodium `crypto_secretbox` file holding *only* Skeleton Key's own secrets (bw API key, master password, MCP bearer token, TOTP seed). Key derived from a passphrase via argon2id. Locked at rest; unlocked in memory.
+- `src/secrets/bootstrap-store.ts` — a libsodium `crypto_secretbox` file holding *only* Skeleton Key's own secrets (bw API key, master password, MCP bearer token, TOTP seed). A random data key encrypts the payload and is wrapped per keyslot (v2 `SKMCP2`): always by an argon2id passphrase KEK, optionally by a random boot auto-unlock key kept in a host-mounted file (`src/secrets/unlock-key-file.ts`). Legacy v1 stores migrate on first passphrase unlock. Locked at rest; keys only in memory.
 - `src/secrets/vaultwarden.ts` — wraps the `bw` CLI against the scoped service account. Reads come from the CLI's **local encrypted offline cache** (survives Vaultwarden outages); only `sync` touches the server. `reestablish()` brings the client to unlocked from any `bw` state (only sets the server + logs in when unauthenticated — never re-runs `bw config server` while logged in). `createLoginItem()` writes to the scoped collection via `bw create item`, feeding the payload on **stdin** (never argv). Errors are **sanitized** so a `bw` failure can't leak the payload/session into logs; the session travels via `BW_SESSION` env, not argv.
 - `src/lib/sodium.ts` — loads the **sumo** libsodium build via `createRequire` (standard build lacks argon2; the package's ESM entry is broken). Import sodium from here only.
 
