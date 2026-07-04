@@ -27,6 +27,7 @@ docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
    - review the automatic **scoping & durability** checks,
    - optionally **scan your LAN** to discover services and register them,
    - enroll **TOTP** 2FA,
+   - optionally enable **boot auto-unlock** (see [Boot auto-unlock](#boot-auto-unlock)),
    - copy the **Claude connect command**.
 3. **Connect Claude** (Code or Desktop): `claude mcp add --transport http skeleton-key http://<host>:8787/mcp`. On first use, Claude opens a browser **consent page**; approve it with your authenticator code. Claude now sees tools for each registered service.
 
@@ -52,7 +53,8 @@ All configuration is optional — the defaults work for a standard container dep
 | `SKELETON_KEY_DATA_DIR` | `/data` (image) · `./data` (dev) | Directory for all mutable state: the encrypted bootstrap store, the `bw` offline cache, the audit DB, and `targets.yaml`. Back this up; it's the only stateful part. |
 | `SKELETON_KEY_PORT` | `8787` | Port the HTTP server (web UI + `/mcp`) listens on **inside** the container. |
 | `SKELETON_KEY_BIND_HOST` | `0.0.0.0` | Interface the server binds to inside the container. Leave at `0.0.0.0`; scope exposure with the host-side port mapping (below), not this. |
-| `SKELETON_KEY_PASSPHRASE` | _(unset)_ | Optional. If set, the encrypted store is **unlocked automatically at boot** so the MCP endpoint comes back up without manual intervention after a restart. If unset, you unlock via the web UI after each restart. Prefer a Docker/Portainer **secret** over an inline value — it's your master passphrase. |
+| `SKELETON_KEY_UNLOCK_KEY_FILE` | `/run/secrets/skeleton-key/unlock-key` | Where the **boot auto-unlock key** lives inside the container. This is a non-secret *path* — the key itself is a random value the web UI writes there when you enable auto-unlock (see [Boot auto-unlock](#boot-auto-unlock)). Only set this to override the default location. |
+| `SKELETON_KEY_PASSPHRASE` / `SKELETON_KEY_PASSPHRASE_FILE` | _(unset)_ | **Deprecated.** The old auto-unlock: your master passphrase in the environment (or in a file the `_FILE` variant points at). Still honored, with a warning at boot, so existing deployments keep working — but prefer [Boot auto-unlock](#boot-auto-unlock), which never puts the passphrase on disk at all. |
 | `SKELETON_KEY_DISABLE_EXECUTE` | _(unset)_ | Set to `1` as a kill-switch: all `execute`-tier tools are refused and audited as denied, leaving only read-only tools. Useful while testing or if you want Claude to look but not touch. |
 | `SKELETON_KEY_PUBLIC_URL` | _(unset)_ | The externally-reachable base URL (e.g. `http://192.168.1.10:8787`). Used as the OAuth issuer / discovery origin so it can't be steered by a forged `Host` header. Set this if a reverse proxy sits in front; otherwise the request's own host is used and `X-Forwarded-*` is ignored. |
 
@@ -64,7 +66,8 @@ All configuration is optional — the defaults work for a standard container dep
 | **Networking** | bridge (default) or `network_mode: host` | On the default bridge network the container only sees Docker's internal subnet, so built-in **LAN discovery** can't enumerate your real network — type your subnet (e.g. `192.168.0`) into the scan, or use `network_mode: host` for full discovery. Reaching already-registered targets works either way. |
 | **Volume** | `skeleton-key-data:/data` | Persists everything in `SKELETON_KEY_DATA_DIR` across restarts and image updates. Without it you'd re-run the wizard every restart. Use a named volume or a host bind mount you back up. |
 | **`image` vs `build`** | `image: ghcr.io/sjdodge123/skeleton-key-mcp:latest` | On the NAS, pull the CI-built image. Use `build: .` only when developing from a source checkout. |
-| **`restart`** | `unless-stopped` | Brings Skeleton Key back after a NAS reboot. Pair with `SKELETON_KEY_PASSPHRASE` for hands-off recovery, or unlock via the UI. |
+| **`restart`** | `unless-stopped` | Brings Skeleton Key back after a NAS reboot. Pair with [Boot auto-unlock](#boot-auto-unlock) for hands-off recovery, or unlock via the UI. |
+| **Secrets mount** | `/volume1/docker/secrets/skeleton-key:/run/secrets/skeleton-key` | Only needed for [Boot auto-unlock](#boot-auto-unlock): a small host directory where Skeleton Key stores its generated unlock key. Deliberately separate from `/data` so a backup of the data volume never contains both the encrypted store and its key. |
 | **Watchtower label** | `com.centurylinklabs.watchtower.enable: "true"` | If you run [Watchtower](https://containrrr.dev/watchtower/), this opts the container into auto-updates: when CI publishes a new `:latest`, Watchtower pulls and recreates it on its next poll. The `/data` volume persists, so no re-setup. Force an immediate update with `docker exec watchtower /watchtower --run-once skeleton-key`. |
 
 Minimal Portainer stack:
@@ -80,13 +83,36 @@ services:
     environment:
       SKELETON_KEY_PORT: "8787"
       SKELETON_KEY_BIND_HOST: "0.0.0.0"
-      # SKELETON_KEY_PASSPHRASE: "..."       # optional auto-unlock (prefer a secret)
       # SKELETON_KEY_DISABLE_EXECUTE: "1"    # optional read-only mode
     volumes:
       - skeleton-key-data:/data
+      # Optional, for boot auto-unlock (see README section) — a host dir owned
+      # by uid 1000, chmod 700:
+      # - /volume1/docker/secrets/skeleton-key:/run/secrets/skeleton-key
 volumes:
   skeleton-key-data:
 ```
+
+## Boot auto-unlock
+
+By default, every container restart **re-locks** Skeleton Key: no tools work (and none are even listed) until you open the web UI and enter your master passphrase. That's a deliberate kill-switch — but it also means a NAS reboot at 3am leaves your MCP endpoint locked until you notice.
+
+Auto-unlock trades that kill-switch for hands-off recovery, without ever writing your passphrase anywhere:
+
+1. **Mount a small host directory** for the key (separate from `/data` on purpose — a backup of the data volume must never contain both the encrypted store and its key):
+   ```bash
+   mkdir -p /volume1/docker/secrets/skeleton-key
+   chown 1000:1000 /volume1/docker/secrets/skeleton-key   # the container runs as uid 1000, not root
+   chmod 700 /volume1/docker/secrets/skeleton-key
+   ```
+   and add the volume line from the stack example above.
+2. **Enable it in the web UI** — either the wizard's *Auto-unlock* step on first setup, or any time later from the unlock page (`http://<host>:8787/`): unlock, enter your **authenticator code**, and click *Enable auto-unlock*.
+
+Skeleton Key then generates a **random unlock key**, enrolls it as a second keyslot on the encrypted store, and writes it to the mounted directory. At boot, that key unlocks the store; your passphrase stays exactly where it was — in your head. Disabling (same TOTP-gated page) removes the keyslot and deletes the file; a leaked copy of the old key is useless afterwards.
+
+**Trade-off, stated plainly:** with auto-unlock on, anyone who can restart the container gets an unlocked instance — the restart kill-switch is gone. You're narrowing "who can read the secret" (a `chmod 700` host dir instead of a passphrase in the stack definition and `portainer.db`), not adding a lock. If you want the kill-switch back, disable auto-unlock.
+
+Existing deployments: stores created before auto-unlock migrate to the keyslot format automatically on their next passphrase unlock — nothing manual. If you were using `SKELETON_KEY_PASSPHRASE`, it still works but warns at boot; switch to auto-unlock and delete the env var from your stack.
 
 ## Conversational onboarding
 
@@ -123,7 +149,8 @@ The service account belongs to exactly one Vaultwarden organization/collection. 
 |---|---|---|
 | `ssh` | ✅ read + gated execute | tail_log, journalctl, service_status, disk_usage, grep_logs, run_readonly, run_command, restart_service |
 | `http` | ✅ generic | get (read), request (execute) |
-| synology, proxmox, unifi, home-assistant, portainer, pihole | 🔜 later phases | — |
+| `portainer` | ✅ read + gated execute | list_endpoints, list_containers, container_logs, list_stacks, get_stack_file, start/stop/restart_container, exec_container, update_stack |
+| synology, proxmox, unifi, home-assistant, pihole | 🔜 later phases | — |
 
 Every tool is tagged `read` or `execute`. Execute tools produce a precise confirmation string, are surfaced to Claude's permission prompt, and are written to an append-only audit log. Destructive shell commands (`rm -rf`, `mkfs`, `dd`, …) are refused by policy even when approved.
 
