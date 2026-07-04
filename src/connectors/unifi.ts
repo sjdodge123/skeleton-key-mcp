@@ -285,6 +285,27 @@ class UniFi {
     return summarizeNetworks(await this.getData<UniFiNetwork>("/rest/networkconf"));
   }
 
+  /** Read the site/gateway settings groups (`/rest/setting`) — each object has a
+   *  `key` (e.g. 'dpi', 'usg', 'mgmt'). Used to inspect what's actually enabled
+   *  (DPI/Traffic Identification, UPnP, hardware offload). These objects can
+   *  carry RADIUS/portal secrets, so the whole body is scrubbed before output. */
+  async getSettings(section?: string): Promise<string> {
+    const settings = await this.getData<Record<string, unknown> & { key?: string }>("/rest/setting");
+    const want = section
+      ? settings.filter((s) => (s.key ?? "").toLowerCase().includes(section.toLowerCase()))
+      : settings;
+    if (!want.length) {
+      const keys = settings.map((s) => s.key ?? "?").join(", ");
+      return section ? `No settings section matching '${section}'. Available: ${keys}` : "No settings.";
+    }
+    return want
+      .map((s) => {
+        const { key, _id, site_id, ...rest } = s as Record<string, unknown>;
+        return `[${(key as string) ?? "?"}] ${scrubSecrets(JSON.stringify(rest)).slice(0, 1500)}`;
+      })
+      .join("\n\n");
+  }
+
   /** Surgically set a network's IPv6 mode. Reads the full networkconf object,
    *  flips only the IPv6 fields, and PUTs it back — all server-side. The object
    *  (which embeds VPN private keys) is never returned; the result reports only
@@ -344,6 +365,17 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "read",
       inputSchema: z.object({}),
       run: run((u) => u.listNetworks()),
+    },
+    {
+      name: "get_settings",
+      description:
+        `Read UniFi site/gateway settings on ${target.name} — e.g. DPI/Traffic Identification, UPnP, hardware offload. ` +
+        `Optional 'section' filters by setting key (e.g. 'dpi', 'usg'); omit to list every section. Secret fields (RADIUS/portal/keys) are redacted.`,
+      tier: "read",
+      inputSchema: z.object({
+        section: z.string().optional().describe("Filter by setting key, e.g. 'dpi' or 'usg'. Omit to list all sections."),
+      }),
+      run: run((u, i) => u.getSettings(i.section)),
     },
     {
       name: "set_network_ipv6",

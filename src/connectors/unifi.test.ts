@@ -106,6 +106,46 @@ describe("API-key auth + redaction", () => {
   });
 });
 
+describe("get_settings", () => {
+  const settings = [
+    { key: "dpi", _id: "d1", site_id: "s", enabled: true, fingerprinting_enabled: true },
+    { key: "usg", _id: "u1", site_id: "s", upnp_enabled: false, radius_secret: "SUPERSECRET", x_ssh_password: "pw123" },
+  ];
+  function mock() {
+    return mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u) => u.includes("/rest/setting"), reply: { json: { data: settings } } },
+    ]);
+  }
+
+  it("filters by section and drops noise/ids", async () => {
+    mock();
+    const res = await tool("get_settings").run({ section: "dpi" }, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("[dpi]");
+    expect(res.text).toContain('"enabled":true');
+    expect(res.text).not.toContain("[usg]"); // section filter excludes it
+    expect(res.text).not.toContain("d1"); // _id stripped
+  });
+
+  it("lists all sections and redacts secret fields", async () => {
+    mock();
+    const res = await tool("get_settings").run({}, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.text).toContain("[dpi]");
+    expect(res.text).toContain("[usg]");
+    expect(res.text).toContain('"upnp_enabled":false');
+    expect(res.text).not.toContain("SUPERSECRET"); // radius_secret redacted
+    expect(res.text).not.toContain("pw123"); // x_ssh_password redacted
+  });
+
+  it("reports available sections when the filter matches nothing", async () => {
+    mock();
+    const res = await tool("get_settings").run({ section: "nope" }, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.text).toContain("No settings section matching 'nope'");
+    expect(res.text).toContain("dpi");
+  });
+});
+
 describe("set_network_ipv6 (surgical write)", () => {
   it("flips only the IPv6 fields, preserves the key in the PUT, and keeps it out of the result", async () => {
     const netObj = { _id: "n1", name: "Default", purpose: "corporate", ipv6_interface_type: "pd", ipv6_ra_enabled: true, x_wireguard_private_key: WG_KEY };
