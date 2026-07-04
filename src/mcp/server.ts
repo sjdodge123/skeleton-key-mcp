@@ -18,7 +18,7 @@ const SERVER_INSTRUCTIONS = [
   "Skeleton Key gives you audited access to the user's self-hosted homelab: read logs, run approved commands, and manage services across their machines.",
   "",
   "Getting started — if the user hasn't set up targets yet, offer to onboard them (call `get_started` for live status). The typical flow, all conversational:",
-  "1. `network_scan` (pass their LAN subnet, e.g. '192.168.0', when asked) to map services.",
+  "1. `network_scan` (pass their LAN subnet, e.g. '192.168.0', when asked) to map services. If the scan finds the network's router/gateway (e.g. UniFi), recommend onboarding IT first — its API names every device on the LAN, which identifies the scan's anonymous SSH/HTTP entries and makes the rest of onboarding much easier.",
   "2. Obtain a credential WITHOUT secrets passing through the chat:",
   "   - Password / API token: `request_credential` returns a one-time, TOTP-gated web link the user opens to type the secret straight into the vault; poll `credential_request_status` until it's 'fulfilled'.",
   "   - SSH key: `vault_generate_ssh_key` stores the private key and returns the public key. If you already have a working credential for the host you can install it via that host's `run_command`; otherwise give the user the one-liner to install it themselves.",

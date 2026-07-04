@@ -1,6 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { AppState } from "../app.js";
 import { buildGlobalTools } from "./builtin-tools.js";
+import { scanLan } from "../discovery/scan.js";
+
+vi.mock("../discovery/scan.js", () => ({ scanLan: vi.fn() }));
 
 // buildGlobalTools only touches `app` inside each tool's run() closure, so we can
 // enumerate the declared tools (names/tiers/flags) without a real AppState.
@@ -24,5 +27,28 @@ describe("global tool registry", () => {
   it("only exposes get_started while the vault is locked", () => {
     const lockedTools = tools.filter((t) => t.availableWhenLocked).map((t) => t.name);
     expect(lockedTools).toEqual(["get_started"]);
+  });
+});
+
+describe("network_scan gateway-first recommendation", () => {
+  const scan = byName.get("network_scan")!;
+
+  it("recommends registering a confirmed gateway first (it names the other devices)", async () => {
+    vi.mocked(scanLan).mockResolvedValue([
+      { host: "192.168.0.1", port: 443, connectorType: "unifi", label: "UniFi", confidence: "confirmed" },
+      { host: "192.168.0.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
+    ] as Awaited<ReturnType<typeof scanLan>>);
+    const out = (await scan.run({}, {} as AppState)).text;
+    expect(out).toContain("Recommended first target");
+    expect(out).toContain("192.168.0.1");
+  });
+
+  it("stays quiet when no gateway is confidently detected", async () => {
+    vi.mocked(scanLan).mockResolvedValue([
+      { host: "192.168.0.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
+      { host: "192.168.0.7", port: 8443, connectorType: "unifi", label: "UniFi", confidence: "likely" },
+    ] as Awaited<ReturnType<typeof scanLan>>);
+    const out = (await scan.run({}, {} as AppState)).text;
+    expect(out).not.toContain("Recommended first target");
   });
 });
