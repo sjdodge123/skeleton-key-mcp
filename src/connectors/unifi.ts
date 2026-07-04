@@ -55,12 +55,30 @@ export function apiKeyFrom(cred: Credential): string | undefined {
 /** Field-name fragments that mark a value as secret in a UniFi config object. */
 const SECRET_KEY = /private_key|wireguard|openvpn|passphrase|password|_psk|pre_shared|x_ca|x_secret|radius_secret/i;
 
-/** Redact secret-looking JSON string fields so raw config / error bodies can't
- *  carry VPN key material into a tool result. Exported for testing. */
+/** Best-effort redaction of secret-looking fields in a raw JSON *string* (server
+ *  error bodies we can't reliably parse). Prefer redactSecrets for structured
+ *  data — this regex can be defeated by an escaped quote inside a value, so it's
+ *  only a backstop on already-truncated error text. Exported for testing. */
 export function scrubSecrets(s: string): string {
   return s.replace(/"([A-Za-z0-9_]*?)"(\s*:\s*)"[^"]*"/g, (m, key: string, sep: string) =>
     SECRET_KEY.test(key) ? `"${key}"${sep}"[redacted]"` : m,
   );
+}
+
+/** Deep-copy `value`, replacing any property whose KEY looks secret with
+ *  "[redacted]". Structured redaction (vs regex-on-JSON) so a secret value that
+ *  contains a quote can't truncate the mask and leak its tail. Exported for
+ *  testing. */
+export function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SECRET_KEY.test(k) ? "[redacted]" : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
 }
 
 function humanUptime(seconds?: number): string {
@@ -301,7 +319,7 @@ class UniFi {
     return want
       .map((s) => {
         const { key, _id, site_id, ...rest } = s as Record<string, unknown>;
-        return `[${(key as string) ?? "?"}] ${scrubSecrets(JSON.stringify(rest)).slice(0, 1500)}`;
+        return `[${(key as string) ?? "?"}] ${JSON.stringify(redactSecrets(rest)).slice(0, 1500)}`;
       })
       .join("\n\n");
   }

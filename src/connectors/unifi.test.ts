@@ -138,6 +138,16 @@ describe("get_settings", () => {
     expect(res.text).not.toContain("pw123"); // x_ssh_password redacted
   });
 
+  it("redacts a secret whose value contains a quote (regex-on-JSON would leak the tail)", async () => {
+    mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u) => u.includes("/rest/setting"), reply: { json: { data: [{ key: "usg", x_ssh_password: 'ab"cd"LEAKTAIL' }] } } },
+    ]);
+    const res = await tool("get_settings").run({ section: "usg" }, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.text).toContain('"x_ssh_password":"[redacted]"');
+    expect(res.text).not.toContain("LEAKTAIL"); // structured redaction masks the whole value
+  });
+
   it("reports available sections when the filter matches nothing", async () => {
     mock();
     const res = await tool("get_settings").run({ section: "nope" }, ctx(cred({ fields: { api_key: "KEY123" } })));
