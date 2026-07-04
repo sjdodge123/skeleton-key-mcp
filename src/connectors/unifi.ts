@@ -179,9 +179,14 @@ class UniFi {
       );
       if (res.status === 404) continue; // not this flavor; try the next
       if (!res.ok) throw new Error(`UniFi login failed: HTTP ${res.status}`);
-      const cookies = res.headers.getSetCookie?.() ?? [res.headers.get("set-cookie") ?? ""];
-      const token = cookies.map((c) => /(?:^|,\s*)(TOKEN=[^;]+)/.exec(c)?.[1]).find(Boolean);
-      this.cookie = token ?? cookies.find((c) => c.includes("TOKEN="))?.split(";")[0] ?? null;
+      // Keep ALL session cookies, not just `TOKEN` — UniFi OS uses `TOKEN`, a
+      // legacy controller uses `unifises`, so a TOKEN-only filter would drop the
+      // legacy cookie and leave later calls unauthenticated while we think we're
+      // logged in. Fail loudly if the login set no cookie at all.
+      const setCookies = res.headers.getSetCookie?.() ?? (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")!] : []);
+      const pairs = setCookies.map((c) => c.split(";")[0]?.trim()).filter((p): p is string => Boolean(p));
+      if (!pairs.length) throw new Error("UniFi login succeeded but returned no session cookie.");
+      this.cookie = pairs.join("; ");
       this.csrf = res.headers.get("x-csrf-token") ?? res.headers.get("x-updated-csrf-token") ?? null;
       this.prefix = prefix;
       return;
@@ -194,7 +199,10 @@ class UniFi {
   private async ensureReady(): Promise<void> {
     if (this.prefix !== null) return;
     const apiKey = apiKeyFrom(this.cred);
-    if (apiKey && !(this.cred.username && this.cred.password)) {
+    // An API key is authoritative when present — stale username/password fields
+    // left on the same vault item must not silently divert to the weaker login
+    // branch (and authenticate as the wrong principal).
+    if (apiKey) {
       for (const prefix of ["/proxy/network", ""]) {
         const res = await tlsFetch(`${this.base}${prefix}/api/s/${this.site}/self`, { headers: { "X-API-Key": apiKey } }, this.insecure);
         if (res.ok) {
@@ -215,7 +223,7 @@ class UniFi {
   private async authHeaders(mutating: boolean): Promise<Record<string, string>> {
     const apiKey = apiKeyFrom(this.cred);
     const headers: Record<string, string> = { Accept: "application/json" };
-    if (apiKey && !(this.cred.username && this.cred.password)) {
+    if (apiKey) {
       headers["X-API-Key"] = apiKey;
     } else {
       if (this.cookie) headers["Cookie"] = this.cookie;
@@ -249,11 +257,21 @@ class UniFi {
     return { ok: res.ok, status: res.status, json, text };
   }
 
+  /** Throw on an HTTP error OR a UniFi `{ meta: { rc: 'error' } }` envelope — the
+   *  controller returns HTTP 200 with rc='error' on validation/permission/site
+   *  failures, so an HTTP-only check would report a failed write as a success.
+   *  Error text is scrubbed of key material before it can reach an exception. */
+  private ensureOk(res: { ok: boolean; status: number; json?: unknown; text: string }, path: string): void {
+    if (!res.ok) throw new Error(`HTTP ${res.status} on ${path}: ${scrubSecrets(res.text).slice(0, 300)}`);
+    const meta = (res.json as { meta?: { rc?: string; msg?: string } })?.meta;
+    if (meta?.rc && meta.rc !== "ok") {
+      throw new Error(`UniFi API error on ${path}: ${scrubSecrets(meta.msg ?? meta.rc).slice(0, 200)}`);
+    }
+  }
+
   private async getData<T>(path: string): Promise<T[]> {
     const res = await this.api(path);
-    // UniFi wraps list responses as { meta: {rc}, data: [...] }. Scrub any error
-    // body before it can carry key material into an exception message.
-    if (!res.ok) throw new Error(`HTTP ${res.status} on ${path}: ${scrubSecrets(res.text).slice(0, 300)}`);
+    this.ensureOk(res, path);
     return ((res.json as { data?: T[] })?.data ?? []) as T[];
   }
 
@@ -276,11 +294,14 @@ class UniFi {
     const net = nets.find((n) => n._id === networkRef || n.name?.toLowerCase() === networkRef.toLowerCase());
     if (!net) throw new Error(`No UniFi network named or id'd '${networkRef}'. Use list_networks to see options.`);
     const prev = net.ipv6_interface_type ?? "none";
-    const updated: UniFiNetwork = { ...net, ipv6_interface_type: mode };
-    if (mode === "none") updated.ipv6_ra_enabled = false;
-    const res = await this.api(`/rest/networkconf/${net._id}`, { method: "PUT", body: updated });
-    if (!res.ok) throw new Error(`HTTP ${res.status} updating network '${net.name ?? net._id}': ${scrubSecrets(res.text).slice(0, 300)}`);
-    return `IPv6 on UniFi network '${net.name ?? net._id}' set to '${mode}' (was '${prev}'). Restore with mode='${prev}'.`;
+    // Couple RA to the mode: a disable sets ipv6_ra_enabled=false, so a later
+    // enable MUST set it back true — otherwise the mode looks restored but
+    // clients get no router advertisements and still have no working IPv6.
+    const updated: UniFiNetwork = { ...net, ipv6_interface_type: mode, ipv6_ra_enabled: mode !== "none" };
+    const path = `/rest/networkconf/${net._id}`;
+    const res = await this.api(path, { method: "PUT", body: updated });
+    this.ensureOk(res, path);
+    return `IPv6 on UniFi network '${net.name ?? net._id}' set to '${mode}' (RA ${mode !== "none" ? "on" : "off"}, was '${prev}'). Restore with mode='${prev}'.`;
   }
 }
 

@@ -117,7 +117,7 @@ describe("set_network_ipv6 (surgical write)", () => {
     const res = await tool("set_network_ipv6").run({ network: "default", mode: "none" }, ctx(cred({ fields: { api_key: "KEY123" } })));
 
     expect(res.isError).toBeFalsy();
-    expect(res.text).toBe("IPv6 on UniFi network 'Default' set to 'none' (was 'pd'). Restore with mode='pd'.");
+    expect(res.text).toBe("IPv6 on UniFi network 'Default' set to 'none' (RA off, was 'pd'). Restore with mode='pd'.");
     expect(res.text).not.toContain(WG_KEY);
 
     const put = calls.find((c) => c.init.method === "PUT")!;
@@ -136,6 +136,45 @@ describe("set_network_ipv6 (surgical write)", () => {
     const res = await tool("set_network_ipv6").run({ network: "Guest", mode: "none" }, ctx(cred({ fields: { api_key: "KEY123" } })));
     expect(res.isError).toBe(true);
     expect(res.text).toContain("No UniFi network");
+  });
+
+  it("re-enables RA when the mode is not 'none' (so a restore actually advertises IPv6)", async () => {
+    const netObj = { _id: "n1", name: "Default", ipv6_interface_type: "none", ipv6_ra_enabled: false };
+    const calls = mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u, i) => u.includes("/rest/networkconf") && (i?.method ?? "GET") === "GET", reply: { json: { data: [netObj] } } },
+      { match: (u, i) => u.includes("/rest/networkconf/n1") && i?.method === "PUT", reply: { json: { meta: { rc: "ok" }, data: [netObj] } } },
+    ]);
+    const res = await tool("set_network_ipv6").run({ network: "Default", mode: "pd" }, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(calls.find((c) => c.init.method === "PUT")!.init.body);
+    expect(body.ipv6_interface_type).toBe("pd");
+    expect(body.ipv6_ra_enabled).toBe(true);
+  });
+
+  it("reports a UniFi envelope error (HTTP 200 + meta.rc='error') as a failure, not a success", async () => {
+    const netObj = { _id: "n1", name: "Default", ipv6_interface_type: "pd" };
+    mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u, i) => u.includes("/rest/networkconf") && (i?.method ?? "GET") === "GET", reply: { json: { data: [netObj] } } },
+      { match: (u, i) => u.includes("/rest/networkconf/n1") && i?.method === "PUT", reply: { status: 200, json: { meta: { rc: "error", msg: "api.err.NoPermission" } } } },
+    ]);
+    const res = await tool("set_network_ipv6").run({ network: "Default", mode: "none" }, ctx(cred({ fields: { api_key: "KEY123" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("api.err.NoPermission");
+  });
+});
+
+describe("auth selection", () => {
+  it("prefers the API key even when stale username/password are also on the item", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u) => u.includes("/rest/networkconf"), reply: { json: { data: [{ _id: "n1", name: "Default" }] } } },
+    ]);
+    const res = await tool("list_networks").run({}, ctx(cred({ fields: { api_key: "KEY123" }, username: "stale", password: "old" })));
+    expect(res.isError).toBeFalsy();
+    expect(calls.every((c) => c.init.headers["X-API-Key"] === "KEY123")).toBe(true);
+    expect(calls.some((c) => /\/api\/(auth\/)?login/.test(c.url))).toBe(false); // never logged in
   });
 });
 
@@ -158,5 +197,24 @@ describe("username/password login", () => {
     expect(put.init.headers["X-CSRF-Token"]).toBe("csrf-xyz"); // CSRF only on the mutating call
     // Data calls go through the UniFi OS prefix learned at login.
     expect(put.url).toContain("/proxy/network/api/s/default/");
+  });
+
+  it("falls back to the legacy controller and keeps its non-TOKEN session cookie", async () => {
+    const netObj = { _id: "n1", name: "Default", ipv6_interface_type: "pd" };
+    const calls = mockFetch([
+      { match: (u) => u.endsWith("/api/auth/login"), reply: { status: 404 } }, // not UniFi OS
+      {
+        match: (u, i) => u.endsWith("/api/login") && i?.method === "POST",
+        reply: { json: { meta: { rc: "ok" } }, headers: { "set-cookie": ["unifises=sess123; Path=/; HttpOnly", "csrf_token=ct9; Path=/"] } },
+      },
+      { match: (u, i) => u.includes("/rest/networkconf") && (i?.method ?? "GET") === "GET", reply: { json: { data: [netObj] } } },
+      { match: (u, i) => u.includes("/rest/networkconf/n1") && i?.method === "PUT", reply: { json: { meta: { rc: "ok" }, data: [netObj] } } },
+    ]);
+    const res = await tool("set_network_ipv6").run({ network: "Default", mode: "none" }, ctx(cred({ username: "admin", password: "pw" })));
+    expect(res.isError).toBeFalsy();
+    const put = calls.find((c) => c.init.method === "PUT")!;
+    expect(put.init.headers["Cookie"]).toContain("unifises=sess123"); // legacy cookie preserved
+    expect(put.url).toContain("/api/s/default/"); // legacy prefix (no /proxy/network)
+    expect(put.url).not.toContain("/proxy/network");
   });
 });
