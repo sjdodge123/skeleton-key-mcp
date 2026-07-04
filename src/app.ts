@@ -72,6 +72,29 @@ export class AppState {
     }
   }
 
+  /**
+   * Common tail of every store-unlock path (boot key file, deprecated boot
+   * passphrase, manual web-UI unlock): re-establish the saved Vaultwarden
+   * session, refresh the offline cache best-effort, keep the bearer hash
+   * current, and nudge live MCP sessions to re-list tools now the full set is
+   * available.
+   */
+  async postUnlock(): Promise<void> {
+    const s = this.store.get();
+    if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
+      await this.vault.reestablish({
+        serverUrl: s.bwServerUrl,
+        clientId: s.bwClientId,
+        clientSecret: s.bwClientSecret,
+        masterPassword: s.bwMasterPassword,
+      });
+      // Best-effort sync; safe to fail if Vaultwarden is unreachable (offline cache).
+      await this.vault.sync().catch(() => {});
+    }
+    await this.ensureBearerHash();
+    if (!this.locked) this.emitToolsChanged();
+  }
+
   /** Persisted, auto-detected public base URL (set at boot; see server.ts).
    *  Overridden by SKELETON_KEY_PUBLIC_URL. */
   private learnedPublicUrl: string | null = null;

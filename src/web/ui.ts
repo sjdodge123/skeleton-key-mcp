@@ -85,7 +85,7 @@ export const WIZARD_HTML = /* html */ `<!doctype html>
 </main>
 <script>
 const S = { step:0, max:0, discovered:[], bearer:null };
-const STEP_NAMES = ["Passphrase","Welcome","Vaultwarden","Connect","Verify","Discover","2FA","Claude","Done"];
+const STEP_NAMES = ["Passphrase","Welcome","Vaultwarden","Connect","Verify","Discover","2FA","Auto-unlock","Claude","Done"];
 const el = (id)=>document.getElementById(id);
 const err = (m)=>{ el("err").textContent = m || ""; };
 async function api(path, body){
@@ -113,9 +113,12 @@ const views = {
     if(st.storeExists && st.storeLocked){
       return card("Unlock", '<p class="muted">A configuration already exists. Enter your master passphrase to unlock it.</p>'+
         pwField("passphrase","Master passphrase")+
-        btn("Unlock", async()=>{ await api("/store/unlock",{passphrase:val("passphrase")}); go(1); }));
+        btn("Unlock", async()=>{ await api("/store/unlock",{passphrase:val("passphrase")}); if(st.setupComplete){ render(); } else { go(1); } }));
     }
-    if(st.storeExists && !st.storeLocked){ go(1); return ""; }
+    if(st.storeExists && !st.storeLocked){
+      if(st.setupComplete) return adminCard();
+      go(1); return "";
+    }
     return card("Choose a master passphrase",
       '<p class="muted">This passphrase encrypts Skeleton Key\\'s own secrets at rest and is your admin login. Minimum 8 characters. There is no recovery — store it safely. Use <b>Show</b> to reveal what you typed before confirming.</p>'+
       pwField("passphrase","Master passphrase")+
@@ -202,6 +205,16 @@ const views = {
       }));
   },
   7: async ()=>{
+    const a = await api("/store/autounlock");
+    return card("Boot auto-unlock (optional)",
+      '<p class="muted">By default, every container restart <b>re-locks</b> the vault until you type your passphrase here — a deliberate kill-switch. Enabling auto-unlock trades that away for convenience: Skeleton Key generates a <b>random unlock key</b> (never your passphrase) and stores it in a file at <code>'+a.keyFile+'</code>, which must be a <b>host-mounted directory</b> (see the volumes example in docker-compose.yml). Restarts then unlock on their own.</p>'+
+      (a.enabled? '<p class="muted">✓ Currently <b>enabled</b>.</p>':'')+
+      '<div class="row">'+
+      btn(a.enabled?"Re-enroll key":"Enable auto-unlock", async()=>{ await api("/store/autounlock/enable",{}); go(8); })+
+      btn(a.enabled?"Continue":"Skip — stay locked on restart", ()=>go(8),"ghost")+
+      '</div>');
+  },
+  8: async ()=>{
     const url = location.protocol+"//"+location.host+"/mcp";
     // Ensure a bearer token exists so setup can complete (used as a fallback path).
     const t = (await api("/setup/token",{})).token;
@@ -216,9 +229,9 @@ const views = {
       '<details><summary class="muted">Advanced: static bearer token (fallback)</summary>'+
       '<p class="muted">If your client does not support OAuth, use a bearer header instead:</p>'+
       '<pre>Authorization: Bearer '+t.replace(/</g,"&lt;")+'</pre></details>'+
-      btn("Finish setup", async()=>{ await api("/setup/complete",{}); go(8); }));
+      btn("Finish setup", async()=>{ await api("/setup/complete",{}); go(9); }));
   },
-  8: async ()=> card("You're all set 🗝️",
+  9: async ()=> card("You're all set 🗝️",
     '<p>The MCP endpoint is now live at <code>/mcp</code>. From here you can finish onboarding <b>just by talking to Claude</b> — no more forms.</p>'+
     '<p class="muted">Try asking Claude to:</p>'+
     '<ul>'+
@@ -226,8 +239,29 @@ const views = {
     '<li>“<b>Generate an SSH key</b> for that NAS as user <code>skeletonkey</code> and register it” — <code>vault_generate_ssh_key</code> + <code>register_target</code>. It stores the private key in your vault and gives you the public key to install.</li>'+
     '<li>“<b>Validate</b> access to it” — <code>vault_validate_ssh</code>.</li>'+
     '</ul>'+
-    '<p class="muted">Installing each returned public key on the target host is the one manual step — that boundary is deliberate. Restart this container? You\\'ll be asked for your master passphrase to unlock again.</p>'),
+    '<p class="muted">Installing each returned public key on the target host is the one manual step — that boundary is deliberate. Restart this container? Unless you enabled auto-unlock, you\\'ll be asked for your master passphrase to unlock again.</p>'),
 };
+
+/** Post-setup landing: shown when the store is already unlocked. Manages the
+ *  boot auto-unlock keyslot (TOTP-gated, like OAuth revocation). */
+async function adminCard(){
+  const a = await api("/store/autounlock");
+  const status = a.enabled
+    ? "✓ <b>Enabled</b> — a random unlock key in <code>"+a.keyFile+"</code> unlocks the store at boot."+
+      (a.keyFilePresent? "" : ' <span style="color:var(--bad)">⚠ The key file is missing — restarts will need manual unlock. Disable, then re-enable to write a fresh key.</span>')
+    : "<b>Disabled</b> — after a restart, unlock here with your passphrase (the kill-switch default).";
+  return card("Unlocked ✓",
+    '<p class="muted">Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.</p>'+
+    '<h3>Boot auto-unlock</h3>'+
+    '<p class="muted">'+status+'</p>'+
+    '<p class="muted">Enabling stores a <b>random unlock key</b> — never your passphrase — in a host-mounted file ('+a.keyFile+'), so container restarts unlock automatically. Requires the compose file to mount a writable host directory there; see docker-compose.yml. Changing this requires your authenticator code.</p>'+
+    field("au_totp","6-digit authenticator code","text")+
+    '<div class="row">'+
+    (a.enabled
+      ? btn("Disable auto-unlock", async()=>{ await api("/store/autounlock/disable",{totp:val("au_totp")}); render(); })
+      : btn("Enable auto-unlock", async()=>{ await api("/store/autounlock/enable",{totp:val("au_totp")}); render(); }))+
+    '</div>');
+}
 
 function card(title, inner){ return '<div class="card"><h2>'+title+'</h2>'+inner+'</div>'; }
 function field(id,label,type,ph){ return '<label>'+label+'</label><input id="'+id+'" class="form-control" type="'+(type||"text")+'" placeholder="'+(ph||"")+'"/>'; }

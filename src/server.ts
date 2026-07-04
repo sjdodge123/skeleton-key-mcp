@@ -3,6 +3,7 @@ import { AppState } from "./app.js";
 import { buildHttpApp } from "./web/server.js";
 import { env, paths } from "./config/paths.js";
 import { detectLanBaseUrl, savePublicUrl } from "./config/public-url.js";
+import { loadUnlockKey } from "./secrets/unlock-key-file.js";
 
 async function main(): Promise<void> {
   await sodium.ready;
@@ -22,28 +23,49 @@ async function main(): Promise<void> {
     }
   }
 
-  // If a store already exists and a passphrase was provided (env var or
-  // SKELETON_KEY_PASSPHRASE_FILE), unlock at boot; otherwise the web UI prompts
-  // for it (the wizard handles first-run).
-  const unlockPassphrase = env.unlockPassphrase;
-  if ((await app.store.exists()) && unlockPassphrase) {
-    try {
-      await app.store.unlock(unlockPassphrase);
-      const s = app.store.get();
-      if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
-        await app.vault.reestablish({
-          serverUrl: s.bwServerUrl,
-          clientId: s.bwClientId,
-          clientSecret: s.bwClientSecret,
-          masterPassword: s.bwMasterPassword,
-        });
-        // Best-effort refresh; safe to fail if Vaultwarden is unreachable (offline cache).
-        await app.vault.sync().catch(() => {});
+  // Boot auto-unlock, in order of preference: the web-UI-managed unlock key
+  // file (a random key — the passphrase never touches disk), then the
+  // DEPRECATED passphrase-in-environment path. If neither applies, the web UI
+  // prompts for the passphrase (the wizard handles first-run).
+  if (await app.store.exists()) {
+    let how: string | null = null;
+    const unlockKey = loadUnlockKey(env.unlockKeyFile);
+    if (unlockKey) {
+      try {
+        await app.store.unlockWithKey(unlockKey);
+        how = "auto-unlock key file";
+      } catch (err) {
+        console.error(
+          "[skeleton-key] Auto-unlock key file rejected:",
+          err instanceof Error ? err.message : err,
+        );
+      } finally {
+        sodium.memzero(unlockKey);
       }
-      await app.ensureBearerHash();
-      console.log("[skeleton-key] Store unlocked at boot.");
-    } catch (err) {
-      console.error("[skeleton-key] Boot unlock failed:", err instanceof Error ? err.message : err);
+    }
+    if (!how) {
+      const passphrase = env.unlockPassphrase;
+      if (passphrase) {
+        console.warn(
+          "[skeleton-key] SKELETON_KEY_PASSPHRASE / SKELETON_KEY_PASSPHRASE_FILE are DEPRECATED: " +
+            "enable boot auto-unlock in the web UI instead — it stores a random unlock key in a " +
+            "host-mounted file, so the master passphrase can be removed from the environment entirely.",
+        );
+        try {
+          await app.store.unlock(passphrase);
+          how = "passphrase env (deprecated)";
+        } catch (err) {
+          console.error("[skeleton-key] Boot unlock failed:", err instanceof Error ? err.message : err);
+        }
+      }
+    }
+    if (how) {
+      try {
+        await app.postUnlock();
+        console.log(`[skeleton-key] Store unlocked at boot (${how}).`);
+      } catch (err) {
+        console.error("[skeleton-key] Post-unlock init failed:", err instanceof Error ? err.message : err);
+      }
     }
   }
 
