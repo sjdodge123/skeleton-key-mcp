@@ -1,5 +1,6 @@
-import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
+import { readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
+import { writeFileAtomic } from "../lib/atomic-file.js";
 import sodium from "../lib/sodium.js";
 import type { BootstrapSecrets } from "./types.js";
 import { paths } from "../config/paths.js";
@@ -232,16 +233,34 @@ export class BootstrapStore {
   async enableAutoUnlock(): Promise<Uint8Array> {
     this.assertUnlocked();
     const unlockKey = sodium.randombytes_buf(sodium.crypto_secretbox_KEYBYTES);
+    // Stage the slot change and roll it back if persist fails, so in-memory
+    // state never disagrees with disk (a later update() would otherwise
+    // persist a slot whose key was never returned to the caller).
+    const previous = this.slots!.unlockKey;
     this.slots!.unlockKey = this.wrapDataKey(unlockKey);
-    await this.persist();
+    try {
+      await this.persist();
+    } catch (err) {
+      if (previous) this.slots!.unlockKey = previous;
+      else delete this.slots!.unlockKey;
+      sodium.memzero(unlockKey);
+      throw err;
+    }
     return unlockKey;
   }
 
   /** Remove the auto-unlock keyslot (the key file alone can no longer unlock). */
   async disableAutoUnlock(): Promise<void> {
     this.assertUnlocked();
+    const previous = this.slots!.unlockKey;
+    if (!previous) return;
     delete this.slots!.unlockKey;
-    await this.persist();
+    try {
+      await this.persist();
+    } catch (err) {
+      this.slots!.unlockKey = previous;
+      throw err;
+    }
   }
 
   /** Whether an auto-unlock slot is enrolled. Readable while locked. */
@@ -287,9 +306,8 @@ export class BootstrapStore {
       ciphertext: sodium.to_base64(sodium.crypto_secretbox_easy(plaintext, nonce, this.dataKey!)),
     };
     await mkdir(path.dirname(this.file), { recursive: true });
-    // Write-then-rename so a crash mid-write can't destroy the only copy.
-    const tmp = `${this.file}.tmp`;
-    await writeFile(tmp, JSON.stringify(out), { mode: 0o600 });
-    await rename(tmp, this.file);
+    // Durable atomic write (fsync + rename) — a crash or power loss can't
+    // destroy or truncate the only copy.
+    await writeFileAtomic(this.file, JSON.stringify(out), 0o600);
   }
 }

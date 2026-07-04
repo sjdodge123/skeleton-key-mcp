@@ -98,6 +98,22 @@ describe("BootstrapStore auto-unlock keyslot", () => {
     await expect(s2.unlockWithKey(key)).rejects.toThrow(/not enrolled/i);
   });
 
+  it("rolls back the staged slot when persist fails, so memory matches disk", async () => {
+    const s = await BootstrapStore.open(file);
+    await s.initialize("correct horse battery");
+    const { chmod } = await import("node:fs/promises");
+    await chmod(dir, 0o500); // read-only dir: the atomic write must fail
+    await expect(s.enableAutoUnlock()).rejects.toThrow();
+    await chmod(dir, 0o700);
+    // The failed enrollment left no trace — a later update() must not
+    // resurrect a slot whose key was never handed to the caller.
+    await s.update({ mcpBearerToken: "after-failure" });
+    expect(await s.autoUnlockEnabled()).toBe(false);
+    const reopened = await BootstrapStore.open(file);
+    await reopened.unlock("correct horse battery");
+    expect(reopened.get().mcpBearerToken).toBe("after-failure");
+  });
+
   it("autoUnlockEnabled() is readable while locked", async () => {
     const s = await BootstrapStore.open(file);
     await s.initialize("correct horse battery");
