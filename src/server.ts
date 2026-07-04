@@ -22,11 +22,13 @@ async function main(): Promise<void> {
     }
   }
 
-  // If a store already exists and a passphrase was provided via env, unlock at
-  // boot; otherwise the web UI prompts for it (the wizard handles first-run).
-  if ((await app.store.exists()) && env.unlockPassphrase) {
+  // If a store already exists and a passphrase was provided (env var or
+  // SKELETON_KEY_PASSPHRASE_FILE), unlock at boot; otherwise the web UI prompts
+  // for it (the wizard handles first-run).
+  const unlockPassphrase = env.unlockPassphrase;
+  if ((await app.store.exists()) && unlockPassphrase) {
     try {
-      await app.store.unlock(env.unlockPassphrase);
+      await app.store.unlock(unlockPassphrase);
       const s = app.store.get();
       if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
         await app.vault.reestablish({

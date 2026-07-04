@@ -31,13 +31,22 @@ services:
       # header. Example:
       # SKELETON_KEY_PUBLIC_URL: "http://192.168.1.10:8787"
       # Optional: unlock the encrypted store automatically at boot. If unset, the
-      # web UI prompts for the passphrase after a restart. Prefer a Docker/
-      # Portainer secret over an inline value.
+      # web UI prompts for the passphrase after a restart. PREFER THE _FILE FORM:
+      # an inline value ends up world-readable in this compose file and in
+      # portainer.db, while a file keeps only a path here (the passphrase lives in
+      # a root-only file on the host — see the volumes example below). Note either
+      # form trades away the restart kill-switch: anyone who can restart the
+      # container gets an unlocked instance.
+      # SKELETON_KEY_PASSPHRASE_FILE: "/run/secrets/skeleton_key_passphrase"
       # SKELETON_KEY_PASSPHRASE: "change-me"
       # Blunt kill-switch for all state-changing tools:
       # SKELETON_KEY_DISABLE_EXECUTE: "1"
     volumes:
       - skeleton-key-data:/data
+      # Pair with SKELETON_KEY_PASSPHRASE_FILE above: create the file on the host
+      # as root with `chmod 600` (e.g. /volume1/secrets/skeleton_key_passphrase,
+      # single line, no quotes) and bind-mount it read-only:
+      # - /volume1/secrets/skeleton_key_passphrase:/run/secrets/skeleton_key_passphrase:ro
     labels:
       # Opt this container into Watchtower auto-updates. When CI publishes a new
       # :latest, Watchtower pulls it and recreates the container on its next poll;

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 
 /**
@@ -28,12 +29,45 @@ export const paths = {
   bearerHash: path.join(DATA_DIR, "mcp-bearer.hash"),
 } as const;
 
+/**
+ * Resolve the bootstrap-store unlock passphrase for optional auto-unlock at boot.
+ *
+ * `SKELETON_KEY_PASSPHRASE_FILE` (the Docker `_FILE` secret convention) is
+ * preferred: the compose file then holds only a path, keeping the passphrase
+ * itself out of portainer.db and world-readable stack files. Exactly one
+ * trailing newline is stripped (editors/`echo` append one) — no full trim, a
+ * passphrase may contain meaningful spaces. If the file is set but unreadable,
+ * this fails closed to `undefined` (manual web-UI unlock) rather than silently
+ * using a possibly stale inline `SKELETON_KEY_PASSPHRASE`; the passphrase value
+ * is never logged.
+ */
+export function resolveUnlockPassphrase(): string | undefined {
+  const file = process.env.SKELETON_KEY_PASSPHRASE_FILE;
+  if (file) {
+    try {
+      return fs.readFileSync(file, "utf8").replace(/\r?\n$/, "");
+    } catch (err) {
+      console.error(
+        `[skeleton-key] Could not read SKELETON_KEY_PASSPHRASE_FILE (${file}): ` +
+          `${err instanceof Error ? err.message : String(err)}. ` +
+          "Skipping boot auto-unlock; unlock via the web UI.",
+      );
+      return undefined;
+    }
+  }
+  // Normalize empty → undefined; a zero-length passphrase can't unlock anything.
+  return process.env.SKELETON_KEY_PASSPHRASE || undefined;
+}
+
 export const env = {
   /** Interface the HTTP server binds to. Defaults to all interfaces inside the
    *  container; the compose file maps it to the LAN only. */
   bindHost: process.env.SKELETON_KEY_BIND_HOST ?? "0.0.0.0",
   port: Number(process.env.SKELETON_KEY_PORT ?? 8787),
   /** Passphrase used to unlock the bootstrap store. In v1 it may be supplied at
-   *  container start; later the web UI prompts for it. */
-  unlockPassphrase: process.env.SKELETON_KEY_PASSPHRASE,
+   *  container start; later the web UI prompts for it. Resolved lazily so the
+   *  file (if any) is read at boot, not at import. */
+  get unlockPassphrase(): string | undefined {
+    return resolveUnlockPassphrase();
+  },
 } as const;
