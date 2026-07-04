@@ -45,7 +45,7 @@ Follow the phases in `docs/SCOPE.md`: core skeleton (server + secrets client + a
 - `npm test` — vitest; `npx vitest run <path>` for a single file, `npm run test:watch` to watch.
 - Docker: `docker compose build && docker compose up`; the stack is importable into Portainer on the NAS.
 
-Config comes from env (see `src/config/paths.ts`): `SKELETON_KEY_DATA_DIR` (runtime state), `SKELETON_KEY_PORT`, `SKELETON_KEY_BIND_HOST`, `SKELETON_KEY_PASSPHRASE` (optional boot unlock), `SKELETON_KEY_DISABLE_EXECUTE=1` (kill-switch for all execute tools), `SKELETON_KEY_PUBLIC_URL` (absolute base URL for user-facing links; **auto-detected** from the LAN on first boot and persisted to `data/public-url`, so the env var is only needed to override — see `src/config/public-url.ts`).
+Config comes from env (see `src/config/paths.ts`): `SKELETON_KEY_DATA_DIR` (runtime state), `SKELETON_KEY_PORT`, `SKELETON_KEY_BIND_HOST`, `SKELETON_KEY_PASSPHRASE` (optional boot unlock), `SKELETON_KEY_PASSPHRASE_FILE` (path to a file holding that passphrase — **preferred over the inline var**: keeps the master passphrase out of the compose file and portainer.db; takes precedence when both are set, and an unreadable file fails closed to manual web-UI unlock), `SKELETON_KEY_DISABLE_EXECUTE=1` (kill-switch for all execute tools), `SKELETON_KEY_PUBLIC_URL` (absolute base URL for user-facing links; **auto-detected** from the LAN on first boot and persisted to `data/public-url`, so the env var is only needed to override — see `src/config/public-url.ts`).
 
 ## Implementation notes
 
