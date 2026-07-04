@@ -58,8 +58,8 @@ async function post(p: string, body: unknown): Promise<{ status: number; json: a
   return { status: r.status, json: await r.json().catch(() => ({})) };
 }
 
-async function get(p: string): Promise<any> {
-  return (await fetch(base + p)).json();
+async function status(totp?: string): Promise<any> {
+  return (await post("/store/autounlock/status", totp ? { totp } : {})).json;
 }
 
 async function initStore(): Promise<void> {
@@ -76,14 +76,14 @@ async function markSetupComplete(withTotpSecret: string): Promise<void> {
 describe("auto-unlock endpoints", () => {
   it("pre-setup (wizard): enable needs no TOTP, writes the key file, and the key boot-unlocks the store", async () => {
     await initStore();
-    expect((await get("/store/autounlock")).enabled).toBe(false);
+    expect((await status()).enabled).toBe(false);
 
     const r = await post("/store/autounlock/enable", {});
     expect(r.status).toBe(200);
     expect(existsSync(keyFile)).toBe(true);
-    const status = await get("/store/autounlock");
-    expect(status.enabled).toBe(true);
-    expect(status.keyFilePresent).toBe(true);
+    const s = await status();
+    expect(s.enabled).toBe(true);
+    expect(s.keyFilePresent).toBe(true);
 
     // Boot path: the persisted key alone unlocks a fresh store handle.
     const { loadUnlockKey } = await import("../secrets/unlock-key-file.js");
@@ -95,24 +95,28 @@ describe("auto-unlock endpoints", () => {
     expect(fresh.locked).toBe(false);
   });
 
-  it("post-setup: enable and disable are TOTP-gated", async () => {
+  it("post-setup: status, enable, and disable are all TOTP-gated", async () => {
     await initStore();
     const secret = authenticator.generateSecret();
     await markSetupComplete(secret);
 
-    expect((await post("/store/autounlock/enable", {})).status).toBe(400); // missing code
+    // Even reading kill-switch state requires a code post-setup.
+    expect((await post("/store/autounlock/status", {})).status).toBe(400); // missing code
+    expect((await post("/store/autounlock/status", { totp: "000000" })).status).toBe(403);
+    expect((await post("/store/autounlock/enable", {})).status).toBe(400);
     expect((await post("/store/autounlock/enable", { totp: "000000" })).status).toBe(403);
 
     const ok = await post("/store/autounlock/enable", { totp: authenticator.generate(secret) });
     expect(ok.status).toBe(200);
     expect(existsSync(keyFile)).toBe(true);
+    expect((await status(authenticator.generate(secret))).enabled).toBe(true);
 
     expect((await post("/store/autounlock/disable", { totp: "000000" })).status).toBe(403);
     const off = await post("/store/autounlock/disable", { totp: authenticator.generate(secret) });
     expect(off.status).toBe(200);
     expect(off.json.keyFileRemoved).toBe(true);
     expect(existsSync(keyFile)).toBe(false);
-    expect((await get("/store/autounlock")).enabled).toBe(false);
+    expect((await status(authenticator.generate(secret))).enabled).toBe(false);
   });
 
   it("rolls the keyslot back when the key file can't be written (no mount)", async () => {
@@ -121,7 +125,7 @@ describe("auto-unlock endpoints", () => {
     const r = await post("/store/autounlock/enable", {});
     expect(r.status).toBe(400);
     expect(String(r.json.error)).toContain("Mount a writable host directory");
-    expect((await get("/store/autounlock")).enabled).toBe(false);
+    expect((await status()).enabled).toBe(false);
   });
 
   it("refuses while the store is locked", async () => {

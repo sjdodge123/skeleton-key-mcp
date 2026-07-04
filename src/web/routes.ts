@@ -96,9 +96,13 @@ export function buildApiRouter(app: AppState): Router {
     return true;
   };
 
-  router.get(
-    "/store/autounlock",
-    h(async (_req, res) => {
+  // Status is gated too (POST so the TOTP travels in the body): whether the
+  // restart kill-switch is disabled — and where the key file lives — is not
+  // something an unauthenticated LAN client should be able to enumerate.
+  router.post(
+    "/store/autounlock/status",
+    h(async (req, res) => {
+      if (!(await guardAutoUnlock(req, res))) return;
       res.json({
         enabled: await app.store.autoUnlockEnabled(),
         keyFile: env.unlockKeyFile,

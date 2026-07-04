@@ -205,7 +205,7 @@ const views = {
       }));
   },
   7: async ()=>{
-    const a = await api("/store/autounlock");
+    const a = await api("/store/autounlock/status",{});
     return card("Boot auto-unlock (optional)",
       '<p class="muted">By default, every container restart <b>re-locks</b> the vault until you type your passphrase here — a deliberate kill-switch. Enabling auto-unlock trades that away for convenience: Skeleton Key generates a <b>random unlock key</b> (never your passphrase) and stores it in a file at <code>'+a.keyFile+'</code>, which must be a <b>host-mounted directory</b> (see the volumes example in docker-compose.yml). Restarts then unlock on their own.</p>'+
       (a.enabled? '<p class="muted">✓ Currently <b>enabled</b>.</p>':'')+
@@ -243,23 +243,32 @@ const views = {
 };
 
 /** Post-setup landing: shown when the store is already unlocked. Manages the
- *  boot auto-unlock keyslot (TOTP-gated, like OAuth revocation). */
+ *  boot auto-unlock keyslot. Everything — even reading whether auto-unlock is
+ *  on and where the key file lives — is behind a fresh TOTP code, so an
+ *  unauthenticated LAN client can't probe the kill-switch state. */
 async function adminCard(){
-  const a = await api("/store/autounlock");
+  if(!S.au){
+    return card("Unlocked ✓",
+      '<p class="muted">Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.</p>'+
+      '<h3>Boot auto-unlock</h3>'+
+      '<p class="muted">Control whether the container unlocks itself after a restart (trading away the restart kill-switch for convenience). Enter your authenticator code to view or change it.</p>'+
+      field("au_totp","6-digit authenticator code","text")+
+      btn("Manage auto-unlock", async()=>{ const t=val("au_totp"); S.au=await api("/store/autounlock/status",{totp:t}); S.auTotp=t; render(); }));
+  }
+  const a = S.au;
   const status = a.enabled
     ? "✓ <b>Enabled</b> — a random unlock key in <code>"+a.keyFile+"</code> unlocks the store at boot."+
       (a.keyFilePresent? "" : ' <span style="color:var(--bad)">⚠ The key file is missing — restarts will need manual unlock. Disable, then re-enable to write a fresh key.</span>')
     : "<b>Disabled</b> — after a restart, unlock here with your passphrase (the kill-switch default).";
-  return card("Unlocked ✓",
-    '<p class="muted">Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.</p>'+
-    '<h3>Boot auto-unlock</h3>'+
+  const done = (msg)=>{ S.au=null; S.auTotp=null; render(); setTimeout(()=>err(msg),0); };
+  return card("Boot auto-unlock",
     '<p class="muted">'+status+'</p>'+
-    '<p class="muted">Enabling stores a <b>random unlock key</b> — never your passphrase — in a host-mounted file ('+a.keyFile+'), so container restarts unlock automatically. Requires the compose file to mount a writable host directory there; see docker-compose.yml. Changing this requires your authenticator code.</p>'+
-    field("au_totp","6-digit authenticator code","text")+
+    '<p class="muted">Enabling stores a <b>random unlock key</b> — never your passphrase — in a host-mounted file ('+a.keyFile+'), so container restarts unlock automatically. Requires the compose file to mount a writable host directory there; see docker-compose.yml.</p>'+
     '<div class="row">'+
     (a.enabled
-      ? btn("Disable auto-unlock", async()=>{ await api("/store/autounlock/disable",{totp:val("au_totp")}); render(); })
-      : btn("Enable auto-unlock", async()=>{ await api("/store/autounlock/enable",{totp:val("au_totp")}); render(); }))+
+      ? btn("Disable auto-unlock", async()=>{ await api("/store/autounlock/disable",{totp:S.auTotp}); done("Auto-unlock disabled — restarts now require your passphrase."); })
+      : btn("Enable auto-unlock", async()=>{ await api("/store/autounlock/enable",{totp:S.auTotp}); done("Auto-unlock enabled."); }))+
+    btn("Back", ()=>{ S.au=null; S.auTotp=null; render(); },"ghost")+
     '</div>');
 }
 

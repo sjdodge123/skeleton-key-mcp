@@ -1,5 +1,6 @@
 import fs from "node:fs";
-import { unlink, writeFile } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
+import { writeFileAtomic } from "../lib/atomic-file.js";
 import sodium from "../lib/sodium.js";
 
 /**
@@ -41,9 +42,10 @@ export function loadUnlockKey(file: string): Uint8Array | null {
   }
 }
 
-/** Persist a freshly enrolled unlock key, owner-read/write only. */
+/** Persist a freshly enrolled unlock key, owner-read/write only. Durable and
+ *  atomic — re-enrollment can never leave a truncated key on disk. */
 export async function saveUnlockKey(file: string, key: Uint8Array): Promise<void> {
-  await writeFile(file, `${sodium.to_base64(key)}\n`, { mode: 0o600 });
+  await writeFileAtomic(file, `${sodium.to_base64(key)}\n`, 0o600);
 }
 
 /** Best-effort removal when auto-unlock is disabled. */
