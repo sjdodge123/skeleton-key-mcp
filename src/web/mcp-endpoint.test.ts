@@ -84,18 +84,26 @@ describe("stateful MCP endpoint", () => {
     const del = await fetch(base, { method: "DELETE", headers: { ...H, "mcp-session-id": sid } });
     expect(del.status).toBeLessThan(500);
     await del.text();
-    // The session is gone: a follow-up call with the old id is rejected.
+    // The session is gone: a follow-up call with the old id gets a 404, the
+    // spec's signal for "re-initialize transparently".
     const r = await fetch(base, { method: "POST", headers: { ...H, "mcp-session-id": sid }, body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }) });
+    expect(r.status).toBe(404);
     const body = parseSse(await r.text());
-    expect(body.error?.code).toBe(-32000);
+    expect(body.error?.code).toBe(-32001);
   });
 
-  it("rejects a request with an unknown session id (JSON-RPC error envelope)", async () => {
-    const r = await fetch(base, { method: "GET", headers: { ...H, "mcp-session-id": "bogus" } });
-    expect(r.status).toBe(400);
-    const body = await r.json();
-    expect(body.jsonrpc).toBe("2.0");
-    expect(body.error.code).toBe(-32000);
+  it("answers an unknown session id with 404 so clients re-initialize (spec) — GET and POST", async () => {
+    // This is what lets a connected client survive a server restart without a
+    // manual reconnect: 404 (not 400) triggers transparent re-initialization.
+    const g = await fetch(base, { method: "GET", headers: { ...H, "mcp-session-id": "bogus" } });
+    expect(g.status).toBe(404);
+    const gBody = await g.json();
+    expect(gBody.jsonrpc).toBe("2.0");
+    expect(gBody.error.code).toBe(-32001);
+
+    const p = await fetch(base, { method: "POST", headers: { ...H, "mcp-session-id": "bogus" }, body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} }) });
+    expect(p.status).toBe(404);
+    expect((await p.json()).error.code).toBe(-32001);
   });
 
   it("rejects a non-initialize POST without a session", async () => {
