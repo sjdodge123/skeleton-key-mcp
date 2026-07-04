@@ -72,7 +72,15 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
         return;
       }
       if (!isInitializeRequest(req.body)) {
-        jsonRpcError(res, 400, -32000, "No valid session; send an initialize request first.");
+        // Spec: an unknown/terminated session ID gets 404, which tells the
+        // client to transparently re-initialize — without it, every server
+        // restart strands connected clients on a dead session until a manual
+        // reconnect. A request with no session at all is a plain 400.
+        if (sid) {
+          jsonRpcError(res, 404, -32001, "Session not found; re-initialize.");
+        } else {
+          jsonRpcError(res, 400, -32000, "No valid session; send an initialize request first.");
+        }
         return;
       }
       if (sessions.size >= MAX_SESSIONS) {
@@ -118,7 +126,10 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
     const sid = req.header("mcp-session-id");
     const session = sid ? sessions.get(sid) : undefined;
     if (!session) {
-      jsonRpcError(res, 400, -32000, "Unknown or missing Mcp-Session-Id.");
+      // 404 for a stale/unknown session (client should re-initialize), 400 when
+      // the header is missing entirely.
+      if (sid) jsonRpcError(res, 404, -32001, "Session not found; re-initialize.");
+      else jsonRpcError(res, 400, -32000, "Missing Mcp-Session-Id.");
       return;
     }
     session.lastSeen = Date.now();
