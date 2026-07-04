@@ -45,7 +45,20 @@ export function resolveUnlockPassphrase(): string | undefined {
   const file = process.env.SKELETON_KEY_PASSPHRASE_FILE;
   if (file) {
     try {
-      return fs.readFileSync(file, "utf8").replace(/\r?\n$/, "");
+      // Strip a UTF-8 BOM (Windows editors add one) and exactly one trailing
+      // newline of any convention (\n, \r\n, or a lone \r) — never a full trim.
+      const passphrase = fs
+        .readFileSync(file, "utf8")
+        .replace(/^\uFEFF/, "")
+        .replace(/\r?\n$|\r$/, "");
+      if (!passphrase) {
+        console.error(
+          `[skeleton-key] SKELETON_KEY_PASSPHRASE_FILE (${file}) is empty. ` +
+            "Skipping boot auto-unlock; unlock via the web UI.",
+        );
+        return undefined;
+      }
+      return passphrase;
     } catch (err) {
       console.error(
         `[skeleton-key] Could not read SKELETON_KEY_PASSPHRASE_FILE (${file}): ` +
