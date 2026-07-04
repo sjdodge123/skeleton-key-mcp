@@ -55,6 +55,19 @@ export function apiKeyFrom(cred: Credential): string | undefined {
 /** Field-name fragments that mark a value as secret in a UniFi config object. */
 const SECRET_KEY = /private_key|wireguard|openvpn|passphrase|password|_psk|pre_shared|x_ca|x_secret|radius_secret/i;
 
+/** Maps a high-level gateway feature to the UniFi setting group + field(s) that
+ *  toggle it. Keeps the execute tool constrained to known, meaningful switches
+ *  rather than arbitrary setting writes — so the approval prompt is specific and
+ *  a bug can't silently rewrite an unrelated setting. */
+const FEATURE_SPECS: Record<string, { key: string; fields?: string[]; path?: [string, string]; label: string }> = {
+  dpi: { key: "dpi", fields: ["enabled"], label: "DPI / Traffic Identification" },
+  upnp: { key: "usg", fields: ["upnp_enabled"], label: "UPnP" },
+  offload: { key: "usg", fields: ["offload_sch", "offload_accounting", "offload_l2_blocking"], label: "hardware offload" },
+  geoip: { key: "usg_geo", path: ["ip_filtering", "enabled"], label: "GeoIP country firewall" },
+};
+
+export const GATEWAY_FEATURES = Object.keys(FEATURE_SPECS) as [string, ...string[]];
+
 /** Best-effort redaction of secret-looking fields in a raw JSON *string* (server
  *  error bodies we can't reliably parse). Prefer redactSecrets for structured
  *  data — this regex can be defeated by an escaped quote inside a value, so it's
@@ -342,6 +355,34 @@ class UniFi {
     this.ensureOk(res, path);
     return `IPv6 on UniFi network '${net.name ?? net._id}' set to '${mode}' (RA ${mode !== "none" ? "on" : "off"}, was '${prev}'). Restore with mode='${prev}'.`;
   }
+
+  /** Enable/disable a known gateway feature (DPI, UPnP, hardware offload, GeoIP)
+   *  via a server-side read-modify-write of its setting group. The group object
+   *  (which can carry RADIUS/portal secrets) is never returned — only the feature
+   *  name and before/after state. */
+  async setGatewayFeature(feature: string, enabled: boolean): Promise<string> {
+    const spec = FEATURE_SPECS[feature];
+    if (!spec) throw new Error(`Unknown gateway feature '${feature}'.`);
+    const groups = await this.getData<Record<string, unknown> & { key?: string; _id?: string }>("/rest/setting");
+    const grp = groups.find((g) => g.key === spec.key);
+    if (!grp?._id) throw new Error(`UniFi has no '${spec.key}' setting group, so ${spec.label} can't be toggled on this gateway.`);
+    const updated: Record<string, unknown> = { ...grp };
+    let prev: unknown;
+    if (spec.path) {
+      const [parentKey, childKey] = spec.path;
+      const parent = { ...((grp[parentKey] as Record<string, unknown>) ?? {}) };
+      prev = parent[childKey];
+      parent[childKey] = enabled;
+      updated[parentKey] = parent;
+    } else {
+      prev = grp[spec.fields![0]!];
+      for (const f of spec.fields!) updated[f] = enabled;
+    }
+    const path = `/rest/setting/${spec.key}/${grp._id}`;
+    const res = await this.api(path, { method: "PUT", body: updated });
+    this.ensureOk(res, path);
+    return `UniFi ${spec.label} set to ${enabled ? "ENABLED" : "DISABLED"} on ${this.target.name} (was ${prev === undefined ? "unset" : `'${String(prev)}'`}).`;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (u: UniFi) => Promise<T>): Promise<T> {
@@ -410,6 +451,23 @@ function buildTools(target: Target): ConnectorTool[] {
         return `Set IPv6 to '${i.mode}' on UniFi network '${i.network}' (${t.name})`;
       },
       run: run((u, i) => u.setNetworkIpv6(i.network, i.mode)),
+    },
+    {
+      name: "set_gateway_feature",
+      description:
+        `Enable or disable a UniFi gateway feature on ${target.name}: 'dpi' (Traffic Identification), 'upnp', ` +
+        `'offload' (hardware offload), or 'geoip' (country firewall). Surgical server-side read-modify-write — ` +
+        `VPN/portal secrets never surface — and it reports the prior state so you can revert.`,
+      tier: "execute",
+      inputSchema: z.object({
+        feature: z.enum(GATEWAY_FEATURES).describe("dpi | upnp | offload | geoip"),
+        enabled: z.boolean().describe("true = enable, false = disable"),
+      }),
+      confirm: (input, t) => {
+        const i = input as { feature: string; enabled: boolean };
+        return `${i.enabled ? "Enable" : "Disable"} UniFi ${i.feature} on ${t.name}`;
+      },
+      run: run((u, i) => u.setGatewayFeature(i.feature, i.enabled)),
     },
   ];
 }
