@@ -292,6 +292,28 @@ export function buildApiRouter(app: AppState): Router {
     }),
   );
 
+  // --- Activity log (audit view) ---
+  // TOTP-gated read of the append-only audit log (arguments are only ever stored
+  // as a SHA-256 digest, never in the clear). POST so the code travels in the
+  // body, like the other admin reads; needs an unlocked store to verify TOTP.
+  router.post(
+    "/audit/recent",
+    h(async (req, res) => {
+      if (app.store.locked) {
+        res.status(409).json({ error: "Unlock the store first." });
+        return;
+      }
+      const { totp, limit } = z
+        .object({ totp: z.string().min(6), limit: z.number().int().positive().max(1000).optional() })
+        .parse(req.body ?? {});
+      if (!app.verifyTotp(totp)) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return;
+      }
+      res.json({ entries: app.audit.recent(limit ?? 200) });
+    }),
+  );
+
   // --- OAuth client management (authorized agents) ---
   router.get(
     "/oauth/clients",

@@ -7,6 +7,7 @@ import { buildMcpServer } from "../mcp/server.js";
 import { buildApiRouter } from "./routes.js";
 import { buildOAuthRouter } from "./oauth-routes.js";
 import { buildCredentialRouter } from "./credential-routes.js";
+import { buildAdminRouter } from "./admin-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
 
@@ -34,6 +35,19 @@ function jsonRpcError(res: express.Response, status: number, code: number, messa
  */
 export function mountMcp(server: express.Express, app: AppState, auth: express.RequestHandler): { stop: () => void } {
   const sessions = new Map<string, McpSession>();
+
+  // Record MCP connection lifecycle into the audit log so the activity view shows
+  // connects/reconnects — and so a post-restart client re-initialize is visible
+  // (a `session_stale` 404 followed by a fresh `session_init` = the client
+  // auto-recovered; silence = it didn't). Best-effort: never let an audit write
+  // break the transport.
+  const logSession = (tool: string, detail: string): void => {
+    try {
+      app.audit.record({ ts: new Date().toISOString(), tool, target: "(mcp)", tier: "session", args: {}, status: "ok", detail });
+    } catch {
+      /* audit is best-effort */
+    }
+  };
 
   // Remove a session and its listener. `closeTransport` is false when called
   // FROM the transport's own onclose (the transport is already closing — calling
@@ -77,6 +91,7 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
         // restart strands connected clients on a dead session until a manual
         // reconnect. A request with no session at all is a plain 400.
         if (sid) {
+          logSession("mcp.session_stale", `stale session ${sid.slice(0, 8)}… → 404 (client asked to re-initialize)`);
           jsonRpcError(res, 404, -32001, "Session not found; re-initialize.");
         } else {
           jsonRpcError(res, 400, -32000, "No valid session; send an initialize request first.");
@@ -101,6 +116,7 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
             );
           });
           sessions.set(id, { transport, unsubscribe, lastSeen: Date.now() });
+          logSession("mcp.session_init", `session ${id.slice(0, 8)}… initialized`);
         },
       });
       // Clean up when the transport closes (explicit DELETE or transport-level
@@ -158,6 +174,9 @@ export function buildHttpApp(app: AppState): express.Express {
 
   // Secure credential hand-off pages (TOTP-gated; secrets go browser→vault).
   server.use(buildCredentialRouter(app));
+
+  // Admin activity view (TOTP-gated audit log — the transparency surface).
+  server.use(buildAdminRouter(app));
 
   // MCP endpoint (stateful — see mountMcp).
   mountMcp(server, app, mcpAuth(app));

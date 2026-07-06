@@ -106,6 +106,14 @@ describe("stateful MCP endpoint", () => {
     expect((await p.json()).error.code).toBe(-32001);
   });
 
+  it("records session_init on initialize and session_stale on an unknown session (activity log)", async () => {
+    await initialize();
+    expect(app.audit.recent().some((e) => e.tool === "mcp.session_init")).toBe(true);
+    // A post-restart client hits an unknown session id → we log the re-init signal.
+    await fetch(base, { method: "POST", headers: { ...H, "mcp-session-id": "bogus" }, body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: {} }) });
+    expect(app.audit.recent().some((e) => e.tool === "mcp.session_stale")).toBe(true);
+  });
+
   it("rejects a non-initialize POST without a session", async () => {
     const r = await fetch(base, { method: "POST", headers: H, body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list", params: {} }) });
     expect(r.status).toBe(400);
