@@ -159,29 +159,33 @@ export function renderServiceData(data: unknown): string {
   return `{${parts.join(",")}${remainder}}`;
 }
 
-/** Canonicalize a request path for security matching: resolve dot-segments +
- *  drop the query/fragment via the URL parser, then percent-decode (bounded, to
- *  defeat single/double encoding) and strip leading slashes. So `/api/%77ebhook`,
- *  `/api/foo/../webhook`, and `/api/webhook%2Fx` all reduce to the same form a
- *  raw-regex guard would miss. */
+/** Canonicalize a request path for security matching. Each round (a) resolves
+ *  dot-segments + drops the query/fragment via the URL parser, then (b) does ONE
+ *  percent-decode. The two INTERLEAVE and repeat to a fixed point: a `..` that is
+ *  only revealed by decoding (e.g. `%252e%252e` → `%2e%2e` → `..`) is collapsed by
+ *  the next normalization pass, so single-, double-, and mixed-encoded traversal
+ *  (`/api/foo/%252e%252e/webhook/x`), `%77ebhook`, and `/api/webhook%2Fx` all
+ *  reduce to the same canonical form a naive guard would miss. Bounded so an
+ *  oscillating input (space ⇄ %20) can't loop forever. */
 function canonicalizePath(path: string): string {
   let p = path;
-  try {
-    // A relative base resolves `.`/`..` and strips query/fragment; pathname stays
-    // percent-encoded (URL doesn't decode it), which the decode loop then handles.
-    p = new URL(p, "http://ha.invalid").pathname;
-  } catch {
-    /* not URL-parseable as-is; match on the raw string */
-  }
-  for (let i = 0; i < 3; i++) {
-    let decoded: string;
+  for (let i = 0; i < 6; i++) {
+    let next = p;
     try {
-      decoded = decodeURIComponent(p);
+      // WHATWG URL treats `%2e`/`%2E` as dot segments, so this resolves both
+      // literal and single-encoded `..`; the decode pass below feeds it the
+      // deeper-encoded forms one layer at a time.
+      next = new URL(next, "http://ha.invalid").pathname;
     } catch {
-      break; // malformed %-escape; use what we have
+      /* not URL-parseable as-is; keep `next` */
     }
-    if (decoded === p) break;
-    p = decoded;
+    try {
+      next = decodeURIComponent(next);
+    } catch {
+      /* malformed %-escape; keep `next` */
+    }
+    if (next === p) break; // fixed point reached
+    p = next;
   }
   return p.replace(/^\/+/, "");
 }

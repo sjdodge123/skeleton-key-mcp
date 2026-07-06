@@ -144,6 +144,9 @@ describe("pure helpers", () => {
     expect(isWebhookPath("/api/%2577ebhook/abc")).toBe(true); // double-encoded %25 -> % -> %77 -> w
     expect(isWebhookPath("/api/webhook%2Fabc")).toBe(true); // %2F = '/'
     expect(isWebhookPath("/api/foo/../webhook/abc")).toBe(true); // dot-segment traversal
+    expect(isWebhookPath("/api/foo/%2e%2e/webhook/abc")).toBe(true); // single-encoded traversal
+    expect(isWebhookPath("/api/foo/%252e%252e/webhook/abc")).toBe(true); // double-encoded traversal
+    expect(isWebhookPath("/api/foo/%252e%252e/%77ebhook/abc")).toBe(true); // mixed double-encoded traversal + encoded 'w'
     // Genuine reads and near-misses stay allowed.
     expect(isWebhookPath("/api/config")).toBe(false);
     expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
