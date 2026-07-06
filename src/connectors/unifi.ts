@@ -422,6 +422,20 @@ class UniFi {
     const path = `/rest/setting/${spec.key}/${grp._id}`;
     const res = await this.api(path, { method: "PUT", body: updated });
     this.ensureOk(res, path);
+
+    // Post-write verification — the backstop for the irreducible final-window
+    // race. Re-read and confirm OUR field(s) actually hold the new value; if a
+    // concurrent full-group write landed right after ours and reverted them, we
+    // report that rather than a phantom success. (Only our boolean fields are
+    // checked, so server-side normalization of other fields can't false-positive.)
+    const after = (await this.getData<Record<string, unknown> & { _id?: string }>("/rest/setting")).find((g) => g._id === grp._id);
+    const held = spec.path
+      ? !!after && typeof after[spec.path[0]] === "object" && after[spec.path[0]] !== null && (after[spec.path[0]] as Record<string, unknown>)[spec.path[1]] === enabled
+      : !!after && spec.fields!.every((f) => after[f] === enabled);
+    if (!held) {
+      throw new Error(`UniFi ${spec.label} did not hold after the write (a concurrent settings change may have reverted it); retry and check the UniFi UI.`);
+    }
+
     return `UniFi ${spec.label} set to ${enabled ? "ENABLED" : "DISABLED"} on ${this.target.name} (was ${prev === undefined ? "unset" : `'${String(prev)}'`}).`;
   }
 }
@@ -506,7 +520,10 @@ function buildTools(target: Target): ConnectorTool[] {
       }),
       confirm: (input, t) => {
         const i = input as { feature: string; enabled: boolean };
-        return `${i.enabled ? "Enable" : "Disable"} UniFi ${featureLabel(i.feature)} (${featureFields(i.feature).join(", ")}) on ${t.name}`;
+        return (
+          `${i.enabled ? "Enable" : "Disable"} UniFi ${featureLabel(i.feature)} (${featureFields(i.feature).join(", ")}) on ${t.name}` +
+          ` — rewrites the whole settings group; avoid editing UniFi settings at the same time`
+        );
       },
       run: run((u, i) => u.setGatewayFeature(i.feature, i.enabled)),
     },
