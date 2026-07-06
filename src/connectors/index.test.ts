@@ -8,6 +8,7 @@ describe("registerableType", () => {
     // Home Assistant now has a bespoke connector, so a confirmed :8123 detection
     // registers as it rather than falling back to the generic http connector.
     expect(registerableType("home-assistant", 8123, "confirmed")).toBe("home-assistant");
+    expect(registerableType("proxmox", 8006, "confirmed")).toBe("proxmox");
   });
 
   it("downgrades a port-only guess to the generic connector (no broken portainer target)", () => {
@@ -18,7 +19,7 @@ describe("registerableType", () => {
 
   it("falls back for types with no bespoke connector regardless of confidence", () => {
     expect(registerableType("synology", 5000, "confirmed")).toBe("http");
-    expect(registerableType("proxmox", 22, "confirmed")).toBe("ssh");
+    expect(registerableType("synology", 22, "confirmed")).toBe("ssh"); // port-22 fallback branch
   });
 
   it("treats missing confidence as unconfirmed (falls back)", () => {
@@ -33,5 +34,9 @@ describe("registerableType", () => {
   it("home-assistant is a registered connector, reachable by its no-hyphen alias too", () => {
     expect(getConnector("home-assistant")?.type).toBe("home-assistant");
     expect(getConnector("homeassistant")?.type).toBe("home-assistant");
+  });
+
+  it("proxmox is a registered connector", () => {
+    expect(getConnector("proxmox")?.type).toBe("proxmox");
   });
 });
