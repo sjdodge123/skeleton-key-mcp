@@ -155,6 +155,10 @@ describe("pure helpers", () => {
     expect(isWebhookPath("//api/webhook/abc")).toBe(true); // protocol-relative-looking
     expect(isWebhookPath("/api//webhook/abc")).toBe(true); // doubled internal slash
     expect(isWebhookPath("/%2fapi/webhook/abc")).toBe(true); // encoded leading slash
+    // Backslashes: fetch/HA fold '\' to '/', so they must be treated as separators.
+    expect(isWebhookPath("\\api\\webhook\\abc")).toBe(true);
+    expect(isWebhookPath("/api\\webhook/abc")).toBe(true);
+    expect(isWebhookPath("/api/%5Cwebhook/abc")).toBe(true); // encoded backslash
     // Genuine reads and near-misses stay allowed.
     expect(isWebhookPath("/api/config")).toBe(false);
     expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
