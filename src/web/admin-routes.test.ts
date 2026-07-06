@@ -70,6 +70,12 @@ describe("admin activity view", () => {
       ts: new Date().toISOString(), tool: "unifi.unifi.get_settings", target: "unifi",
       tier: "read", args: { section: "SENTINELARG" }, status: "ok", detail: "read settings",
     });
+    // An execute entry whose detail (confirmation text) embeds an argument value —
+    // stands in for e.g. an SSH command line that could carry a secret.
+    app.audit.record({
+      ts: new Date().toISOString(), tool: "ssh.nas.run_command", target: "nas",
+      tier: "execute", args: {}, status: "ok", detail: "Run `echo HUNTER2SECRET` on nas",
+    });
 
     expect((await post("/audit/recent", {})).status).toBe(400); // missing code
     expect((await post("/audit/recent", { totp: "000000" })).status).toBe(403); // wrong code
@@ -80,7 +86,13 @@ describe("admin activity view", () => {
     const entry = ok.json.entries.find((e: any) => e.tool === "unifi.unifi.get_settings");
     expect(entry).toBeTruthy();
     expect(entry.argsDigest).toMatch(/^[0-9a-f]{32}$/); // hashed, not the raw value
+    expect(entry.detail).toBe("read settings"); // non-execute (system) detail preserved
     expect(JSON.stringify(ok.json.entries)).not.toContain("SENTINELARG"); // args never in the clear
+
+    // Execute-tier detail is redacted — its confirmation text can embed a secret.
+    const exec = ok.json.entries.find((e: any) => e.tool === "ssh.nas.run_command");
+    expect(exec.detail).toBeNull();
+    expect(JSON.stringify(ok.json.entries)).not.toContain("HUNTER2SECRET");
   });
 
   it("refuses while the store is locked", async () => {

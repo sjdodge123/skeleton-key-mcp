@@ -310,7 +310,14 @@ export function buildApiRouter(app: AppState): Router {
         res.status(403).json({ error: "Invalid authenticator code." });
         return;
       }
-      res.json({ entries: app.audit.recent(limit ?? 200) });
+      // `detail` on an EXECUTE entry is the tool's confirmation text, which is
+      // derived from the call arguments and can embed a raw command line (SSH
+      // run_command, Portainer exec) — i.e. potentially a secret. `args` is already
+      // stored only as a hash; redact execute-tier `detail` here too so this reader
+      // can never surface argument-derived text. Non-execute detail is
+      // system-generated (session/store/oauth events) and safe to show.
+      const entries = app.audit.recent(limit ?? 200).map((e) => (e.tier === "execute" ? { ...e, detail: null } : e));
+      res.json({ entries });
     }),
   );
 
