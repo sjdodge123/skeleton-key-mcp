@@ -173,18 +173,21 @@ export function renderServiceData(data: unknown): string {
  *  `\api\webhook\x`, `/api/%5Cwebhook/x`, `/api/foo/%252e%252e/webhook/x`, and
  *  `/api/webhook%2Fx` all reduce to the same `api/webhook/x` form. */
 function canonicalizePath(path: string): string {
-  let p = path;
+  // Strip the query/fragment on the RAW input FIRST — before any decoding. A
+  // malformed escape in the query (e.g. `?x=%zz`) would otherwise make the very
+  // first decodeURIComponent throw and abort, leaving the PATH's `%2e%2e`
+  // undecoded so a traversal slips the guard while HA still resolves it.
+  let p = path.split(/[?#]/)[0] ?? path;
   for (let i = 0; i < 8; i++) {
     let decoded: string;
     try {
       decoded = decodeURIComponent(p);
     } catch {
-      break; // malformed %-escape; leave the residual `%` for the fail-closed check
+      break; // malformed %-escape in the path; residual `%` is caught fail-closed below
     }
     if (decoded === p) break; // fully decoded
     p = decoded;
   }
-  p = p.split(/[?#]/)[0] ?? p; // routing ignores query/fragment
   p = p.replace(/[\t\n\r]/g, ""); // WHATWG URL (what fetch uses) strips tab/newline/CR
   p = p.replace(/\\/g, "/"); // fetch/HA treat a backslash as a path separator
   const out: string[] = [];
@@ -227,6 +230,10 @@ const HA_GET_ALLOW_PREFIXES = [
  *  testing. */
 export function isAllowedReadPath(path: string): boolean {
   const canon = canonicalizePath(path);
+  // Fail closed on a residual percent-escape: we couldn't fully decode (a
+  // malformed or too-deeply-nested escape), so HA could still decode it into a
+  // `..`/`/` that escapes the matched prefix (e.g. `api/states/%2e%2e/webhook`).
+  if (canon.includes("%")) return false;
   if (canon === "api") return true; // GET /api/ → "API running"
   return HA_GET_ALLOW_PREFIXES.some((pre) => canon === pre || canon.startsWith(`${pre}/`));
 }
