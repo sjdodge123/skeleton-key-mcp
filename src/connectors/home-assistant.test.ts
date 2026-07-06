@@ -343,6 +343,30 @@ describe("ha_call_service (POST body encoding)", () => {
     expect(res.isError).toBe(true);
     expect(res.text).toContain("needs a long-lived token");
   });
+
+  it("rejects a non-identifier domain/service before issuing any request (no endpoint traversal)", async () => {
+    for (const args of [
+      { domain: "..", service: "template" }, // would normalize to /api/template
+      { domain: "light", service: "../../template" },
+      { domain: "light", service: "turn_on/extra" },
+      { domain: "light\\x", service: "turn_on" },
+      { domain: "", service: "turn_on" },
+    ]) {
+      const calls = mockFetch([{ match: () => true, reply: { json: [] } }]);
+      const res = await tool("ha_call_service").run(args, ctx(cred({ secret: "TKN" })));
+      expect(res.isError, JSON.stringify(args)).toBe(true);
+      expect(res.text).toContain("must be identifiers");
+      expect(calls.length, JSON.stringify(args)).toBe(0); // never hit the network
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("the ha_call_service schema rejects non-identifier domain/service (MCP path fails before approval)", () => {
+    const schema = tool("ha_call_service").inputSchema;
+    expect(schema.safeParse({ domain: "..", service: "template" }).success).toBe(false);
+    expect(schema.safeParse({ domain: "light", service: "turn_on/x" }).success).toBe(false);
+    expect(schema.safeParse({ domain: "light", service: "turn_on", data: { entity_id: "light.k" } }).success).toBe(true);
+  });
 });
 
 describe("ha_backup", () => {
