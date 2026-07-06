@@ -565,6 +565,29 @@ describe("structured reads fail loudly on truncated/malformed responses", () => 
 });
 
 describe("request bounds", () => {
+  it("hard-caps a single stream chunk larger than the byte limit (no full-chunk buffering)", async () => {
+    const oneBigChunk = new Uint8Array(300_000).fill(0x7a); // 'z' × 300 KB > RAW_GET_MAX_BYTES (256 KB)
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        // A body stream that emits the whole oversized payload in ONE chunk.
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(oneBigChunk);
+            c.close();
+          },
+        }),
+        text: async () => "z".repeat(300_000),
+      })),
+    );
+    const res = await tool("ha_get").run({ path: "/api/config" }, ctx(cred({ secret: "TKN" })));
+    expect(res.text).toContain("(response truncated)");
+    expect(res.text.length).toBeLessThan(30_000); // output is the 20 KB slice + note, not 300 KB
+  });
+
   it("aborts a hung request after the timeout and reports it (no indefinite hang)", async () => {
     vi.useFakeTimers();
     try {
