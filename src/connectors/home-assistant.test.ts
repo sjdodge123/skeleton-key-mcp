@@ -180,6 +180,19 @@ describe("pure helpers", () => {
     expect(isAllowedReadPath("/api/events")).toBe(true); // GET lists event listeners
   });
 
+  it("isAllowedReadPath fails closed on traversal hidden behind a malformed query or residual %", () => {
+    // A malformed query escape must not poison the PATH decode and let a traversal
+    // stay under an allowed prefix (query is stripped before decoding).
+    expect(isAllowedReadPath("/api/states/%2e%2e/webhook/abc?x=%zz")).toBe(false);
+    // A malformed escape in the path itself leaves a residual % → fail closed.
+    expect(isAllowedReadPath("/api/states/%2e%2e/webhook/%zz")).toBe(false);
+    // Plain encoded traversal out of an allowed prefix into webhook.
+    expect(isAllowedReadPath("/api/states/%2e%2e/webhook/abc")).toBe(false);
+    // A legitimate query on an allowed path is fine (query stripped for the check).
+    expect(isAllowedReadPath("/api/history/period/2026-07-06T00:00:00?filter_entity_id=sensor.x")).toBe(true);
+    expect(isAllowedReadPath("/api/config?x=1")).toBe(true);
+  });
+
   it("summarizeLogbook renders when/who/what and caps output", () => {
     const out = summarizeLogbook([
       { when: "2026-07-06T04:00:00", entity_id: "automation.x", message: "triggered" },
