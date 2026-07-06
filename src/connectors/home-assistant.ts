@@ -185,6 +185,7 @@ function canonicalizePath(path: string): string {
     p = decoded;
   }
   p = p.split(/[?#]/)[0] ?? p; // routing ignores query/fragment
+  p = p.replace(/[\t\n\r]/g, ""); // WHATWG URL (what fetch uses) strips tab/newline/CR
   p = p.replace(/\\/g, "/"); // fetch/HA treat a backslash as a path separator
   const out: string[] = [];
   for (const seg of p.split("/")) {
@@ -198,18 +199,36 @@ function canonicalizePath(path: string): string {
   return out.join("/");
 }
 
-/** True if a path is unsafe for the read-only ha_get: it targets an HA webhook
- *  (/api/webhook/<id>) — the one documented GET-with-side-effects surface (can
- *  fire automations) — OR it can't be fully canonicalized. Canonicalizes first so
- *  percent-encoded / dot-segment variants can't slip past, then FAILS CLOSED: a
- *  path that still holds a percent-escape after the decode cap (a >6-layer
- *  encoding like `%2525…77ebhook`, or a malformed escape) is treated as unsafe,
- *  because another decode by HA/a proxy could still form `webhook`, `/`, or a dot
- *  segment. Exported for testing. */
-export function isWebhookPath(path: string): boolean {
+/** Canonical read-path prefixes ha_get permits. An ALLOWLIST (not a webhook
+ *  denylist) is used deliberately: the read tier must never reach a
+ *  GET-with-side-effects endpoint (HA webhooks under /api/webhook fire
+ *  automations), and proving a denylist blocks every encoding/normalization
+ *  variant of `webhook` is a losing game (percent/double/backslash/tab tricks).
+ *  With an allowlist, anything unrecognized — including a webhook however encoded,
+ *  or a path we under-canonicalize — fails CLOSED (refused) instead of open. GET
+ *  to a POST-only route under an allowed prefix is inert (405), so these prefixes
+ *  carry no side effects; /api/webhook is simply absent. */
+const HA_GET_ALLOW_PREFIXES = [
+  "api/config",
+  "api/core",
+  "api/states",
+  "api/history",
+  "api/logbook",
+  "api/error_log",
+  "api/calendars",
+  "api/services",
+  "api/events",
+  "api/camera_proxy",
+  "api/discovery_info",
+];
+
+/** True if `path` canonicalizes to a permitted read endpoint (see
+ *  HA_GET_ALLOW_PREFIXES). Exact `api` is the `/api/` health check. Exported for
+ *  testing. */
+export function isAllowedReadPath(path: string): boolean {
   const canon = canonicalizePath(path);
-  if (canon.includes("%")) return true; // residual encoding we couldn't resolve — deny
-  return /(^|\/)api\/webhook(\/|$)/i.test(canon);
+  if (canon === "api") return true; // GET /api/ → "API running"
+  return HA_GET_ALLOW_PREFIXES.some((pre) => canon === pre || canon.startsWith(`${pre}/`));
 }
 
 /** Zod for a service-data dict: a real object in the JSON schema (so the client
@@ -397,15 +416,18 @@ class HomeAssistant {
     }
   }
 
-  /** Raw GET passthrough for endpoints without a dedicated tool (e.g.
-   *  /api/config, /api/history/period). Read-tier, so it must stay side-effect
-   *  free: HA webhooks (/api/webhook/<id>) can be configured to fire automations
-   *  on GET, which would let this read tool change state — those are refused.
-   *  Actions go through ha_call_service (execute-tier, approval-gated). */
+  /** GET passthrough for read endpoints without a dedicated tool (e.g.
+   *  /api/config, /api/history/period). Read-tier, so it is restricted to an
+   *  ALLOWLIST of known side-effect-free read paths (isAllowedReadPath); anything
+   *  else — notably an /api/webhook endpoint, which can fire automations on GET —
+   *  is refused. Actions go through ha_call_service (execute-tier, approval-gated). */
   async getRaw(path: string): Promise<ToolResult> {
-    if (isWebhookPath(path)) {
+    if (!isAllowedReadPath(path)) {
       return {
-        text: "Refused: this path is an /api/webhook endpoint (can fire automations) or could not be safely canonicalized, so it's not allowed from the read-only ha_get. Use ha_call_service (execute) for actions.",
+        text:
+          `Refused: ha_get is read-only and only permits known side-effect-free HA read paths ` +
+          `(api/config, api/states, api/history, api/logbook, api/calendars, api/services, api/events, api/camera_proxy, api/error_log, …). ` +
+          `'${path}' is not on the allowlist — use a dedicated tool, or ha_call_service (execute) for actions.`,
         isError: true,
       };
     }
@@ -532,9 +554,10 @@ function buildTools(target: Target): ConnectorTool[] {
     {
       name: "ha_get",
       description:
-        `Raw authenticated GET against the Home Assistant REST API on ${target.name} (e.g. /api/config, ` +
-        `/api/history/period, /api/states/<id>). Read-only escape hatch for endpoints without a dedicated tool; ` +
-        `/api/webhook paths are refused (they can fire automations — use ha_call_service for actions).`,
+        `Authenticated GET against the Home Assistant REST API on ${target.name} (e.g. /api/config, ` +
+        `/api/history/period, /api/states/<id>). Read-only escape hatch, restricted to an allowlist of ` +
+        `side-effect-free read endpoints (config, states, history, logbook, calendars, services, events, camera_proxy, error_log); ` +
+        `side-effecting paths like /api/webhook are refused — use ha_call_service for actions.`,
       tier: "read",
       inputSchema: z.object({ path: z.string().describe("API path, e.g. /api/config") }),
       run: run((ha, i) => ha.getRaw(i.path)),
