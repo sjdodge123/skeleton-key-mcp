@@ -345,14 +345,20 @@ async function readBounded(
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value && value.byteLength) {
-        chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-        total += value.byteLength;
-        if (total >= maxBytes) {
-          truncated = true;
-          break;
-        }
+      if (!value || value.byteLength === 0) continue;
+      const remaining = maxBytes - total;
+      // Enforce the cap at the chunk BOUNDARY: a single chunk larger than the
+      // remaining budget must not be buffered in full. Keep only `remaining`
+      // bytes, mark truncated, and stop — so total memory is hard-bounded by
+      // maxBytes regardless of the server's chunk sizes.
+      if (value.byteLength > remaining) {
+        if (remaining > 0) chunks.push(Buffer.from(value.buffer, value.byteOffset, remaining));
+        total += remaining;
+        truncated = true;
+        break;
       }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+      total += value.byteLength;
     }
   } finally {
     try {
