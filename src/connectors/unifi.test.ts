@@ -282,6 +282,52 @@ describe("set_gateway_feature (surgical toggle)", () => {
     expect(res.isError).toBe(true);
     expect(res.text).toContain("api.err.NoSiteContext");
   });
+
+  it("fails closed on GeoIP schema drift (missing ip_filtering) instead of writing", async () => {
+    const calls = mock([{ key: "usg_geo", _id: "g1" }], "usg_geo", "g1"); // no ip_filtering object
+    const res = await tool("set_gateway_feature").run({ feature: "geoip", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("expected shape");
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(false); // never wrote
+  });
+
+  it("fails closed when GeoIP ip_filtering.enabled is not a boolean", async () => {
+    mock([{ key: "usg_geo", _id: "g1", ip_filtering: { enabled: "yes" } }], "usg_geo", "g1");
+    const res = await tool("set_gateway_feature").run({ feature: "geoip", enabled: true }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("expected shape");
+  });
+
+  it("aborts without writing if the setting group changed between the read and the write", async () => {
+    let getN = 0;
+    const v1 = { key: "usg", _id: "u1", upnp_enabled: false, sibling: "A" };
+    const v2 = { key: "usg", _id: "u1", upnp_enabled: false, sibling: "B" }; // a sibling changed concurrently
+    const calls: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (url.includes("/rest/setting") && method === "GET") json = { data: [getN++ === 0 ? v1 : v2] };
+        else if (method === "PUT") json = { meta: { rc: "ok" } };
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    const res = await tool("set_gateway_feature").run({ feature: "upnp", enabled: true }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("changed under us");
+    expect(calls.some((c) => (c.init?.method ?? "GET") === "PUT")).toBe(false); // never wrote
+  });
+
+  it("execute confirmation names the feature label and the exact fields", () => {
+    const c = tool("set_gateway_feature").confirm!;
+    expect(c({ feature: "offload", enabled: false }, target())).toBe(
+      "Disable UniFi hardware offload (usg.offload_sch, usg.offload_accounting, usg.offload_l2_blocking) on unifi",
+    );
+    expect(c({ feature: "geoip", enabled: true }, target())).toBe("Enable UniFi GeoIP country firewall (usg_geo.ip_filtering.enabled) on unifi");
+  });
 });
 
 describe("username/password login", () => {
