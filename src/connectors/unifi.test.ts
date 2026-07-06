@@ -298,6 +298,16 @@ describe("set_gateway_feature (surgical toggle)", () => {
     expect(res.text).toContain("expected shape");
   });
 
+  it("fails closed when a top-level feature field is missing/non-boolean (no fabrication)", async () => {
+    // usg is missing offload_accounting — the offload toggle must refuse, not invent it.
+    const calls = mock([{ key: "usg", _id: "u1", offload_sch: true, offload_l2_blocking: true }], "usg", "u1");
+    const res = await tool("set_gateway_feature").run({ feature: "offload", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("expected shape");
+    expect(res.text).toContain("usg.offload_accounting"); // names the offending field
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(false); // never wrote
+  });
+
   it("aborts without writing if the setting group changed between the read and the write", async () => {
     let getN = 0;
     const v1 = { key: "usg", _id: "u1", upnp_enabled: false, sibling: "A" };

@@ -395,14 +395,25 @@ class UniFi {
       prev = (parent as Record<string, unknown>)[childKey];
       updated[parentKey] = { ...(parent as Record<string, unknown>), [childKey]: enabled };
     } else {
+      // Same fail-closed invariant as the nested path: only flip fields that
+      // already exist as booleans — never fabricate a field the controller/model
+      // didn't expose (partial offload support, version drift).
+      const bad = spec.fields!.filter((f) => typeof grp[f] !== "boolean");
+      if (bad.length) {
+        throw new Error(
+          `UniFi ${spec.label} isn't in the expected shape on this gateway (missing/non-boolean: ${bad.map((f) => `${spec.key}.${f}`).join(", ")}); refusing to write.`,
+        );
+      }
       prev = grp[spec.fields![0]!];
       for (const f of spec.fields!) updated[f] = enabled;
     }
 
-    // Optimistic-concurrency guard: UniFi only supports a full-group PUT, so a
-    // sibling changed between our read and write would be silently rolled back —
-    // and this group can hold sensitive RADIUS/portal/SSH fields. Re-read and
-    // abort if the group drifted since we snapshotted it, rather than clobber.
+    // Best-effort concurrency handling — NOT a guarantee. UniFi's classic API has
+    // no conditional (CAS/ETag) write, only a full-group PUT, so a truly
+    // simultaneous sibling edit cannot be fully prevented. We re-read and abort on
+    // any drift already visible before writing (catching the common case); a
+    // sibling change landing in the final re-read→PUT window is an accepted,
+    // documented residual — the tool is approval-gated and every write is audited.
     const fresh = (await this.getData<Record<string, unknown> & { _id?: string }>("/rest/setting")).find((g) => g._id === grp._id);
     if (!fresh || JSON.stringify(fresh) !== JSON.stringify(grp)) {
       throw new Error(`UniFi '${spec.key}' settings changed under us (concurrent edit); aborted to avoid clobbering other fields — retry.`);
