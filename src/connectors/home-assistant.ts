@@ -225,12 +225,15 @@ const HA_GET_ALLOW_PREFIXES = [
   "api/history",
   "api/logbook",
   "api/error_log",
-  "api/calendars",
   "api/services",
   "api/events",
-  "api/camera_proxy",
   "api/discovery_info",
 ];
+// Deliberately EXCLUDED even though read-only: `api/calendars` (event details =
+// private schedules) and `api/camera_proxy` (actual camera imagery). Those are
+// privacy-sensitive content, not operational diagnostics, and the read tier is
+// un-approved — keep ha_get to low-sensitivity operational state. A future
+// explicit, approval-gated tool can expose them if needed.
 
 /** True if `path` canonicalizes to a permitted read endpoint (see
  *  HA_GET_ALLOW_PREFIXES). Exact `api` is the `/api/` health check. Exported for
@@ -439,9 +442,9 @@ class HomeAssistant {
     if (!isAllowedReadPath(path)) {
       return {
         text:
-          `Refused: ha_get is read-only and only permits known side-effect-free HA read paths ` +
-          `(api/config, api/states, api/history, api/logbook, api/calendars, api/services, api/events, api/camera_proxy, api/error_log, …). ` +
-          `'${path}' is not on the allowlist — use a dedicated tool, or ha_call_service (execute) for actions.`,
+          `Refused: ha_get is read-only and only permits low-sensitivity operational HA read paths ` +
+          `(api/config, api/states, api/history, api/logbook, api/services, api/events, api/error_log, …). ` +
+          `'${path}' is not on the allowlist (private surfaces like api/camera_proxy and api/calendars are excluded) — use a dedicated tool, or ha_call_service (execute) for actions.`,
         isError: true,
       };
     }
@@ -592,8 +595,8 @@ function buildTools(target: Target): ConnectorTool[] {
       description:
         `Authenticated GET against the Home Assistant REST API on ${target.name} (e.g. /api/config, ` +
         `/api/history/period, /api/states/<id>). Read-only escape hatch, restricted to an allowlist of ` +
-        `side-effect-free read endpoints (config, states, history, logbook, calendars, services, events, camera_proxy, error_log); ` +
-        `side-effecting paths like /api/webhook are refused — use ha_call_service for actions.`,
+        `low-sensitivity operational read endpoints (config, states, history, logbook, services, events, error_log); ` +
+        `side-effecting paths (/api/webhook) and private surfaces (/api/camera_proxy, /api/calendars) are refused — use ha_call_service for actions.`,
       tier: "read",
       inputSchema: z.object({ path: z.string().describe("API path, e.g. /api/config") }),
       run: run((ha, i) => ha.getRaw(i.path)),

@@ -141,8 +141,6 @@ describe("pure helpers", () => {
     expect(isAllowedReadPath("/api/states/sun.sun")).toBe(true);
     expect(isAllowedReadPath("/api/history/period/2026-07-06T00:00:00")).toBe(true);
     expect(isAllowedReadPath("/api/logbook/2026-07-06T00:00:00")).toBe(true);
-    expect(isAllowedReadPath("/api/calendars")).toBe(true);
-    expect(isAllowedReadPath("/api/camera_proxy/camera.front")).toBe(true);
     expect(isAllowedReadPath("api/config")).toBe(true); // no leading slash
     expect(isAllowedReadPath("/api/%63onfig")).toBe(true); // %63='c' decodes to /api/config
   });
@@ -172,6 +170,10 @@ describe("pure helpers", () => {
       "/api/template", // POST-only endpoint, not a read → refused
       "/local/foo", // outside /api entirely
       "/", // empty
+      // Privacy-sensitive content is deliberately off the un-approved read tier.
+      "/api/camera_proxy/camera.front",
+      "/api/calendars",
+      "/api/calendars/calendar.family",
     ]) {
       expect(isAllowedReadPath(p), p).toBe(false);
     }
