@@ -134,6 +134,19 @@ describe("pure helpers", () => {
     expect(rendered.length).toBeLessThan(1200); // still bounded
   });
 
+  it("renderServiceData stays hard-bounded against a huge key name or thousands of keys", () => {
+    // A single enormous key name must not blow the budget.
+    const bigKey = renderServiceData({ ["k".repeat(5000)]: 1 });
+    expect(bigKey.length).toBeLessThanOrEqual(1000);
+    expect(bigKey).toContain("…");
+    // Thousands of keys: bounded output, overflow list itself capped.
+    const wide: Record<string, number> = {};
+    for (let i = 0; i < 5000; i++) wide[`f${i}`] = i;
+    const rendered = renderServiceData(wide);
+    expect(rendered.length).toBeLessThanOrEqual(1000);
+    expect(rendered).toMatch(/\+\d+ more:/);
+  });
+
   it("isAllowedReadPath permits known side-effect-free read endpoints", () => {
     expect(isAllowedReadPath("/api/")).toBe(true); // health check → canon 'api'
     expect(isAllowedReadPath("/api/config")).toBe(true);
