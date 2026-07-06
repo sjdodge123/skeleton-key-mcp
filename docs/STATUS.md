@@ -2,7 +2,7 @@
 
 Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
 
-_Last updated: 2026-07-03._
+_Last updated: 2026-07-06._
 
 ## TL;DR
 
@@ -29,7 +29,7 @@ Each feature PR went through an adversarial `/code-review`; findings were fixed 
 
 ## Open PRs
 
-None. `main` is the source of truth.
+- **`feat/home-assistant-connector`** — bespoke Home Assistant connector (see gap #2). Diagnosed and fixes the long-standing `400` on every programmatic HA POST: the generic `http` connector's untyped `body` was transmitted as a JSON string and double-encoded, so HA saw a JSON *string* where it wanted an object. New connector sends service data as a typed, single-encoded object. Awaiting adversarial review + owner merge.
 
 ## Known gaps / good next tasks
 
@@ -38,7 +38,7 @@ Roughly in priority order — pick up any of these:
 0. **Verify bearer while locked (#20)** — a valid legacy static bearer gets a 401 (not a clear "locked") while the store is locked, because it can only be verified against the locked store. Fix: hash it lock-independently (like OAuth tokens) so it can be verified — and safely admitted to the banner-only `get_started` — while locked.
 
 1. **LAN TLS for the web UI + MCP endpoint** (owner-flagged 2026-07-03). Everything the UI carries — the master passphrase at unlock, credentials typed into `request_credential` forms — currently transits the LAN as **plain HTTP**. The existing guardrails don't cover this: LAN-only shrinks the attacker pool but a compromised IoT device doing ARP spoofing can capture the passphrase; the pinned public URL stops *us* linking to a forged origin but not an attacker *answering as* ours; TOTP protects actions, not transit. This is exactly TLS's job (confidentiality + server authentication). Sketch: native HTTPS — self-signed cert generated on first boot (or a user-mounted cert/key pair), one-time browser trust step documented; mind the OAuth issuer URL (scheme changes) and MCP client trust of self-signed certs (`NODE_EXTRA_CA_CERTS` for Claude Code). The "no reverse proxy" rule is about *internet* exposure — a LAN-only TLS terminator or native TLS is compatible with the security model. Note: boot auto-unlock reduces how often the passphrase transits; the credential hand-off forms still carry a secret every time.
-2. **Bespoke connectors** (the biggest value). `ssh`/`http` plus **`portainer`** (done — Docker mgmt incl. `update_stack` to redeploy a stack from an edited compose). Discovery maps `portainer` detections to the real connector now; `synology`, `proxmox`, `unifi`, `home-assistant`, `pihole` still fall back to `http`. Next suggested: **Home Assistant** (REST + long-lived token), **Proxmox** (API token). Each is a `Connector` in `src/connectors/`.
+2. **Bespoke connectors** (the biggest value). `ssh`/`http` plus **`portainer`** (Docker mgmt incl. `update_stack`), **`unifi`** (surgical gateway/network writes), and **`home-assistant`** (REST + long-lived token; read state/logbook, `ha_call_service`, `ha_backup` — fixes the generic-http double-encoded-POST `400` at the root). Discovery maps `portainer`/`unifi`/`home-assistant` detections to their real connectors now; `synology`, `proxmox`, `pihole` still fall back to `http`. Next suggested: **Proxmox** (API token). Each is a `Connector` in `src/connectors/`.
 3. **Admin console** — the web UI is first-run-wizard only. Grow it into an authenticated admin page: audit-log viewer, target CRUD, OAuth client list/revoke (endpoints already exist under `/api/oauth/clients`), token rotation, vault re-unlock. Reuse the wizard's TOTP/verify components.
 4. **Scan accuracy round 2** — fingerprints are content-based now but still imperfect (e.g., SPA shells that don't self-identify show as "likely"/"open"). Consider secondary probes (Portainer `/api/status`, Pi-hole `/admin`) and de-noising the results list.
 5. **Operational polish** — consider a scan progress indicator (the fingerprinting scan is slower than the old port scan).
