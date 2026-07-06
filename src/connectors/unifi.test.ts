@@ -298,6 +298,16 @@ describe("set_gateway_feature (surgical toggle)", () => {
     expect(body.upnp_enabled).toBe(false); // untouched
   });
 
+  it("reports each field's prior value for a multi-field feature (mixed offload state)", async () => {
+    // Mixed start: sch off, the other two on — the audit text must name all three.
+    mock([{ key: "usg", _id: "u1", offload_sch: false, offload_accounting: true, offload_l2_blocking: true }], "usg", "u1");
+    const res = await tool("set_gateway_feature").run({ feature: "offload", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("offload_sch=false");
+    expect(res.text).toContain("offload_accounting=true");
+    expect(res.text).toContain("offload_l2_blocking=true");
+  });
+
   it("errors when the setting group for the feature is absent", async () => {
     mock([{ key: "dpi", _id: "d1", enabled: true }], "usg_geo", "g1");
     const res = await tool("set_gateway_feature").run({ feature: "geoip", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
