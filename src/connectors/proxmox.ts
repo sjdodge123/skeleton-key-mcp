@@ -64,13 +64,21 @@ export function baseUrl(target: Target): string {
   return `https://${host}:${target.port ?? 8006}`;
 }
 
+/** A complete `PVEAPIToken` value: `user@realm!tokenid=secret`, no whitespace. */
+const FULL_TOKEN = /^[^\s@!=]+@[^\s@!=]+![^\s@!=]+=\S+$/;
+
 /** The full `PVEAPIToken` value (`<user@realm!tokenid>=<secret>`) from the
- *  credential, or undefined if this is a username/password credential. Prefers
- *  explicit fields; a `!`-bearing username is treated as a token id. Exported for
- *  testing. */
+ *  credential, or undefined if this is a username/password credential. Accepts a
+ *  complete token from any common slot — `api_token`, the generic hidden `token`
+ *  field, the item secret, or the password (so a Proxmox token onboarded via the
+ *  safe `request_credential(kind:"token")` flow, which lands in `cred.secret`,
+ *  works) — as long as it has the `user@realm!tokenid=secret` shape. Otherwise a
+ *  split `token_id` + `token_secret`/secret, or a `!`-bearing username, forms it.
+ *  Exported for testing. */
 export function pveTokenFrom(cred: Credential): string | undefined {
-  const full = cred.fields["api_token"];
-  if (full && full.includes("=") && full.includes("!")) return full;
+  for (const cand of [cred.fields["api_token"], cred.fields["token"], cred.secret, cred.password]) {
+    if (cand && FULL_TOKEN.test(cand)) return cand;
+  }
   const id = cred.fields["token_id"] ?? (cred.username?.includes("!") ? cred.username : undefined);
   const secret = cred.fields["token_secret"] ?? cred.secret ?? cred.password ?? undefined;
   if (id && secret) return `${id}=${secret}`;
@@ -230,7 +238,7 @@ class Proxmox {
       return headers;
     }
     throw new Error(
-      "Proxmox target needs an API token (store the token id as 'token_id' and the secret as 'token_secret' or the item secret), or a username + password.",
+      "Proxmox target needs an API token — store the FULL token 'user@realm!tokenid=<secret>' (e.g. via request_credential), or split it into 'token_id' + 'token_secret' fields — or a username + password.",
     );
   }
 

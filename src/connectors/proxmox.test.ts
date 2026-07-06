@@ -58,8 +58,14 @@ describe("pure helpers", () => {
     expect(pveTokenFrom(cred({ fields: { token_id: "root@pam!mcp" }, secret: "s2" }))).toBe("root@pam!mcp=s2");
     expect(pveTokenFrom(cred({ username: "root@pam!mcp", password: "s3" }))).toBe("root@pam!mcp=s3");
     expect(pveTokenFrom(cred({ fields: { api_token: "root@pam!mcp=s4" } }))).toBe("root@pam!mcp=s4");
+    // The safe request_credential(kind:"token") flow lands the pasted full token
+    // in cred.secret (or the hidden 'token' field) — accept those too.
+    expect(pveTokenFrom(cred({ secret: "root@pam!mcp=s5" }))).toBe("root@pam!mcp=s5");
+    expect(pveTokenFrom(cred({ fields: { token: "root@pam!mcp=s6" } }))).toBe("root@pam!mcp=s6");
     // A plain user/password (no '!') is NOT a token → undefined (ticket auth path).
     expect(pveTokenFrom(cred({ username: "root@pam", password: "pw" }))).toBeUndefined();
+    // A password that merely contains punctuation isn't mistaken for a token.
+    expect(pveTokenFrom(cred({ username: "root@pam", password: "a!b=c d" }))).toBeUndefined();
   });
 
   it("upidNode extracts + validates the node, rejecting malformed UPIDs", () => {
