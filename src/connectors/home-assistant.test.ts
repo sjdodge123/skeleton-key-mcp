@@ -328,6 +328,45 @@ describe("ha_call_service (POST body encoding)", () => {
     expect(res.text).toContain("Changed 2: light.kitchen, light.hall");
   });
 
+  it("supports return_response: appends ?return_response and surfaces service_response", async () => {
+    const calls = mockFetch([
+      {
+        match: (u, i) => u.includes("/api/services/weather/get_forecasts") && u.includes("return_response") && i.method === "POST",
+        reply: { json: { changed_states: [], service_response: { "weather.home": { forecast: [{ temperature: 72 }] } } } },
+      },
+    ]);
+    const res = await tool("ha_call_service").run(
+      { domain: "weather", service: "get_forecasts", data: { type: "daily", entity_id: "weather.home" }, return_response: true },
+      ctx(cred({ secret: "TKN" })),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("OK (HTTP 200)");
+    expect(res.text).toContain('"temperature":72');
+    const post = calls.find((c) => c.init.method === "POST")!;
+    expect(post.url).toContain("/api/services/weather/get_forecasts?return_response");
+    // Body is still a single-encoded object.
+    expect(JSON.parse(post.init.body)).toEqual({ type: "daily", entity_id: "weather.home" });
+  });
+
+  it("a mandatory-response service without return_response surfaces HA's 400 and hints at the flag", async () => {
+    mockFetch([
+      {
+        match: (u, i) => u.includes("/api/services/weather/get_forecasts") && !u.includes("return_response") && i.method === "POST",
+        reply: { status: 400, statusText: "Bad Request", text: "A non stateful action must be passed with return_response=True" },
+      },
+    ]);
+    const res = await tool("ha_call_service").run({ domain: "weather", service: "get_forecasts", data: { type: "daily", entity_id: "weather.home" } }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("HTTP 400");
+  });
+
+  it("return_response with a non-object body is flagged ambiguous", async () => {
+    mockFetch([{ match: (u, i) => u.includes("return_response") && i.method === "POST", reply: { json: [] } }]);
+    const res = await tool("ha_call_service").run({ domain: "weather", service: "get_forecasts", return_response: true }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("OUTCOME UNKNOWN");
+  });
+
   it("reports an HA error body as a failure (not a phantom success)", async () => {
     mockFetch([
       { match: (u, i) => u.includes("/api/services/homeassistant/update_entity") && i.method === "POST", reply: { status: 400, statusText: "Bad Request", text: "400: Bad Request" } },

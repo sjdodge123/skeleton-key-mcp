@@ -498,8 +498,11 @@ class HomeAssistant {
 
   /** Call a HA service: POST /api/services/<domain>/<service> with the service
    *  data as the JSON *object* body. This is the corrected path the generic http
-   *  connector got wrong. Returns a short summary of the entities HA changed. */
-  async callService(domain: string, service: string, data?: unknown): Promise<ToolResult> {
+   *  connector got wrong. Without `returnResponse` HA replies with the ARRAY of
+   *  changed states; some services (e.g. weather.get_forecasts, calendar.get_events)
+   *  REQUIRE `?return_response` and reply with `{ changed_states, service_response }`
+   *  — pass returnResponse=true for those and the service data is surfaced. */
+  async callService(domain: string, service: string, data?: unknown, returnResponse = false): Promise<ToolResult> {
     // Reject anything that isn't a bare HA identifier BEFORE building the URL — a
     // `..`/slash/encoded segment could otherwise traverse to a different endpoint
     // than the one the approval named.
@@ -507,21 +510,34 @@ class HomeAssistant {
       return { text: `Invalid Home Assistant service '${domain}.${service}': domain and service must be identifiers (letters, digits, underscore).`, isError: true };
     }
     const body = normalizeServiceData(data);
-    const res = await this.request("POST", `/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, { body });
+    const path = `/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}${returnResponse ? "?return_response" : ""}`;
+    const res = await this.request("POST", path, { body });
     if (!res.ok) {
       const detail = res.text.trim() || res.statusText;
       return { text: `HA service ${domain}.${service} failed: HTTP ${res.status} ${res.statusText}\n${detail.slice(0, 4_000)}`, isError: true };
     }
-    // A service call returns the ARRAY of states it changed (often []). A 2xx that
-    // is truncated or NOT an array (a proxy/login HTML page, response-shape drift)
-    // must not be reported as a clean "OK / no change" — the write may have been
-    // applied, so flag it as ambiguous rather than hiding the uncertainty behind a
-    // success for a possibly non-idempotent service.
+    // A 2xx that is truncated must not be reported as clean success — the write may
+    // have been applied, so flag it as ambiguous (non-idempotent hazard).
     if (res.truncated) {
       return { text: `HA service ${domain}.${service} returned HTTP ${res.status} but the response was too large to read fully — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying.`, isError: true };
     }
+    if (returnResponse) {
+      // return_response replies with `{ changed_states: [...], service_response: {...} }`.
+      const obj = res.json as { changed_states?: HAState[]; service_response?: unknown } | undefined;
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+        return { text: `HA service ${domain}.${service} (return_response) returned HTTP ${res.status} with an unexpected body — OUTCOME UNKNOWN: verify state before retrying. Body: ${res.text.slice(0, 500)}`, isError: true };
+      }
+      const ids = (Array.isArray(obj.changed_states) ? obj.changed_states : []).map((s) => s.entity_id).filter(Boolean);
+      const changedSummary = ids.length ? ` Changed ${ids.length}: ${ids.slice(0, 30).join(", ")}${ids.length > 30 ? " …" : ""}.` : "";
+      const respStr = obj.service_response !== undefined ? JSON.stringify(obj.service_response) : "";
+      const respClause = respStr ? ` Response: ${respStr.length > 8_000 ? `${respStr.slice(0, 7_999)}…` : respStr}` : "";
+      return { text: `HA service ${domain}.${service} OK (HTTP ${res.status}).${changedSummary}${respClause}` };
+    }
+    // Normal (no return_response): HA replies with the ARRAY of changed states
+    // (often []). A non-array 2xx (proxy/login HTML, shape drift) is ambiguous, not
+    // "OK / no change" — the write may have been applied.
     if (!Array.isArray(res.json)) {
-      return { text: `HA service ${domain}.${service} returned HTTP ${res.status} with an unexpected (non-array) body — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying. Body: ${res.text.slice(0, 500)}`, isError: true };
+      return { text: `HA service ${domain}.${service} returned HTTP ${res.status} with an unexpected (non-array) body — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying. Body: ${res.text.slice(0, 500)}` + " (if this service requires response data, set return_response=true)", isError: true };
     }
     const changed = res.json as HAState[];
     const ids = changed.map((s) => s.entity_id).filter(Boolean);
@@ -607,6 +623,10 @@ function buildTools(target: Target): ConnectorTool[] {
         domain: z.string().regex(HA_IDENTIFIER, "domain must be a Home Assistant identifier (letters, digits, underscore)").describe("Service domain, e.g. 'light', 'homeassistant', 'update'."),
         service: z.string().regex(HA_IDENTIFIER, "service must be a Home Assistant identifier (letters, digits, underscore)").describe("Service name, e.g. 'turn_on', 'update_entity', 'install'."),
         data: serviceData,
+        return_response: z
+          .boolean()
+          .optional()
+          .describe("Set true for services that require response data (e.g. weather.get_forecasts, calendar.get_events); the service_response is returned."),
       }),
       confirm: (input, t) => {
         const i = input as { domain: string; service: string; data?: unknown };
@@ -619,7 +639,7 @@ function buildTools(target: Target): ConnectorTool[] {
         const dataClause = rendered ? ` — data: ${rendered}` : "";
         return `Call Home Assistant service ${i.domain}.${i.service}${on}${dataClause} (${t.name})`;
       },
-      run: run((ha, i) => ha.callService(i.domain, i.service, i.data)),
+      run: run((ha, i) => ha.callService(i.domain, i.service, i.data, i.return_response)),
     },
     {
       name: "ha_backup",
