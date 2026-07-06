@@ -399,6 +399,40 @@ describe("read tools", () => {
   });
 });
 
+describe("structured reads fail loudly on truncated/malformed responses", () => {
+  const OVERSIZED = "z".repeat(6_300_000); // > DEFAULT_MAX_BYTES (6 MB)
+
+  it("ha_states (all) errors on a truncated response instead of reporting 'No entities'", async () => {
+    mockFetch([{ match: (u) => u.endsWith("/api/states"), reply: { text: OVERSIZED } }]);
+    const res = await tool("ha_states").run({}, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("too large");
+    expect(res.text).not.toContain("No entities");
+  });
+
+  it("ha_logbook errors on a truncated response instead of reporting 'No logbook entries'", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/logbook"), reply: { text: OVERSIZED } }]);
+    const res = await tool("ha_logbook").run({}, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("too large");
+    expect(res.text).not.toContain("No logbook entries");
+  });
+
+  it("ha_states (all) errors on a 2xx non-array body", async () => {
+    mockFetch([{ match: (u) => u.endsWith("/api/states"), reply: { json: { message: "unexpected" } } }]);
+    const res = await tool("ha_states").run({}, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("not a JSON array");
+  });
+
+  it("ha_logbook errors on a 2xx non-array body", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/logbook"), reply: { json: { message: "unexpected" } } }]);
+    const res = await tool("ha_logbook").run({}, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("not a JSON array");
+  });
+});
+
 describe("request bounds", () => {
   it("aborts a hung request after the timeout and reports it (no indefinite hang)", async () => {
     vi.useFakeTimers();

@@ -392,12 +392,22 @@ class HomeAssistant {
     if (entity) {
       const res = await this.request("GET", `/api/states/${encodeURIComponent(entity)}`);
       if (!res.ok) return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 4_000)}`, isError: true };
+      if (res.truncated) {
+        return { text: `HA state for '${entity}' was unexpectedly large and got truncated; inspect via ha_get.`, isError: true };
+      }
       return { text: JSON.stringify(res.json ?? res.text, null, 2).slice(0, 8_000) };
     }
     const res = await this.request("GET", "/api/states");
     if (!res.ok) return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 4_000)}`, isError: true };
-    const arr = Array.isArray(res.json) ? (res.json as HAState[]) : [];
-    return { text: summarizeStates(arr, filter) };
+    // A truncated or non-array 2xx MUST NOT summarize as "No entities" — that
+    // false empty-state could drive a wrong automation decision. Fail loudly.
+    if (res.truncated) {
+      return { text: "HA /api/states was too large to read fully; query a single 'entity' to narrow it (a substring 'filter' still fetches the full list, so it won't help here).", isError: true };
+    }
+    if (!Array.isArray(res.json)) {
+      return { text: `Unexpected /api/states response (not a JSON array): ${res.text.slice(0, 500)}`, isError: true };
+    }
+    return { text: summarizeStates(res.json as HAState[], filter) };
   }
 
   async logbook(entity?: string, start?: string, end?: string): Promise<ToolResult> {
@@ -413,8 +423,15 @@ class HomeAssistant {
     if (qs) path += `?${qs}`;
     const res = await this.request("GET", path);
     if (!res.ok) return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 4_000)}`, isError: true };
-    const arr = Array.isArray(res.json) ? (res.json as LogbookEntry[]) : [];
-    return { text: summarizeLogbook(arr) };
+    // Same false-empty-state hazard as states(): a truncated/non-array 2xx is an
+    // error, not "No logbook entries".
+    if (res.truncated) {
+      return { text: "HA logbook response was too large to read fully; narrow it with 'entity' and/or a tighter 'start'/'end' window.", isError: true };
+    }
+    if (!Array.isArray(res.json)) {
+      return { text: `Unexpected /api/logbook response (not a JSON array): ${res.text.slice(0, 500)}`, isError: true };
+    }
+    return { text: summarizeLogbook(res.json as LogbookEntry[]) };
   }
 
   /** Call a HA service: POST /api/services/<domain>/<service> with the service
