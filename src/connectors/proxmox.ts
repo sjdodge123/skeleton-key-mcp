@@ -28,13 +28,17 @@ const optionsSchema = z
     baseUrl: z.string().url().optional(),
     /** Default node for node-scoped reads (e.g. list_tasks) when none is given. */
     node: z.string().optional(),
-    /** Skip TLS verification for THIS target only. Defaults **off** (secure): this
-     *  connector sends credentials (API token, or a username/password ticket +
-     *  CSRF), so it must not silently trust any cert. Proxmox ships a self-signed
-     *  cert on :8006, so a target using that must OPT IN by setting this true — an
-     *  informed choice accepting LAN-MITM exposure, not a silent default. Scoped
-     *  per-request via an undici dispatcher, never process-global. */
-    insecureTLS: z.boolean().default(false),
+    /** Skip TLS *certificate verification* for THIS target only (NOT encryption —
+     *  `baseUrl` always forces https, so transit is always TLS-encrypted and a
+     *  passive LAN sniffer never sees the token; this only toggles trust in the
+     *  cert). Defaults ON because Proxmox ships a self-signed cert on :8006, so
+     *  this makes stock PVE work out of the box via both the wizard and the
+     *  conversational onboarding path — consistent with the UniFi connector
+     *  (another LAN self-signed appliance). Set it to `false` for a CA-signed PVE
+     *  to also get active-MITM protection. The residual (active MITM with a forged
+     *  cert on the LAN) is the app-wide LAN-transit item tracked in docs/STATUS.md.
+     *  Scoped per-request via an undici dispatcher, never process-global. */
+    insecureTLS: z.boolean().default(true),
   })
   .default({});
 

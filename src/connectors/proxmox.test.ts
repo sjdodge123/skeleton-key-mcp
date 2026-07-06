@@ -48,9 +48,11 @@ describe("pure helpers", () => {
     expect(() => baseUrl(target({ baseUrl: "http://pve.lan" }))).toThrow(/https/i);
   });
 
-  it("insecureTLS defaults OFF (secure by default) but can be opted in", () => {
-    expect((proxmoxConnector.configSchema.parse({}) as { insecureTLS: boolean }).insecureTLS).toBe(false);
-    expect((proxmoxConnector.configSchema.parse({ insecureTLS: true }) as { insecureTLS: boolean }).insecureTLS).toBe(true);
+  it("insecureTLS (cert verification) defaults ON for self-signed PVE but can be turned off", () => {
+    // Transit is always https-encrypted (see baseUrl); this only toggles cert
+    // verification. Default true = works OOB against a self-signed :8006 cert.
+    expect((proxmoxConnector.configSchema.parse({}) as { insecureTLS: boolean }).insecureTLS).toBe(true);
+    expect((proxmoxConnector.configSchema.parse({ insecureTLS: false }) as { insecureTLS: boolean }).insecureTLS).toBe(false);
   });
 
   it("pveTokenFrom builds the PVEAPIToken value from fields, username, or a full token", () => {
