@@ -382,7 +382,7 @@ class UniFi {
     if (!grp?._id) throw new Error(`UniFi has no '${spec.key}' setting group, so ${spec.label} can't be toggled on this gateway.`);
 
     const updated: Record<string, unknown> = { ...grp };
-    let prev: unknown;
+    let prevDesc: string; // per-field prior state, so the audit trail supports a restore
     if (spec.path) {
       const [parentKey, childKey] = spec.path;
       const parent = grp[parentKey];
@@ -392,7 +392,7 @@ class UniFi {
       if (!parent || typeof parent !== "object" || Array.isArray(parent) || typeof (parent as Record<string, unknown>)[childKey] !== "boolean") {
         throw new Error(`UniFi ${spec.label} isn't in the expected shape (${spec.key}.${parentKey}.${childKey}) on this gateway; refusing to write.`);
       }
-      prev = (parent as Record<string, unknown>)[childKey];
+      prevDesc = `'${String((parent as Record<string, unknown>)[childKey])}'`;
       updated[parentKey] = { ...(parent as Record<string, unknown>), [childKey]: enabled };
     } else {
       // Same fail-closed invariant as the nested path: only flip fields that
@@ -404,7 +404,13 @@ class UniFi {
           `UniFi ${spec.label} isn't in the expected shape on this gateway (missing/non-boolean: ${bad.map((f) => `${spec.key}.${f}`).join(", ")}); refusing to write.`,
         );
       }
-      prev = grp[spec.fields![0]!];
+      // Capture EVERY toggled field's prior value (not just the first), so a
+      // mixed starting state (e.g. offload part-on) is recorded accurately and
+      // the operator can restore it.
+      prevDesc =
+        spec.fields!.length === 1
+          ? `'${String(grp[spec.fields![0]!])}'`
+          : spec.fields!.map((f) => `${f}=${String(grp[f])}`).join(", ");
       for (const f of spec.fields!) updated[f] = enabled;
     }
 
@@ -436,7 +442,7 @@ class UniFi {
       throw new Error(`UniFi ${spec.label} did not hold after the write (a concurrent settings change may have reverted it); retry and check the UniFi UI.`);
     }
 
-    return `UniFi ${spec.label} set to ${enabled ? "ENABLED" : "DISABLED"} on ${this.target.name} (was ${prev === undefined ? "unset" : `'${String(prev)}'`}).`;
+    return `UniFi ${spec.label} set to ${enabled ? "ENABLED" : "DISABLED"} on ${this.target.name} (was ${prevDesc}).`;
   }
 }
 
