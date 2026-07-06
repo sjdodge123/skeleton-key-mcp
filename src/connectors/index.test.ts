@@ -5,6 +5,9 @@ describe("registerableType", () => {
   it("routes a fingerprint-confirmed detection to its bespoke connector", () => {
     expect(registerableType("portainer", 9000, "confirmed")).toBe("portainer");
     expect(registerableType("ssh", 22, "confirmed")).toBe("ssh");
+    // Home Assistant now has a bespoke connector, so a confirmed :8123 detection
+    // registers as it rather than falling back to the generic http connector.
+    expect(registerableType("home-assistant", 8123, "confirmed")).toBe("home-assistant");
   });
 
   it("downgrades a port-only guess to the generic connector (no broken portainer target)", () => {
@@ -25,5 +28,10 @@ describe("registerableType", () => {
 
   it("portainer is a registered connector", () => {
     expect(getConnector("portainer")?.type).toBe("portainer");
+  });
+
+  it("home-assistant is a registered connector, reachable by its no-hyphen alias too", () => {
+    expect(getConnector("home-assistant")?.type).toBe("home-assistant");
+    expect(getConnector("homeassistant")?.type).toBe("home-assistant");
   });
 });
