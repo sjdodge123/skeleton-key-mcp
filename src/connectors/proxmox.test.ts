@@ -44,6 +44,11 @@ describe("pure helpers", () => {
     expect(baseUrl(target({ baseUrl: "https://pve.lan/" }, 8006))).toBe("https://pve.lan");
   });
 
+  it("insecureTLS defaults OFF (secure by default) but can be opted in", () => {
+    expect((proxmoxConnector.configSchema.parse({}) as { insecureTLS: boolean }).insecureTLS).toBe(false);
+    expect((proxmoxConnector.configSchema.parse({ insecureTLS: true }) as { insecureTLS: boolean }).insecureTLS).toBe(true);
+  });
+
   it("pveTokenFrom builds the PVEAPIToken value from fields, username, or a full token", () => {
     expect(pveTokenFrom(cred({ fields: { token_id: "root@pam!mcp", token_secret: "s" } }))).toBe("root@pam!mcp=s");
     expect(pveTokenFrom(cred({ fields: { token_id: "root@pam!mcp" }, secret: "s2" }))).toBe("root@pam!mcp=s2");
@@ -112,7 +117,7 @@ describe("ticket (username/password) auth", () => {
       { match: (u, i) => u.includes("/cluster/resources") && (i?.method ?? "GET") === "GET", reply: { json: { data: [{ vmid: 100, name: "web", node: "pve1", type: "qemu", status: "running" }] } } },
       { match: (u, i) => u.includes("/nodes/pve1/qemu/100/status/reboot") && i.method === "POST", reply: { json: { data: "UPID:pve1:x:" } } },
     ]);
-    const res = await tool("guest_power").run({ vmid: 100, name: "web", action: "reboot" }, ctx(cred({ username: "root@pam", password: "pw" })));
+    const res = await tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "reboot" }, ctx(cred({ username: "root@pam", password: "pw" })));
     expect(res.isError).toBeFalsy();
 
     const ticket = calls.find((c) => c.url.endsWith("/access/ticket"))!;
@@ -136,7 +141,7 @@ describe("guest_power (execute)", () => {
 
   it("looks the guest up by vmid, POSTs the action to the right node/type, and reports the UPID", async () => {
     const calls = mockGuest(100, "qemu");
-    const res = await tool("guest_power").run({ vmid: 100, name: "web", action: "shutdown" }, ctx(token()));
+    const res = await tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "shutdown" }, ctx(token()));
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("shutdown started on VM 100 (web) on node pve1");
     expect(res.text).toContain("UPID:pve1");
@@ -144,17 +149,26 @@ describe("guest_power (execute)", () => {
     expect(post.url).toContain("/api2/json/nodes/pve1/qemu/100/status/shutdown");
   });
 
-  it("refuses (without POSTing) when the live guest name doesn't match the approved name — stale vmid", async () => {
+  it("refuses (without POSTing) when the live guest NAME doesn't match the approved name — stale vmid", async () => {
     const calls = mockFetch([{ match: (u) => u.includes("/cluster/resources"), reply: { json: { data: [{ vmid: 100, name: "db", node: "pve1", type: "qemu" }] } } }]);
-    const res = await tool("guest_power").run({ vmid: 100, name: "web", action: "stop" }, ctx(token()));
+    const res = await tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "stop" }, ctx(token()));
     expect(res.isError).toBe(true);
-    expect(res.text).toContain("is currently 'db', not 'web'");
+    expect(res.text).toContain("is currently 'db'");
+    expect(res.text).toContain("not 'web'");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("refuses when the live guest NODE doesn't match the approved node (recreated elsewhere)", async () => {
+    const calls = mockFetch([{ match: (u) => u.includes("/cluster/resources"), reply: { json: { data: [{ vmid: 100, name: "web", node: "pve2", type: "qemu" }] } } }]);
+    const res = await tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "stop" }, ctx(token()));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("on node 'pve2'");
     expect(calls.some((c) => c.init.method === "POST")).toBe(false);
   });
 
   it("errors clearly when the vmid isn't in the cluster (no POST issued)", async () => {
     const calls = mockFetch([{ match: (u) => u.includes("/cluster/resources"), reply: { json: { data: [{ vmid: 100, name: "web", node: "pve1", type: "qemu" }] } } }]);
-    const res = await tool("guest_power").run({ vmid: 999, name: "web", action: "start" }, ctx(token()));
+    const res = await tool("guest_power").run({ vmid: 999, name: "web", node: "pve1", action: "start" }, ctx(token()));
     expect(res.isError).toBe(true);
     expect(res.text).toContain("No VM/CT with vmid 999");
     expect(calls.some((c) => c.init.method === "POST")).toBe(false);
@@ -165,15 +179,15 @@ describe("guest_power (execute)", () => {
       { match: (u) => u.includes("/cluster/resources"), reply: { json: { data: [{ vmid: 100, name: "web", node: "pve1", type: "qemu" }] } } },
       { match: (u, i) => u.includes("/status/stop") && i.method === "POST", reply: { status: 500, statusText: "Internal Server Error", text: "cannot stop" } },
     ]);
-    const res = await tool("guest_power").run({ vmid: 100, name: "web", action: "stop" }, ctx(token()));
+    const res = await tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "stop" }, ctx(token()));
     expect(res.isError).toBe(true);
     expect(res.text).toContain("HTTP 500");
   });
 
   it("confirm names the exact vmid + name + action and warns on a hard stop", () => {
     const c = tool("guest_power").confirm!;
-    expect(c({ vmid: 100, name: "web", action: "start" }, target())).toBe('Proxmox: start guest 100 "web" on pve');
-    expect(c({ vmid: 100, name: "web", action: "stop" }, target())).toContain("HARD stop");
+    expect(c({ vmid: 100, name: "web", node: "pve1", action: "start" }, target())).toBe('Proxmox: start guest 100 "web" on node pve1 (pve)');
+    expect(c({ vmid: 100, name: "web", node: "pve1", action: "stop" }, target())).toContain("HARD stop");
   });
 
   it("has the right tiers", () => {
@@ -255,7 +269,7 @@ describe("request bounds", () => {
           return new Promise((_r, reject) => init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))));
         }),
       );
-      const p = tool("guest_power").run({ vmid: 100, name: "web", action: "stop" }, ctx(token()));
+      const p = tool("guest_power").run({ vmid: 100, name: "web", node: "pve1", action: "stop" }, ctx(token()));
       await vi.advanceTimersByTimeAsync(21_000);
       const res = await p;
       expect(res.isError).toBe(true);
