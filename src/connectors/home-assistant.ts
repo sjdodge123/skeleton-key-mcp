@@ -85,14 +85,32 @@ export function normalizeServiceData(data: unknown): Record<string, unknown> {
  *  secret into the audit trail (audit args are hashed; the `detail` is not). */
 const SECRET_DATA_KEY = /pass(word|wd)?|token|secret|api[_-]?key|credential|private[_-]?key|\bpin\b|\bcode\b/i;
 
+/** Deep-copy `value`, masking any property whose KEY looks secret — at every
+ *  nesting level, through arrays too. Service data can nest (e.g. notify `data`,
+ *  hassio `input`), so a shallow pass would leak `{"data":{"token":"…"}}`.
+ *  Recursion is depth-bounded so a pathological payload can't blow the stack. */
+function redactDeep(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "…";
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, depth + 1));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SECRET_DATA_KEY.test(k) ? "[redacted]" : redactDeep(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
 /**
  * Compact, secret-redacted, length-capped rendering of service data for the
  * approval prompt + audit detail, so a human approves the ACTUAL payload — not
  * just the service name (a generic execute tool could otherwise smuggle
- * destructive fields behind a vague "Call service …"). Best-effort and
- * non-throwing: an object is redacted per-key; a JSON string is parsed first; any
- * other value is shown truncated. Exported for testing.
- */
+ * destructive fields behind a vague "Call service …"). Redaction is recursive
+ * (nested keys + arrays). Best-effort and non-throwing: an object is redacted; a
+ * JSON string is parsed first; any other value is shown truncated. Exported for
+ * testing. Key-based like the UniFi connector's redactSecrets — a secret placed
+ * in a non-secret-named VALUE is out of scope (impractical to detect generally). */
 export function renderServiceData(data: unknown): string {
   let obj: Record<string, unknown> | undefined;
   if (data && typeof data === "object" && !Array.isArray(data)) {
@@ -107,18 +125,43 @@ export function renderServiceData(data: unknown): string {
   }
   if (!obj) return "";
   if (!Object.keys(obj).length) return "";
-  const redacted: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) redacted[k] = SECRET_DATA_KEY.test(k) ? "[redacted]" : v;
-  const json = JSON.stringify(redacted);
-  return json.length > 200 ? `${json.slice(0, 199)}…` : json;
+  const json = JSON.stringify(redactDeep(obj));
+  return json.length > 300 ? `${json.slice(0, 299)}…` : json;
+}
+
+/** Canonicalize a request path for security matching: resolve dot-segments +
+ *  drop the query/fragment via the URL parser, then percent-decode (bounded, to
+ *  defeat single/double encoding) and strip leading slashes. So `/api/%77ebhook`,
+ *  `/api/foo/../webhook`, and `/api/webhook%2Fx` all reduce to the same form a
+ *  raw-regex guard would miss. */
+function canonicalizePath(path: string): string {
+  let p = path;
+  try {
+    // A relative base resolves `.`/`..` and strips query/fragment; pathname stays
+    // percent-encoded (URL doesn't decode it), which the decode loop then handles.
+    p = new URL(p, "http://ha.invalid").pathname;
+  } catch {
+    /* not URL-parseable as-is; match on the raw string */
+  }
+  for (let i = 0; i < 3; i++) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(p);
+    } catch {
+      break; // malformed %-escape; use what we have
+    }
+    if (decoded === p) break;
+    p = decoded;
+  }
+  return p.replace(/^\/+/, "");
 }
 
 /** True if a path targets an HA webhook (/api/webhook/<id>). Webhooks are the one
  *  documented GET-with-side-effects surface (they can fire automations), so the
- *  read-only ha_get refuses them. Matches regardless of a leading slash or case.
- *  Exported for testing. */
+ *  read-only ha_get refuses them. Canonicalizes first so percent-encoded or
+ *  dot-segment variants can't slip past. Exported for testing. */
 export function isWebhookPath(path: string): boolean {
-  return /(^|\/)api\/webhook(\/|$)/i.test(path.replace(/^\/+/, ""));
+  return /(^|\/)api\/webhook(\/|$)/i.test(canonicalizePath(path));
 }
 
 /** Zod for a service-data dict: a real object in the JSON schema (so the client

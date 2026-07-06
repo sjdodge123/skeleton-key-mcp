@@ -94,21 +94,33 @@ describe("pure helpers", () => {
     expect(summarizeStates(states as any, "nope")).toContain("No entities match 'nope'");
   });
 
-  it("renderServiceData redacts secrets, keeps other fields, and tolerates junk", () => {
+  it("renderServiceData redacts secrets (recursively), keeps other fields, and tolerates junk", () => {
     expect(renderServiceData({ entity_id: "light.k", brightness: 128 })).toBe('{"entity_id":"light.k","brightness":128}');
     expect(renderServiceData({ password: "hunter2", name: "x" })).toBe('{"password":"[redacted]","name":"x"}');
     expect(renderServiceData({ pin: "1234", api_key: "k" })).toBe('{"pin":"[redacted]","api_key":"[redacted]"}');
+    // Nested + arrays: a shallow pass would leak these.
+    expect(renderServiceData({ data: { token: "abc", other: 1 } })).toBe('{"data":{"token":"[redacted]","other":1}}');
+    const arr = renderServiceData({ items: [{ password: "p" }, { ok: true }] });
+    expect(arr).not.toContain('"p"');
+    expect(arr).toBe('{"items":[{"password":"[redacted]"},{"ok":true}]}');
     expect(renderServiceData('{"entity_id":"light.k"}')).toBe('{"entity_id":"light.k"}'); // parses a JSON string
     expect(renderServiceData(undefined)).toBe("");
     expect(renderServiceData({})).toBe("");
   });
 
-  it("isWebhookPath flags webhook endpoints regardless of leading slash/case", () => {
+  it("isWebhookPath flags webhook endpoints and their encoded/traversal variants", () => {
     expect(isWebhookPath("/api/webhook/abc123")).toBe(true);
     expect(isWebhookPath("api/webhook/abc123")).toBe(true);
     expect(isWebhookPath("/API/Webhook/abc")).toBe(true);
+    // Encoded-bypass attempts must still be caught (HA canonicalizes before routing).
+    expect(isWebhookPath("/api/%77ebhook/abc")).toBe(true); // %77 = 'w'
+    expect(isWebhookPath("/api/web%68ook/abc")).toBe(true); // %68 = 'h'
+    expect(isWebhookPath("/api/%2577ebhook/abc")).toBe(true); // double-encoded %25 -> % -> %77 -> w
+    expect(isWebhookPath("/api/webhook%2Fabc")).toBe(true); // %2F = '/'
+    expect(isWebhookPath("/api/foo/../webhook/abc")).toBe(true); // dot-segment traversal
+    // Genuine reads and near-misses stay allowed.
     expect(isWebhookPath("/api/config")).toBe(false);
-    expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere in the path is fine
+    expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
     expect(isWebhookPath("/api/webhookfoo")).toBe(false); // not the webhook endpoint
   });
 
@@ -315,12 +327,15 @@ describe("read tools", () => {
     expect(res.text).toContain('"version":"2026.7.1"');
   });
 
-  it("ha_get refuses a webhook path WITHOUT issuing a request (read tier stays side-effect free)", async () => {
-    const calls = mockFetch([{ match: () => true, reply: { json: {} } }]);
-    const res = await tool("ha_get").run({ path: "/api/webhook/some_secret_id" }, ctx(cred({ secret: "TKN" })));
-    expect(res.isError).toBe(true);
-    expect(res.text).toContain("Refused");
-    expect(calls.length).toBe(0); // never hit the network
+  it("ha_get refuses a webhook path (plain and percent-encoded) WITHOUT issuing a request", async () => {
+    for (const path of ["/api/webhook/some_secret_id", "/api/%77ebhook/some_secret_id"]) {
+      const calls = mockFetch([{ match: () => true, reply: { json: {} } }]);
+      const res = await tool("ha_get").run({ path }, ctx(cred({ secret: "TKN" })));
+      expect(res.isError, path).toBe(true);
+      expect(res.text).toContain("Refused");
+      expect(calls.length, path).toBe(0); // never hit the network
+      vi.restoreAllMocks();
+    }
   });
 
   it("ha_logbook builds the path with entity + time bounds and summarizes", async () => {
