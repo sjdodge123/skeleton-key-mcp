@@ -555,12 +555,16 @@ class HomeAssistant {
       return { text: `HA service ${domain}.${service} returned HTTP ${res.status} but the response was too large to read fully — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying.`, isError: true };
     }
     if (returnResponse) {
-      // return_response replies with `{ changed_states: [...], service_response: {...} }`.
-      const obj = res.json as { changed_states?: HAState[]; service_response?: unknown } | undefined;
-      if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
-        return { text: `HA service ${domain}.${service} (return_response) returned HTTP ${res.status} with an unexpected body — OUTCOME UNKNOWN: verify state before retrying. Body: ${res.text.slice(0, 500)}`, isError: true };
+      // return_response replies with the documented shape
+      // `{ changed_states: [...], service_response: {...} }`. Require BOTH keys in
+      // the expected form — a bare `{}`, `{"error":…}`, or other drift is ambiguous
+      // (a proxy/login page or schema drift after a possibly state-changing POST),
+      // not a clean success.
+      const obj = res.json as { changed_states?: unknown; service_response?: unknown } | undefined;
+      if (!obj || typeof obj !== "object" || Array.isArray(obj) || !Array.isArray(obj.changed_states) || obj.service_response === undefined) {
+        return { text: `HA service ${domain}.${service} (return_response) returned HTTP ${res.status} with an unexpected body shape (expected {changed_states:[…], service_response:…}) — OUTCOME UNKNOWN: verify state before retrying. Body: ${res.text.slice(0, 500)}`, isError: true };
       }
-      const ids = (Array.isArray(obj.changed_states) ? obj.changed_states : []).map((s) => s.entity_id).filter(Boolean);
+      const ids = (obj.changed_states as HAState[]).map((s) => s.entity_id).filter(Boolean);
       const changedSummary = ids.length ? ` Changed ${ids.length}: ${ids.slice(0, 30).join(", ")}${ids.length > 30 ? " …" : ""}.` : "";
       const respStr = obj.service_response !== undefined ? JSON.stringify(obj.service_response) : "";
       const respClause = respStr ? ` Response: ${respStr.length > 8_000 ? `${respStr.slice(0, 7_999)}…` : respStr}` : "";
