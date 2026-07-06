@@ -79,6 +79,13 @@ export function normalizeServiceData(data: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** A Home Assistant domain / service identifier: lowercase-ish alnum + underscore.
+ *  Validating BEFORE building `/api/services/<domain>/<service>` stops a `..`, a
+ *  slash, or an encoded segment from steering the POST to a different endpoint
+ *  (e.g. `domain='..', service='template'` → `/api/services/../template` →
+ *  `/api/template`) while the approval/audit text still says the named service. */
+export const HA_IDENTIFIER = /^[a-z0-9_]+$/i;
+
 /** Field-name fragments that mark a service-data value as sensitive (a backup
  *  password, an access token, a lock PIN/code, …). Redacted from the human
  *  approval prompt + audit detail so the confirmation names the payload without
@@ -493,6 +500,12 @@ class HomeAssistant {
    *  data as the JSON *object* body. This is the corrected path the generic http
    *  connector got wrong. Returns a short summary of the entities HA changed. */
   async callService(domain: string, service: string, data?: unknown): Promise<ToolResult> {
+    // Reject anything that isn't a bare HA identifier BEFORE building the URL — a
+    // `..`/slash/encoded segment could otherwise traverse to a different endpoint
+    // than the one the approval named.
+    if (!HA_IDENTIFIER.test(domain) || !HA_IDENTIFIER.test(service)) {
+      return { text: `Invalid Home Assistant service '${domain}.${service}': domain and service must be identifiers (letters, digits, underscore).`, isError: true };
+    }
     const body = normalizeServiceData(data);
     const res = await this.request("POST", `/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, { body });
     if (!res.ok) {
@@ -591,8 +604,8 @@ function buildTools(target: Target): ConnectorTool[] {
         `The data is sent as a single JSON object (the fix for the generic connector's double-encoded 400).`,
       tier: "execute",
       inputSchema: z.object({
-        domain: z.string().describe("Service domain, e.g. 'light', 'homeassistant', 'update'."),
-        service: z.string().describe("Service name, e.g. 'turn_on', 'update_entity', 'install'."),
+        domain: z.string().regex(HA_IDENTIFIER, "domain must be a Home Assistant identifier (letters, digits, underscore)").describe("Service domain, e.g. 'light', 'homeassistant', 'update'."),
+        service: z.string().regex(HA_IDENTIFIER, "service must be a Home Assistant identifier (letters, digits, underscore)").describe("Service name, e.g. 'turn_on', 'update_entity', 'install'."),
         data: serviceData,
       }),
       confirm: (input, t) => {
