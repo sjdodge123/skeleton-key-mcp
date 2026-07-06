@@ -375,11 +375,14 @@ describe("ha_call_service (POST body encoding)", () => {
     expect(res.text).toContain("HTTP 400");
   });
 
-  it("return_response with a non-object body is flagged ambiguous", async () => {
-    mockFetch([{ match: (u, i) => u.includes("return_response") && i.method === "POST", reply: { json: [] } }]);
-    const res = await tool("ha_call_service").run({ domain: "weather", service: "get_forecasts", return_response: true }, ctx(cred({ secret: "TKN" })));
-    expect(res.isError).toBe(true);
-    expect(res.text).toContain("OUTCOME UNKNOWN");
+  it("return_response with a non-object or wrong-shape body is flagged ambiguous", async () => {
+    for (const body of [[] as unknown, {}, { error: "nope" }, { changed_states: [] }, { service_response: {} }]) {
+      mockFetch([{ match: (u, i) => u.includes("return_response") && i.method === "POST", reply: { json: body } }]);
+      const res = await tool("ha_call_service").run({ domain: "weather", service: "get_forecasts", return_response: true }, ctx(cred({ secret: "TKN" })));
+      expect(res.isError, JSON.stringify(body)).toBe(true);
+      expect(res.text).toContain("OUTCOME UNKNOWN");
+      vi.restoreAllMocks();
+    }
   });
 
   it("reports an HA error body as a failure (not a phantom success)", async () => {
