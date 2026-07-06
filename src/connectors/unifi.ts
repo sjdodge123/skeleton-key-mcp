@@ -68,6 +68,19 @@ const FEATURE_SPECS: Record<string, { key: string; fields?: string[]; path?: [st
 
 export const GATEWAY_FEATURES = Object.keys(FEATURE_SPECS) as [string, ...string[]];
 
+/** Human label for a feature (e.g. "hardware offload"), for the approval prompt. */
+export function featureLabel(feature: string): string {
+  return FEATURE_SPECS[feature]?.label ?? feature;
+}
+
+/** The exact setting fields a feature toggles, as `key.field` (or
+ *  `key.parent.child`), so the execute confirmation names precisely what changes. */
+export function featureFields(feature: string): string[] {
+  const spec = FEATURE_SPECS[feature];
+  if (!spec) return [];
+  return spec.path ? [`${spec.key}.${spec.path.join(".")}`] : (spec.fields ?? []).map((f) => `${spec.key}.${f}`);
+}
+
 /** Best-effort redaction of secret-looking fields in a raw JSON *string* (server
  *  error bodies we can't reliably parse). Prefer redactSecrets for structured
  *  data — this regex can be defeated by an escaped quote inside a value, so it's
@@ -363,21 +376,38 @@ class UniFi {
   async setGatewayFeature(feature: string, enabled: boolean): Promise<string> {
     const spec = FEATURE_SPECS[feature];
     if (!spec) throw new Error(`Unknown gateway feature '${feature}'.`);
-    const groups = await this.getData<Record<string, unknown> & { key?: string; _id?: string }>("/rest/setting");
-    const grp = groups.find((g) => g.key === spec.key);
+    const grp = (await this.getData<Record<string, unknown> & { key?: string; _id?: string }>("/rest/setting")).find(
+      (g) => g.key === spec.key,
+    );
     if (!grp?._id) throw new Error(`UniFi has no '${spec.key}' setting group, so ${spec.label} can't be toggled on this gateway.`);
+
     const updated: Record<string, unknown> = { ...grp };
     let prev: unknown;
     if (spec.path) {
       const [parentKey, childKey] = spec.path;
-      const parent = { ...((grp[parentKey] as Record<string, unknown>) ?? {}) };
-      prev = parent[childKey];
-      parent[childKey] = enabled;
-      updated[parentKey] = parent;
+      const parent = grp[parentKey];
+      // Fail closed on schema drift: only flip an EXISTING boolean inside an
+      // existing plain object. Forcing the field onto a missing/array/scalar
+      // parent would write a setting shape the controller never had.
+      if (!parent || typeof parent !== "object" || Array.isArray(parent) || typeof (parent as Record<string, unknown>)[childKey] !== "boolean") {
+        throw new Error(`UniFi ${spec.label} isn't in the expected shape (${spec.key}.${parentKey}.${childKey}) on this gateway; refusing to write.`);
+      }
+      prev = (parent as Record<string, unknown>)[childKey];
+      updated[parentKey] = { ...(parent as Record<string, unknown>), [childKey]: enabled };
     } else {
       prev = grp[spec.fields![0]!];
       for (const f of spec.fields!) updated[f] = enabled;
     }
+
+    // Optimistic-concurrency guard: UniFi only supports a full-group PUT, so a
+    // sibling changed between our read and write would be silently rolled back —
+    // and this group can hold sensitive RADIUS/portal/SSH fields. Re-read and
+    // abort if the group drifted since we snapshotted it, rather than clobber.
+    const fresh = (await this.getData<Record<string, unknown> & { _id?: string }>("/rest/setting")).find((g) => g._id === grp._id);
+    if (!fresh || JSON.stringify(fresh) !== JSON.stringify(grp)) {
+      throw new Error(`UniFi '${spec.key}' settings changed under us (concurrent edit); aborted to avoid clobbering other fields — retry.`);
+    }
+
     const path = `/rest/setting/${spec.key}/${grp._id}`;
     const res = await this.api(path, { method: "PUT", body: updated });
     this.ensureOk(res, path);
@@ -465,7 +495,7 @@ function buildTools(target: Target): ConnectorTool[] {
       }),
       confirm: (input, t) => {
         const i = input as { feature: string; enabled: boolean };
-        return `${i.enabled ? "Enable" : "Disable"} UniFi ${i.feature} on ${t.name}`;
+        return `${i.enabled ? "Enable" : "Disable"} UniFi ${featureLabel(i.feature)} (${featureFields(i.feature).join(", ")}) on ${t.name}`;
       },
       run: run((u, i) => u.setGatewayFeature(i.feature, i.enabled)),
     },
