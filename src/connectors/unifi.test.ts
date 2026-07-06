@@ -229,12 +229,41 @@ describe("auth selection", () => {
 });
 
 describe("set_gateway_feature (surgical toggle)", () => {
-  function mock(settings: unknown[], putKey: string, putId: string, putReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
-    return mockFetch([
-      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
-      { match: (u, i) => u.includes("/rest/setting") && (i?.method ?? "GET") === "GET", reply: { json: { data: settings } } },
-      { match: (u, i) => u.includes(`/rest/setting/${putKey}/${putId}`) && i?.method === "PUT", reply: putReply },
-    ]);
+  // Stateful mock: a successful PUT updates the in-memory settings so a
+  // subsequent GET (the post-write verification read) reflects it.
+  function mock(settings: any[], putKey: string, putId: string, putReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
+    const state: any[] = settings.map((s) => ({ ...s }));
+    const calls: { url: string; init: any }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let status = 200;
+        let json: unknown = {};
+        if (url.includes("/self")) {
+          json = { data: [{}] };
+        } else if (url.includes(`/rest/setting/${putKey}/${putId}`) && method === "PUT") {
+          status = putReply.status ?? 200;
+          json = putReply.json ?? {};
+          const rc = (json as { meta?: { rc?: string } })?.meta?.rc;
+          if (status >= 200 && status < 300 && rc !== "error") {
+            const idx = state.findIndex((s) => s._id === putId);
+            if (idx >= 0) state[idx] = JSON.parse(init.body);
+          }
+        } else if (url.includes("/rest/setting") && method === "GET") {
+          json = { data: state };
+        }
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          statusText: "",
+          headers: { get: () => null, getSetCookie: () => [] },
+          text: async () => JSON.stringify(json),
+        } as any;
+      }),
+    );
+    return calls;
   }
 
   it("disables DPI by flipping the top-level enabled field", async () => {
@@ -331,12 +360,33 @@ describe("set_gateway_feature (surgical toggle)", () => {
     expect(calls.some((c) => (c.init?.method ?? "GET") === "PUT")).toBe(false); // never wrote
   });
 
-  it("execute confirmation names the feature label and the exact fields", () => {
+  it("execute confirmation names the exact fields and warns about the full-group rewrite", () => {
     const c = tool("set_gateway_feature").confirm!;
-    expect(c({ feature: "offload", enabled: false }, target())).toBe(
-      "Disable UniFi hardware offload (usg.offload_sch, usg.offload_accounting, usg.offload_l2_blocking) on unifi",
+    const offload = c({ feature: "offload", enabled: false }, target());
+    expect(offload).toContain("Disable UniFi hardware offload (usg.offload_sch, usg.offload_accounting, usg.offload_l2_blocking) on unifi");
+    expect(offload).toContain("rewrites the whole settings group");
+    expect(c({ feature: "geoip", enabled: true }, target())).toContain("Enable UniFi GeoIP country firewall (usg_geo.ip_filtering.enabled) on unifi");
+  });
+
+  it("errors if the change doesn't hold after the write (post-write revert detected)", async () => {
+    // GET always reports enabled:true (a concurrent writer keeps reverting), yet PUT 'succeeds'.
+    const calls: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (url.includes("/rest/setting") && method === "GET") json = { data: [{ key: "dpi", _id: "d1", enabled: true }] };
+        else if (method === "PUT") json = { meta: { rc: "ok" } };
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
     );
-    expect(c({ feature: "geoip", enabled: true }, target())).toBe("Enable UniFi GeoIP country firewall (usg_geo.ip_filtering.enabled) on unifi");
+    const res = await tool("set_gateway_feature").run({ feature: "dpi", enabled: false }, ctx(cred({ fields: { api_key: "K" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("did not hold");
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(true); // it did attempt the write
   });
 });
 
