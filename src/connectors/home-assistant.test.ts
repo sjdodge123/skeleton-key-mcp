@@ -147,10 +147,15 @@ describe("pure helpers", () => {
     expect(isWebhookPath("/api/foo/%2e%2e/webhook/abc")).toBe(true); // single-encoded traversal
     expect(isWebhookPath("/api/foo/%252e%252e/webhook/abc")).toBe(true); // double-encoded traversal
     expect(isWebhookPath("/api/foo/%252e%252e/%77ebhook/abc")).toBe(true); // mixed double-encoded traversal + encoded 'w'
+    // Fail closed: an encoding deeper than the decode cap, or a malformed escape,
+    // still holds a '%' after canonicalization and must be denied (not fail open).
+    expect(isWebhookPath("/api/%25252525252577ebhook/abc")).toBe(true); // >6 encoding layers
+    expect(isWebhookPath("/api/%zzwebhook/abc")).toBe(true); // malformed escape leaves a '%'
     // Genuine reads and near-misses stay allowed.
     expect(isWebhookPath("/api/config")).toBe(false);
     expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
     expect(isWebhookPath("/api/webhookfoo")).toBe(false); // not the webhook endpoint
+    expect(isWebhookPath("/api/history/period/2026-07-06T00:00:00")).toBe(false); // colons are fine, no residual %
   });
 
   it("summarizeLogbook renders when/who/what and caps output", () => {
@@ -455,6 +460,30 @@ describe("request bounds", () => {
       const res = await p;
       expect(res.isError).toBe(true);
       expect(res.text).toContain("timed out");
+      expect(res.text).not.toContain("OUTCOME UNKNOWN"); // a GET timeout is a clean no-op
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a POST (service call) timeout is flagged as ambiguous — verify before retry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (_url: string, init: any) =>
+            new Promise((_resolve, reject) => {
+              init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+            }),
+        ),
+      );
+      const p = tool("ha_call_service").run({ domain: "homeassistant", service: "restart" }, ctx(cred({ secret: "TKN" })));
+      await vi.advanceTimersByTimeAsync(21_000);
+      const res = await p;
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("OUTCOME UNKNOWN");
+      expect(res.text).toContain("Verify state before retrying");
     } finally {
       vi.useRealTimers();
     }

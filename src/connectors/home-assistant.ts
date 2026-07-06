@@ -190,12 +190,18 @@ function canonicalizePath(path: string): string {
   return p.replace(/^\/+/, "");
 }
 
-/** True if a path targets an HA webhook (/api/webhook/<id>). Webhooks are the one
- *  documented GET-with-side-effects surface (they can fire automations), so the
- *  read-only ha_get refuses them. Canonicalizes first so percent-encoded or
- *  dot-segment variants can't slip past. Exported for testing. */
+/** True if a path is unsafe for the read-only ha_get: it targets an HA webhook
+ *  (/api/webhook/<id>) — the one documented GET-with-side-effects surface (can
+ *  fire automations) — OR it can't be fully canonicalized. Canonicalizes first so
+ *  percent-encoded / dot-segment variants can't slip past, then FAILS CLOSED: a
+ *  path that still holds a percent-escape after the decode cap (a >6-layer
+ *  encoding like `%2525…77ebhook`, or a malformed escape) is treated as unsafe,
+ *  because another decode by HA/a proxy could still form `webhook`, `/`, or a dot
+ *  segment. Exported for testing. */
 export function isWebhookPath(path: string): boolean {
-  return /(^|\/)api\/webhook(\/|$)/i.test(canonicalizePath(path));
+  const canon = canonicalizePath(path);
+  if (canon.includes("%")) return true; // residual encoding we couldn't resolve — deny
+  return /(^|\/)api\/webhook(\/|$)/i.test(canon);
 }
 
 /** Zod for a service-data dict: a real object in the JSON schema (so the client
@@ -367,7 +373,15 @@ class HomeAssistant {
       return { ok: res.ok, status: res.status, statusText: res.statusText, json, text, truncated };
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") {
-        throw new Error(`Home Assistant request timed out after ${REQUEST_TIMEOUT_MS}ms (${method} ${path}).`);
+        // A GET timeout is a clean no-op. A non-GET timeout is AMBIGUOUS: HA may
+        // have already accepted and applied the request before the response
+        // completed, so a blind retry could repeat a non-idempotent action
+        // (backup, restart, update.install, unlock). Say so explicitly.
+        const idempotent = method === "GET" || method === "HEAD";
+        const suffix = idempotent
+          ? ""
+          : " — OUTCOME UNKNOWN: Home Assistant may have already applied this request. Verify state before retrying (the action may not be idempotent).";
+        throw new Error(`Home Assistant request timed out after ${REQUEST_TIMEOUT_MS}ms (${method} ${path}).${suffix}`);
       }
       throw e;
     } finally {
@@ -383,7 +397,7 @@ class HomeAssistant {
   async getRaw(path: string): Promise<ToolResult> {
     if (isWebhookPath(path)) {
       return {
-        text: "Refused: /api/webhook paths can trigger automations, so they are not allowed from the read-only ha_get. Use ha_call_service (execute) for actions.",
+        text: "Refused: this path is an /api/webhook endpoint (can fire automations) or could not be safely canonicalized, so it's not allowed from the read-only ha_get. Use ha_call_service (execute) for actions.",
         isError: true,
       };
     }
