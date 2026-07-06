@@ -28,8 +28,12 @@ const optionsSchema = z
     baseUrl: z.string().url().optional(),
     /** Default node for node-scoped reads (e.g. list_tasks) when none is given. */
     node: z.string().optional(),
-    /** Skip TLS verification for THIS target only — PVE ships a self-signed cert
-     *  and this is LAN-only, so default on. Per-request via an undici dispatcher. */
+    /** Skip TLS verification for THIS target only. Proxmox ships a self-signed
+     *  cert on :8006, so this defaults ON for out-of-the-box use — consistent with
+     *  the UniFi connector (another LAN self-signed appliance). Set it to `false`
+     *  if your PVE presents a CA-signed cert. Scoped per-request via an undici
+     *  dispatcher, never process-global. (LAN-plaintext exposure overall is a
+     *  tracked project-wide item — see the "LAN TLS" gap in docs/STATUS.md.) */
     insecureTLS: z.boolean().default(true),
   })
   .default({});
@@ -324,8 +328,18 @@ class Proxmox {
     return text.trim() ? text.slice(0, 16_000) : "(no task output)";
   }
 
-  async guestPower(vmid: number, action: GuestAction): Promise<ToolResult> {
+  async guestPower(vmid: number, expectedName: string, action: GuestAction): Promise<ToolResult> {
     const { node, type, name } = await this.findGuest(vmid);
+    // Safety gate for a destructive op: the approval named a specific guest, so
+    // confirm the LIVE guest at this vmid still matches it before acting. Catches a
+    // stale vmid (reused/renamed guest) — refuse rather than power-cycle the wrong
+    // workload.
+    if (name.trim().toLowerCase() !== expectedName.trim().toLowerCase()) {
+      return {
+        text: `Refused: vmid ${vmid} is currently '${name}', not '${expectedName}' — aborted to avoid acting on the wrong guest (stale vmid?). Re-check with list_guests.`,
+        isError: true,
+      };
+    }
     const path = `/nodes/${encodeURIComponent(node)}/${type}/${vmid}/status/${action}`;
     const res = await this.request("POST", path);
     if (!res.ok) {
@@ -420,18 +434,21 @@ function buildTools(target: Target): ConnectorTool[] {
       name: "guest_power",
       description:
         `Change a VM or container's power state on ${target.name}: 'start', 'shutdown' (graceful ACPI/CT shutdown), ` +
-        `'reboot', or 'stop' (HARD stop — pulls the virtual power, may lose unsaved data). Identify the guest by vmid (see list_guests).`,
+        `'reboot', or 'stop' (HARD stop — pulls the virtual power, may lose unsaved data). Identify the guest by vmid AND its ` +
+        `name (both from list_guests); the name is shown in the approval prompt and re-verified against the live guest before ` +
+        `acting, so a stale vmid can't power-cycle the wrong workload.`,
       tier: "execute",
       inputSchema: z.object({
         vmid: z.number().int().positive().describe("The guest's vmid (see list_guests)."),
+        name: z.string().min(1).describe("The guest's name (from list_guests) — shown in the approval and verified before acting."),
         action: z.enum(GUEST_ACTIONS).describe("start | shutdown | reboot | stop (stop is a hard power-off)."),
       }),
       confirm: (input, t) => {
-        const i = input as { vmid: number; action: GuestAction };
+        const i = input as { vmid: number; name: string; action: GuestAction };
         const hard = i.action === "stop" ? " — HARD stop (pulls power; use 'shutdown' for graceful)" : "";
-        return `Proxmox: ${i.action} guest ${i.vmid} on ${t.name}${hard}`;
+        return `Proxmox: ${i.action} guest ${i.vmid} "${i.name}" on ${t.name}${hard}`;
       },
-      run: runResult((p, i) => p.guestPower(i.vmid, i.action)),
+      run: runResult((p, i) => p.guestPower(i.vmid, i.name, i.action)),
     },
   ];
 }
