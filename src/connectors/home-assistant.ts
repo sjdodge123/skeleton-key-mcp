@@ -159,35 +159,40 @@ export function renderServiceData(data: unknown): string {
   return `{${parts.join(",")}${remainder}}`;
 }
 
-/** Canonicalize a request path for security matching. Each round (a) resolves
- *  dot-segments + drops the query/fragment via the URL parser, then (b) does ONE
- *  percent-decode. The two INTERLEAVE and repeat to a fixed point: a `..` that is
- *  only revealed by decoding (e.g. `%252e%252e` → `%2e%2e` → `..`) is collapsed by
- *  the next normalization pass, so single-, double-, and mixed-encoded traversal
- *  (`/api/foo/%252e%252e/webhook/x`), `%77ebhook`, and `/api/webhook%2Fx` all
- *  reduce to the same canonical form a naive guard would miss. Bounded so an
- *  oscillating input (space ⇄ %20) can't loop forever. */
+/** Canonicalize a request path for security matching, WITHOUT the URL parser —
+ *  `new URL("//api/webhook", base)` would treat `api` as the authority (host) and
+ *  drop it, so `//api/webhook/x` and `/%2fapi/webhook/x` would evade the guard.
+ *  Instead: (1) percent-decode to a fixed point (bounded — a malformed escape
+ *  stops the loop and leaves a `%` the caller fails closed on) so encoded slashes,
+ *  dots, and letters become literal; (2) drop any query/fragment; (3) normalize as
+ *  PURE PATH DATA — split on `/`, drop empty segments (collapsing `//`, leading,
+ *  and trailing slashes) and `.`, and pop on `..`. So `//api/webhook/x`,
+ *  `/api//webhook/x`, `/%2fapi/webhook/x`, `/api/%77ebhook/x`,
+ *  `/api/foo/%252e%252e/webhook/x`, and `/api/webhook%2Fx` all reduce to the same
+ *  `api/webhook/x` form. */
 function canonicalizePath(path: string): string {
   let p = path;
-  for (let i = 0; i < 6; i++) {
-    let next = p;
+  for (let i = 0; i < 8; i++) {
+    let decoded: string;
     try {
-      // WHATWG URL treats `%2e`/`%2E` as dot segments, so this resolves both
-      // literal and single-encoded `..`; the decode pass below feeds it the
-      // deeper-encoded forms one layer at a time.
-      next = new URL(next, "http://ha.invalid").pathname;
+      decoded = decodeURIComponent(p);
     } catch {
-      /* not URL-parseable as-is; keep `next` */
+      break; // malformed %-escape; leave the residual `%` for the fail-closed check
     }
-    try {
-      next = decodeURIComponent(next);
-    } catch {
-      /* malformed %-escape; keep `next` */
-    }
-    if (next === p) break; // fixed point reached
-    p = next;
+    if (decoded === p) break; // fully decoded
+    p = decoded;
   }
-  return p.replace(/^\/+/, "");
+  p = p.split(/[?#]/)[0] ?? p; // routing ignores query/fragment
+  const out: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue; // collapse //, leading/trailing /, and .
+    if (seg === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  return out.join("/");
 }
 
 /** True if a path is unsafe for the read-only ha_get: it targets an HA webhook

@@ -149,8 +149,12 @@ describe("pure helpers", () => {
     expect(isWebhookPath("/api/foo/%252e%252e/%77ebhook/abc")).toBe(true); // mixed double-encoded traversal + encoded 'w'
     // Fail closed: an encoding deeper than the decode cap, or a malformed escape,
     // still holds a '%' after canonicalization and must be denied (not fail open).
-    expect(isWebhookPath("/api/%25252525252577ebhook/abc")).toBe(true); // >6 encoding layers
+    expect(isWebhookPath("/api/%25252525252577ebhook/abc")).toBe(true); // deeply-nested encoding
     expect(isWebhookPath("/api/%zzwebhook/abc")).toBe(true); // malformed escape leaves a '%'
+    // Slash tricks that a URL-authority parse would drop 'api' from.
+    expect(isWebhookPath("//api/webhook/abc")).toBe(true); // protocol-relative-looking
+    expect(isWebhookPath("/api//webhook/abc")).toBe(true); // doubled internal slash
+    expect(isWebhookPath("/%2fapi/webhook/abc")).toBe(true); // encoded leading slash
     // Genuine reads and near-misses stay allowed.
     expect(isWebhookPath("/api/config")).toBe(false);
     expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
