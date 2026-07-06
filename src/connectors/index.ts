@@ -4,6 +4,7 @@ import { httpConnector } from "./http.js";
 import { portainerConnector } from "./portainer.js";
 import { unifiConnector } from "./unifi.js";
 import { homeAssistantConnector } from "./home-assistant.js";
+import { proxmoxConnector } from "./proxmox.js";
 
 /**
  * Registry of available connector *types*. Adding support for a new service
@@ -53,3 +54,4 @@ registerConnector(homeAssistantConnector);
 // but accept the no-hyphen `homeassistant` a human might type in register_target
 // too — both resolve to the same connector.
 connectors.set("homeassistant", homeAssistantConnector);
+registerConnector(proxmoxConnector);
