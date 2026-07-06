@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
-import { deriveBaseUrl, tlsFetch } from "./net.js";
+import { tlsFetch } from "./net.js";
 
 /**
  * Proxmox VE connector — inspect a PVE node/cluster and control guest (VM / LXC)
@@ -44,8 +44,24 @@ function options(target: Target): Options {
   return optionsSchema.parse(target.options ?? {});
 }
 
+/**
+ * The PVE base URL — always HTTPS. This connector sends credentials (API token or
+ * a username/password ticket), so plaintext HTTP is refused outright (fail closed):
+ * a naked `deriveBaseUrl` would emit `http://host` when the port is omitted or the
+ * port isn't a known-https one. An explicit `baseUrl` option must be `https://`;
+ * otherwise the scheme is forced https and an omitted port defaults to PVE's 8006.
+ */
 export function baseUrl(target: Target): string {
-  return deriveBaseUrl(target, { baseUrl: options(target).baseUrl, httpsPorts: [8006, 443] });
+  const opt = options(target).baseUrl;
+  if (opt) {
+    if (!/^https:\/\//i.test(opt)) {
+      throw new Error("Proxmox baseUrl must be https:// — this connector sends credentials, so plaintext HTTP is refused.");
+    }
+    return opt.replace(/\/$/, "");
+  }
+  // Bracket IPv6 literals so host:port is a valid URL.
+  const host = target.host.includes(":") && !target.host.startsWith("[") ? `[${target.host}]` : target.host;
+  return `https://${host}:${target.port ?? 8006}`;
 }
 
 /** The full `PVEAPIToken` value (`<user@realm!tokenid>=<secret>`) from the

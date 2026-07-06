@@ -38,10 +38,14 @@ function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: 
 afterEach(() => vi.restoreAllMocks());
 
 describe("pure helpers", () => {
-  it("baseUrl picks https on 8006/443", () => {
+  it("baseUrl always uses HTTPS, defaults an omitted port to 8006, and refuses http://", () => {
     expect(baseUrl(target({}, 8006))).toBe("https://10.0.0.9:8006");
     expect(baseUrl(target({}, 443))).toBe("https://10.0.0.9:443");
     expect(baseUrl(target({ baseUrl: "https://pve.lan/" }, 8006))).toBe("https://pve.lan");
+    // Omitted port must NOT downgrade to plaintext http://host — it defaults to :8006.
+    expect(baseUrl({ ...target(), port: undefined })).toBe("https://10.0.0.9:8006");
+    // An http:// baseUrl for a credential-bearing connector is refused outright.
+    expect(() => baseUrl(target({ baseUrl: "http://pve.lan" }))).toThrow(/https/i);
   });
 
   it("insecureTLS defaults OFF (secure by default) but can be opted in", () => {
