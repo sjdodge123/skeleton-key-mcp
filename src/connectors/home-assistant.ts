@@ -164,12 +164,14 @@ export function renderServiceData(data: unknown): string {
  *  drop it, so `//api/webhook/x` and `/%2fapi/webhook/x` would evade the guard.
  *  Instead: (1) percent-decode to a fixed point (bounded — a malformed escape
  *  stops the loop and leaves a `%` the caller fails closed on) so encoded slashes,
- *  dots, and letters become literal; (2) drop any query/fragment; (3) normalize as
- *  PURE PATH DATA — split on `/`, drop empty segments (collapsing `//`, leading,
- *  and trailing slashes) and `.`, and pop on `..`. So `//api/webhook/x`,
- *  `/api//webhook/x`, `/%2fapi/webhook/x`, `/api/%77ebhook/x`,
- *  `/api/foo/%252e%252e/webhook/x`, and `/api/webhook%2Fx` all reduce to the same
- *  `api/webhook/x` form. */
+ *  dots, backslashes, and letters become literal; (2) drop any query/fragment;
+ *  (3) fold `\` to `/` — the WHATWG URL parser (what fetch uses for http URLs)
+ *  treats a backslash as a slash, so `\api\webhook\x` would route to the webhook
+ *  endpoint; (4) normalize as PURE PATH DATA — split on `/`, drop empty segments
+ *  (collapsing `//`, leading, and trailing slashes) and `.`, and pop on `..`. So
+ *  `//api/webhook/x`, `/api//webhook/x`, `/%2fapi/webhook/x`, `/api/%77ebhook/x`,
+ *  `\api\webhook\x`, `/api/%5Cwebhook/x`, `/api/foo/%252e%252e/webhook/x`, and
+ *  `/api/webhook%2Fx` all reduce to the same `api/webhook/x` form. */
 function canonicalizePath(path: string): string {
   let p = path;
   for (let i = 0; i < 8; i++) {
@@ -183,6 +185,7 @@ function canonicalizePath(path: string): string {
     p = decoded;
   }
   p = p.split(/[?#]/)[0] ?? p; // routing ignores query/fragment
+  p = p.replace(/\\/g, "/"); // fetch/HA treat a backslash as a path separator
   const out: string[] = [];
   for (const seg of p.split("/")) {
     if (seg === "" || seg === ".") continue; // collapse //, leading/trailing /, and .
