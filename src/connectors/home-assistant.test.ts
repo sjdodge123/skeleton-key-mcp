@@ -443,6 +443,29 @@ describe("structured reads fail loudly on truncated/malformed responses", () => 
     expect(res.isError).toBe(true);
     expect(res.text).toContain("not a JSON array");
   });
+
+  it("ha_call_service flags a 2xx NON-array response as ambiguous (write may have applied)", async () => {
+    // A 2xx proxy/login HTML page or response-shape drift — not the expected array.
+    mockFetch([{ match: (u, i) => u.includes("/api/services/homeassistant/restart") && i.method === "POST", reply: { text: "<html>logged out</html>" } }]);
+    const res = await tool("ha_call_service").run({ domain: "homeassistant", service: "restart" }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("OUTCOME UNKNOWN");
+    expect(res.text).not.toContain("OK (HTTP"); // not a clean success
+  });
+
+  it("ha_call_service flags a truncated 2xx response as ambiguous", async () => {
+    mockFetch([{ match: (u, i) => u.includes("/api/services/light/turn_on") && i.method === "POST", reply: { text: OVERSIZED } }]);
+    const res = await tool("ha_call_service").run({ domain: "light", service: "turn_on", data: { entity_id: "light.k" } }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("OUTCOME UNKNOWN");
+  });
+
+  it("ha_call_service still treats an empty array (2xx) as a clean success", async () => {
+    mockFetch([{ match: (u, i) => u.includes("/api/services/homeassistant/update_entity") && i.method === "POST", reply: { json: [] } }]);
+    const res = await tool("ha_call_service").run({ domain: "homeassistant", service: "update_entity", data: { entity_id: "sun.sun" } }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("OK (HTTP 200)");
+  });
 });
 
 describe("request bounds", () => {

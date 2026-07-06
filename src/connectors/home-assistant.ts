@@ -467,8 +467,18 @@ class HomeAssistant {
       const detail = res.text.trim() || res.statusText;
       return { text: `HA service ${domain}.${service} failed: HTTP ${res.status} ${res.statusText}\n${detail.slice(0, 4_000)}`, isError: true };
     }
-    // A service call returns the array of states it changed (often []).
-    const changed = Array.isArray(res.json) ? (res.json as HAState[]) : [];
+    // A service call returns the ARRAY of states it changed (often []). A 2xx that
+    // is truncated or NOT an array (a proxy/login HTML page, response-shape drift)
+    // must not be reported as a clean "OK / no change" — the write may have been
+    // applied, so flag it as ambiguous rather than hiding the uncertainty behind a
+    // success for a possibly non-idempotent service.
+    if (res.truncated) {
+      return { text: `HA service ${domain}.${service} returned HTTP ${res.status} but the response was too large to read fully — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying.`, isError: true };
+    }
+    if (!Array.isArray(res.json)) {
+      return { text: `HA service ${domain}.${service} returned HTTP ${res.status} with an unexpected (non-array) body — OUTCOME UNKNOWN: the call may already have been applied. Verify state before retrying. Body: ${res.text.slice(0, 500)}`, isError: true };
+    }
+    const changed = res.json as HAState[];
     const ids = changed.map((s) => s.entity_id).filter(Boolean);
     const summary = ids.length ? ` Changed ${ids.length}: ${ids.slice(0, 30).join(", ")}${ids.length > 30 ? " …" : ""}.` : " No state change reported.";
     return { text: `HA service ${domain}.${service} OK (HTTP ${res.status}).${summary}` };
