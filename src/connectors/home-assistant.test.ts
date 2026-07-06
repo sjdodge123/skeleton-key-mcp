@@ -108,6 +108,32 @@ describe("pure helpers", () => {
     expect(renderServiceData({})).toBe("");
   });
 
+  it("renderServiceData redacts separator-delimited secret keys (alarm_code, user_pin, …)", () => {
+    for (const key of ["alarm_code", "pin_code", "access_code", "user_pin", "otp", "passcode", "passphrase"]) {
+      const out = renderServiceData({ [key]: "SECRETVAL", entity_id: "lock.front" });
+      expect(out, key).not.toContain("SECRETVAL");
+      expect(out, key).toContain('"entity_id":"lock.front"');
+    }
+    // A benign 'code' near-miss is over-redacted (safe) but a plain field is not.
+    expect(renderServiceData({ color_name: "red" })).toBe('{"color_name":"red"}');
+  });
+
+  it("renderServiceData names every top-level key — a long value is marked, extras are listed, never silently dropped", () => {
+    const longVal = "x".repeat(500);
+    const oneBig = renderServiceData({ entity_id: "light.k", template: longVal });
+    expect(oneBig).toContain('"entity_id":"light.k"'); // first key intact
+    expect(oneBig).toContain('"template":'); // key present
+    expect(oneBig).toContain("…"); // its oversized value is visibly truncated
+    expect(oneBig).not.toContain(longVal); // not the whole 500-char value
+
+    // Many medium values that blow the total budget => remaining keys are named.
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 30; i++) many[`field_${i}`] = "y".repeat(80);
+    const rendered = renderServiceData(many);
+    expect(rendered).toMatch(/\+\d+ more: field_/); // explicitly names the overflow keys
+    expect(rendered.length).toBeLessThan(1200); // still bounded
+  });
+
   it("isWebhookPath flags webhook endpoints and their encoded/traversal variants", () => {
     expect(isWebhookPath("/api/webhook/abc123")).toBe(true);
     expect(isWebhookPath("api/webhook/abc123")).toBe(true);
@@ -362,5 +388,38 @@ describe("read tools", () => {
     const res = await tool("ha_states").run({ entity: "nope.nope" }, ctx(cred({ secret: "TKN" })));
     expect(res.isError).toBe(true);
     expect(res.text).toContain("HTTP 404");
+  });
+
+  it("ha_get bounds an oversized response and marks it truncated", async () => {
+    const huge = "z".repeat(300_000); // > the ha_get read cap (256 KB)
+    mockFetch([{ match: (u) => u.endsWith("/api/config"), reply: { text: huge } }]);
+    const res = await tool("ha_get").run({ path: "/api/config" }, ctx(cred({ secret: "TKN" })));
+    expect(res.text).toContain("(response truncated)");
+    expect(res.text.length).toBeLessThan(30_000); // output itself is capped at 20 KB
+  });
+});
+
+describe("request bounds", () => {
+  it("aborts a hung request after the timeout and reports it (no indefinite hang)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (_url: string, init: any) =>
+            new Promise((_resolve, reject) => {
+              // Never resolves on its own; only the AbortController (timeout) settles it.
+              init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+            }),
+        ),
+      );
+      const p = tool("ha_get").run({ path: "/api/config" }, ctx(cred({ secret: "TKN" })));
+      await vi.advanceTimersByTimeAsync(21_000); // past REQUEST_TIMEOUT_MS
+      const res = await p;
+      expect(res.isError).toBe(true);
+      expect(res.text).toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

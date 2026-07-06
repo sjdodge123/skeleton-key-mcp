@@ -80,10 +80,14 @@ export function normalizeServiceData(data: unknown): Record<string, unknown> {
 }
 
 /** Field-name fragments that mark a service-data value as sensitive (a backup
- *  password, an access token, a lock PIN, …). Redacted from the human approval
- *  prompt + audit detail so the confirmation names the payload without echoing a
- *  secret into the audit trail (audit args are hashed; the `detail` is not). */
-const SECRET_DATA_KEY = /pass(word|wd)?|token|secret|api[_-]?key|credential|private[_-]?key|\bpin\b|\bcode\b/i;
+ *  password, an access token, a lock PIN/code, …). Redacted from the human
+ *  approval prompt + audit detail so the confirmation names the payload without
+ *  echoing a secret into the audit trail (audit args are hashed; the `detail` is
+ *  not). `pin`/`code`/`otp` are matched on separators (`_`/`-`/start/end) rather
+ *  than `\b` — `_` is a regex word char, so `\bcode\b` would MISS `alarm_code`,
+ *  `user_pin`, `access_code`, `pin_code`. Over-redacting a benign `postal_code`
+ *  is an accepted, safe trade for never leaking a lock/alarm secret. */
+const SECRET_DATA_KEY = /pass(word|wd|phrase|code)?|token|secret|api[_-]?key|credential|private[_-]?key|(^|[_-])(pin|code|otp)([_-]|$)/i;
 
 /** Deep-copy `value`, masking any property whose KEY looks secret — at every
  *  nesting level, through arrays too. Service data can nest (e.g. notify `data`,
@@ -102,15 +106,24 @@ function redactDeep(value: unknown, depth = 0): unknown {
   return value;
 }
 
+/** Per-value and total budgets for the approval/audit rendering. Bounded so a
+ *  giant payload can't bloat the audit detail — but bounded *without hiding
+ *  fields*: every top-level key is named (see renderServiceData). */
+const CONFIRM_PER_VALUE = 160;
+const CONFIRM_TOTAL = 700;
+
 /**
- * Compact, secret-redacted, length-capped rendering of service data for the
- * approval prompt + audit detail, so a human approves the ACTUAL payload — not
- * just the service name (a generic execute tool could otherwise smuggle
- * destructive fields behind a vague "Call service …"). Redaction is recursive
- * (nested keys + arrays). Best-effort and non-throwing: an object is redacted; a
- * JSON string is parsed first; any other value is shown truncated. Exported for
- * testing. Key-based like the UniFi connector's redactSecrets — a secret placed
- * in a non-secret-named VALUE is out of scope (impractical to detect generally). */
+ * Deterministic, secret-redacted rendering of service data for the approval
+ * prompt + audit detail, so a human approves the ACTUAL payload — not just the
+ * service name (a generic execute tool could otherwise smuggle destructive fields
+ * behind a vague "Call service …"). Guarantees: redaction is recursive (nested
+ * keys + arrays); EVERY top-level key is accounted for — an individual oversized
+ * value is truncated with a visible `…`, and if the whole thing exceeds budget
+ * the remaining keys are listed by name (`+N more: …`) rather than silently
+ * dropped. Non-throwing: an object is rendered; a JSON string is parsed first;
+ * anything else is shown truncated. Exported for testing. Key-based like the
+ * UniFi connector's redactSecrets — a secret in a non-secret-NAMED value is out
+ * of scope (impractical to detect generally). */
 export function renderServiceData(data: unknown): string {
   let obj: Record<string, unknown> | undefined;
   if (data && typeof data === "object" && !Array.isArray(data)) {
@@ -119,14 +132,31 @@ export function renderServiceData(data: unknown): string {
     try {
       const parsed = JSON.parse(data);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) obj = parsed as Record<string, unknown>;
+      else return ""; // parsed to a non-object; the callService path renders nothing meaningful
     } catch {
-      return data.length > 200 ? `${data.slice(0, 199)}…` : data;
+      return data.length > CONFIRM_PER_VALUE ? `${data.slice(0, CONFIRM_PER_VALUE - 1)}…` : data;
     }
   }
   if (!obj) return "";
-  if (!Object.keys(obj).length) return "";
-  const json = JSON.stringify(redactDeep(obj));
-  return json.length > 300 ? `${json.slice(0, 299)}…` : json;
+  const redacted = redactDeep(obj) as Record<string, unknown>;
+  const keys = Object.keys(redacted);
+  if (!keys.length) return "";
+  const parts: string[] = [];
+  let used = 1; // opening brace
+  let i = 0;
+  for (; i < keys.length; i++) {
+    const k = keys[i]!;
+    let vstr = JSON.stringify(redacted[k]) ?? "null";
+    if (vstr.length > CONFIRM_PER_VALUE) vstr = `${vstr.slice(0, CONFIRM_PER_VALUE - 1)}…`;
+    const piece = `${JSON.stringify(k)}:${vstr}`;
+    // Always render at least the first key; stop before blowing the budget, but
+    // NAME whatever remains so no field is silently hidden from the approver.
+    if (parts.length > 0 && used + piece.length + 1 > CONFIRM_TOTAL) break;
+    parts.push(piece);
+    used += piece.length + 1;
+  }
+  const remainder = i < keys.length ? `${parts.length ? "," : ""}+${keys.length - i} more: ${keys.slice(i).join(", ")}` : "";
+  return `{${parts.join(",")}${remainder}}`;
 }
 
 /** Canonicalize a request path for security matching: resolve dot-segments +
@@ -232,6 +262,54 @@ export function summarizeLogbook(entries: LogbookEntry[]): string {
   return `${more}${lines.join("\n")}`;
 }
 
+/** Request bounds (see HomeAssistant.request). The timeout covers connect + body
+ *  read; the byte caps stop a slow/huge/streaming endpoint from buffering an
+ *  unbounded response. The default is generous enough for a large /api/states
+ *  dump; ha_get uses a tight cap since it only surfaces the first 20 KB anyway. */
+const REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_MAX_BYTES = 6_000_000;
+const RAW_GET_MAX_BYTES = 262_144;
+
+/** Read a fetch Response body up to `maxBytes`, stopping early (and reporting
+ *  `truncated`) rather than buffering an unbounded/streaming response — the cap
+ *  is enforced DURING the read, not after. Falls back to `res.text()` when the
+ *  body isn't a readable stream (e.g. a test stub). */
+async function readBounded(
+  res: { body?: ReadableStream<Uint8Array> | null; text(): Promise<string> },
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const body = res.body;
+  if (!body || typeof body.getReader !== "function") {
+    const text = await res.text();
+    return text.length > maxBytes ? { text: text.slice(0, maxBytes), truncated: true } : { text, truncated: false };
+  }
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength) {
+        chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+        total += value.byteLength;
+        if (total >= maxBytes) {
+          truncated = true;
+          break;
+        }
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed/aborted */
+    }
+  }
+  return { text: Buffer.concat(chunks).toString("utf8"), truncated };
+}
+
 /** HA REST client bound to one target. Holds no long-lived state; the token is
  *  read from the resolved credential per construction. */
 class HomeAssistant {
@@ -248,28 +326,49 @@ class HomeAssistant {
   }
 
   /** One REST call. `body`, when present, is JSON-encoded EXACTLY ONCE with
-   *  `Content-Type: application/json` — the whole point of this connector. */
+   *  `Content-Type: application/json` — the whole point of this connector. The
+   *  request is bounded two ways so an arbitrary path (ha_get) or a slow/huge
+   *  endpoint can't wedge or OOM the MCP call: an AbortController timeout covers
+   *  connect + body read, and the body is read through a streaming byte cap
+   *  (`maxBytes`) that stops early rather than buffering an unbounded response. */
   private async request(
     method: string,
     path: string,
-    body?: unknown,
-  ): Promise<{ ok: boolean; status: number; statusText: string; json?: unknown; text: string }> {
+    opts: { body?: unknown; maxBytes?: number } = {},
+  ): Promise<{ ok: boolean; status: number; statusText: string; json?: unknown; text: string; truncated: boolean }> {
     const token = tokenFrom(this.cred);
     if (!token) {
       throw new Error("Home Assistant target needs a long-lived token (store it as the item's secret/password, or a 'token' field).");
     }
     const headers: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${token}` };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     const url = `${this.base}${path.startsWith("/") ? path : `/${path}`}`;
-    const res = await tlsFetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined }, this.insecure);
-    const text = await res.text();
-    let json: unknown;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      json = text ? JSON.parse(text) : undefined;
-    } catch {
-      /* non-JSON body (e.g. an error page) */
+      const res = await tlsFetch(
+        url,
+        { method, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined, signal: controller.signal },
+        this.insecure,
+      );
+      const { text, truncated } = await readBounded(res, opts.maxBytes ?? DEFAULT_MAX_BYTES);
+      let json: unknown;
+      if (!truncated) {
+        try {
+          json = text ? JSON.parse(text) : undefined;
+        } catch {
+          /* non-JSON body (e.g. an error page) */
+        }
+      }
+      return { ok: res.ok, status: res.status, statusText: res.statusText, json, text, truncated };
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new Error(`Home Assistant request timed out after ${REQUEST_TIMEOUT_MS}ms (${method} ${path}).`);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    return { ok: res.ok, status: res.status, statusText: res.statusText, json, text };
   }
 
   /** Raw GET passthrough for endpoints without a dedicated tool (e.g.
@@ -284,8 +383,9 @@ class HomeAssistant {
         isError: true,
       };
     }
-    const res = await this.request("GET", path);
-    return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 20_000)}`, isError: !res.ok };
+    const res = await this.request("GET", path, { maxBytes: RAW_GET_MAX_BYTES });
+    const note = res.truncated ? "\n… (response truncated)" : "";
+    return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 20_000)}${note}`, isError: !res.ok };
   }
 
   async states(entity?: string, filter?: string): Promise<ToolResult> {
@@ -322,7 +422,7 @@ class HomeAssistant {
    *  connector got wrong. Returns a short summary of the entities HA changed. */
   async callService(domain: string, service: string, data?: unknown): Promise<ToolResult> {
     const body = normalizeServiceData(data);
-    const res = await this.request("POST", `/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, body);
+    const res = await this.request("POST", `/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, { body });
     if (!res.ok) {
       const detail = res.text.trim() || res.statusText;
       return { text: `HA service ${domain}.${service} failed: HTTP ${res.status} ${res.statusText}\n${detail.slice(0, 4_000)}`, isError: true };
