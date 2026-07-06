@@ -117,7 +117,10 @@ function redactDeep(value: unknown, depth = 0): unknown {
  *  giant payload can't bloat the audit detail — but bounded *without hiding
  *  fields*: every top-level key is named (see renderServiceData). */
 const CONFIRM_PER_VALUE = 160;
+const CONFIRM_PER_KEY = 80;
 const CONFIRM_TOTAL = 700;
+const CONFIRM_REMAINDER = 200; // cap on the "+N more: <names>" overflow list
+const CONFIRM_HARD_MAX = 1000; // absolute backstop on the whole rendering
 
 /**
  * Deterministic, secret-redacted rendering of service data for the approval
@@ -152,18 +155,39 @@ export function renderServiceData(data: unknown): string {
   let used = 1; // opening brace
   let i = 0;
   for (; i < keys.length; i++) {
-    const k = keys[i]!;
-    let vstr = JSON.stringify(redacted[k]) ?? "null";
+    // Bound BOTH the key and the value so a single huge key name can't blow the
+    // budget — a malicious payload must not be able to inflate the audit detail.
+    let kstr = JSON.stringify(keys[i]!);
+    if (kstr.length > CONFIRM_PER_KEY) kstr = `${kstr.slice(0, CONFIRM_PER_KEY - 1)}…`;
+    let vstr = JSON.stringify(redacted[keys[i]!]) ?? "null";
     if (vstr.length > CONFIRM_PER_VALUE) vstr = `${vstr.slice(0, CONFIRM_PER_VALUE - 1)}…`;
-    const piece = `${JSON.stringify(k)}:${vstr}`;
+    const piece = `${kstr}:${vstr}`;
     // Always render at least the first key; stop before blowing the budget, but
     // NAME whatever remains so no field is silently hidden from the approver.
     if (parts.length > 0 && used + piece.length + 1 > CONFIRM_TOTAL) break;
     parts.push(piece);
     used += piece.length + 1;
   }
-  const remainder = i < keys.length ? `${parts.length ? "," : ""}+${keys.length - i} more: ${keys.slice(i).join(", ")}` : "";
-  return `{${parts.join(",")}${remainder}}`;
+  let remainder = "";
+  if (i < keys.length) {
+    // The overflow key-name list is itself bounded (per-name and in total) so it
+    // can't grow unboundedly with thousands of keys.
+    const names: string[] = [];
+    let namesLen = 0;
+    let shown = 0;
+    for (; i + shown < keys.length; shown++) {
+      const k = keys[i + shown]!;
+      const nm = k.length > 40 ? `${k.slice(0, 39)}…` : k;
+      if (names.length && namesLen + nm.length + 2 > CONFIRM_REMAINDER) break;
+      names.push(nm);
+      namesLen += nm.length + 2;
+    }
+    const unlisted = keys.length - i - names.length;
+    remainder = `${parts.length ? "," : ""}+${keys.length - i} more: ${names.join(", ")}${unlisted > 0 ? `, …(+${unlisted})` : ""}`;
+  }
+  const out = `{${parts.join(",")}${remainder}}`;
+  // Absolute backstop — the composed string can never exceed this hard cap.
+  return out.length > CONFIRM_HARD_MAX ? `${out.slice(0, CONFIRM_HARD_MAX - 1)}…` : out;
 }
 
 /** Canonicalize a request path for security matching, WITHOUT the URL parser —
