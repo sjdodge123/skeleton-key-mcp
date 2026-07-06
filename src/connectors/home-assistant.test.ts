@@ -7,7 +7,7 @@ import {
   tokenFrom,
   normalizeServiceData,
   renderServiceData,
-  isWebhookPath,
+  isAllowedReadPath,
   summarizeStates,
   summarizeLogbook,
   serviceData,
@@ -134,36 +134,50 @@ describe("pure helpers", () => {
     expect(rendered.length).toBeLessThan(1200); // still bounded
   });
 
-  it("isWebhookPath flags webhook endpoints and their encoded/traversal variants", () => {
-    expect(isWebhookPath("/api/webhook/abc123")).toBe(true);
-    expect(isWebhookPath("api/webhook/abc123")).toBe(true);
-    expect(isWebhookPath("/API/Webhook/abc")).toBe(true);
-    // Encoded-bypass attempts must still be caught (HA canonicalizes before routing).
-    expect(isWebhookPath("/api/%77ebhook/abc")).toBe(true); // %77 = 'w'
-    expect(isWebhookPath("/api/web%68ook/abc")).toBe(true); // %68 = 'h'
-    expect(isWebhookPath("/api/%2577ebhook/abc")).toBe(true); // double-encoded %25 -> % -> %77 -> w
-    expect(isWebhookPath("/api/webhook%2Fabc")).toBe(true); // %2F = '/'
-    expect(isWebhookPath("/api/foo/../webhook/abc")).toBe(true); // dot-segment traversal
-    expect(isWebhookPath("/api/foo/%2e%2e/webhook/abc")).toBe(true); // single-encoded traversal
-    expect(isWebhookPath("/api/foo/%252e%252e/webhook/abc")).toBe(true); // double-encoded traversal
-    expect(isWebhookPath("/api/foo/%252e%252e/%77ebhook/abc")).toBe(true); // mixed double-encoded traversal + encoded 'w'
-    // Fail closed: an encoding deeper than the decode cap, or a malformed escape,
-    // still holds a '%' after canonicalization and must be denied (not fail open).
-    expect(isWebhookPath("/api/%25252525252577ebhook/abc")).toBe(true); // deeply-nested encoding
-    expect(isWebhookPath("/api/%zzwebhook/abc")).toBe(true); // malformed escape leaves a '%'
-    // Slash tricks that a URL-authority parse would drop 'api' from.
-    expect(isWebhookPath("//api/webhook/abc")).toBe(true); // protocol-relative-looking
-    expect(isWebhookPath("/api//webhook/abc")).toBe(true); // doubled internal slash
-    expect(isWebhookPath("/%2fapi/webhook/abc")).toBe(true); // encoded leading slash
-    // Backslashes: fetch/HA fold '\' to '/', so they must be treated as separators.
-    expect(isWebhookPath("\\api\\webhook\\abc")).toBe(true);
-    expect(isWebhookPath("/api\\webhook/abc")).toBe(true);
-    expect(isWebhookPath("/api/%5Cwebhook/abc")).toBe(true); // encoded backslash
-    // Genuine reads and near-misses stay allowed.
-    expect(isWebhookPath("/api/config")).toBe(false);
-    expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere is fine
-    expect(isWebhookPath("/api/webhookfoo")).toBe(false); // not the webhook endpoint
-    expect(isWebhookPath("/api/history/period/2026-07-06T00:00:00")).toBe(false); // colons are fine, no residual %
+  it("isAllowedReadPath permits known side-effect-free read endpoints", () => {
+    expect(isAllowedReadPath("/api/")).toBe(true); // health check → canon 'api'
+    expect(isAllowedReadPath("/api/config")).toBe(true);
+    expect(isAllowedReadPath("/api/states")).toBe(true);
+    expect(isAllowedReadPath("/api/states/sun.sun")).toBe(true);
+    expect(isAllowedReadPath("/api/history/period/2026-07-06T00:00:00")).toBe(true);
+    expect(isAllowedReadPath("/api/logbook/2026-07-06T00:00:00")).toBe(true);
+    expect(isAllowedReadPath("/api/calendars")).toBe(true);
+    expect(isAllowedReadPath("/api/camera_proxy/camera.front")).toBe(true);
+    expect(isAllowedReadPath("api/config")).toBe(true); // no leading slash
+    expect(isAllowedReadPath("/api/%63onfig")).toBe(true); // %63='c' decodes to /api/config
+  });
+
+  it("isAllowedReadPath refuses webhooks (every encoding) and anything off the allowlist — fails closed", () => {
+    // The one GET-with-side-effects surface, in every obfuscation, is NOT on the
+    // allowlist, so it's refused. (No denylist to outsmart — it's simply absent.)
+    for (const p of [
+      "/api/webhook/abc",
+      "api/webhook/abc",
+      "/API/Webhook/abc",
+      "/api/%77ebhook/abc", // %77='w'
+      "/api/web%68ook/abc", // %68='h'
+      "/api/%2577ebhook/abc", // double-encoded
+      "/api/webhook%2Fabc", // %2F='/'
+      "/api/foo/../webhook/abc", // traversal
+      "/api/foo/%252e%252e/webhook/abc", // double-encoded traversal
+      "/api/%25252525252577ebhook/abc", // deep encoding (residual % → not allowlisted)
+      "/api/%zzwebhook/abc", // malformed escape
+      "//api/webhook/abc", // protocol-relative-looking
+      "/api//webhook/abc", // doubled slash
+      "/%2fapi/webhook/abc", // encoded leading slash
+      "\\api\\webhook\\abc", // backslashes
+      "/api\\webhook/abc",
+      "/api/%5Cwebhook/abc", // encoded backslash
+      "/api/web\thook/abc", // tab (WHATWG URL strips it → would route to webhook)
+      "/api/template", // POST-only endpoint, not a read → refused
+      "/local/foo", // outside /api entirely
+      "/", // empty
+    ]) {
+      expect(isAllowedReadPath(p), p).toBe(false);
+    }
+    // Near-misses that ARE legitimate reads stay allowed.
+    expect(isAllowedReadPath("/api/states/webhook.sensor")).toBe(true); // an entity that happens to be named 'webhook'
+    expect(isAllowedReadPath("/api/events")).toBe(true); // GET lists event listeners
   });
 
   it("summarizeLogbook renders when/who/what and caps output", () => {
