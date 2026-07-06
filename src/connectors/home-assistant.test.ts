@@ -6,6 +6,8 @@ import {
   baseUrl,
   tokenFrom,
   normalizeServiceData,
+  renderServiceData,
+  isWebhookPath,
   summarizeStates,
   summarizeLogbook,
   serviceData,
@@ -92,6 +94,24 @@ describe("pure helpers", () => {
     expect(summarizeStates(states as any, "nope")).toContain("No entities match 'nope'");
   });
 
+  it("renderServiceData redacts secrets, keeps other fields, and tolerates junk", () => {
+    expect(renderServiceData({ entity_id: "light.k", brightness: 128 })).toBe('{"entity_id":"light.k","brightness":128}');
+    expect(renderServiceData({ password: "hunter2", name: "x" })).toBe('{"password":"[redacted]","name":"x"}');
+    expect(renderServiceData({ pin: "1234", api_key: "k" })).toBe('{"pin":"[redacted]","api_key":"[redacted]"}');
+    expect(renderServiceData('{"entity_id":"light.k"}')).toBe('{"entity_id":"light.k"}'); // parses a JSON string
+    expect(renderServiceData(undefined)).toBe("");
+    expect(renderServiceData({})).toBe("");
+  });
+
+  it("isWebhookPath flags webhook endpoints regardless of leading slash/case", () => {
+    expect(isWebhookPath("/api/webhook/abc123")).toBe(true);
+    expect(isWebhookPath("api/webhook/abc123")).toBe(true);
+    expect(isWebhookPath("/API/Webhook/abc")).toBe(true);
+    expect(isWebhookPath("/api/config")).toBe(false);
+    expect(isWebhookPath("/api/states/webhook.sensor")).toBe(false); // 'webhook' elsewhere in the path is fine
+    expect(isWebhookPath("/api/webhookfoo")).toBe(false); // not the webhook endpoint
+  });
+
   it("summarizeLogbook renders when/who/what and caps output", () => {
     const out = summarizeLogbook([
       { when: "2026-07-06T04:00:00", entity_id: "automation.x", message: "triggered" },
@@ -145,14 +165,30 @@ describe("tiers and confirmations", () => {
     expect(tool("ha_backup").confirm).toBeTypeOf("function");
   });
 
-  it("ha_call_service confirm names the exact service and target entity", () => {
+  it("ha_call_service confirm names the exact service, target entity, and full payload", () => {
     const c = tool("ha_call_service").confirm!;
     expect(c({ domain: "homeassistant", service: "update_entity", data: { entity_id: "sun.sun" } }, target())).toBe(
-      "Call Home Assistant service homeassistant.update_entity on sun.sun (homeassistant)",
+      'Call Home Assistant service homeassistant.update_entity on sun.sun — data: {"entity_id":"sun.sun"} (homeassistant)',
     );
     // Array entity_id is joined; no entity_id => no target clause.
     expect(c({ domain: "update", service: "install", data: { entity_id: ["update.a", "update.b"] } }, target())).toContain("on update.a, update.b");
     expect(c({ domain: "homeassistant", service: "restart" }, target())).toBe("Call Home Assistant service homeassistant.restart (homeassistant)");
+  });
+
+  it("confirm surfaces NON-entity payload fields so they can't be smuggled past approval", () => {
+    const c = tool("ha_call_service").confirm!;
+    const text = c({ domain: "light", service: "turn_on", data: { entity_id: "light.kitchen", brightness: 255, rgb_color: [255, 0, 0] } }, target());
+    expect(text).toContain('"brightness":255');
+    expect(text).toContain('"rgb_color":[255,0,0]');
+  });
+
+  it("confirm redacts secret-looking payload fields (they'd otherwise land in the audit detail)", () => {
+    const c = tool("ha_call_service").confirm!;
+    const text = c({ domain: "hassio", service: "backup_full", data: { name: "nightly", password: "hunter2", token: "abc" } }, target());
+    expect(text).not.toContain("hunter2");
+    expect(text).not.toContain('"token":"abc"');
+    expect(text).toContain('"password":"[redacted]"');
+    expect(text).toContain('"name":"nightly"'); // non-secret fields still shown
   });
 
   it("ha_backup confirm names the exact service", () => {
@@ -277,6 +313,14 @@ describe("read tools", () => {
     const res = await tool("ha_get").run({ path: "/api/config" }, ctx(cred({ secret: "TKN" })));
     expect(res.text).toContain("HTTP 200");
     expect(res.text).toContain('"version":"2026.7.1"');
+  });
+
+  it("ha_get refuses a webhook path WITHOUT issuing a request (read tier stays side-effect free)", async () => {
+    const calls = mockFetch([{ match: () => true, reply: { json: {} } }]);
+    const res = await tool("ha_get").run({ path: "/api/webhook/some_secret_id" }, ctx(cred({ secret: "TKN" })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Refused");
+    expect(calls.length).toBe(0); // never hit the network
   });
 
   it("ha_logbook builds the path with entity + time bounds and summarizes", async () => {

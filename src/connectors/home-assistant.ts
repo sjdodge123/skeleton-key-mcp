@@ -79,6 +79,48 @@ export function normalizeServiceData(data: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Field-name fragments that mark a service-data value as sensitive (a backup
+ *  password, an access token, a lock PIN, …). Redacted from the human approval
+ *  prompt + audit detail so the confirmation names the payload without echoing a
+ *  secret into the audit trail (audit args are hashed; the `detail` is not). */
+const SECRET_DATA_KEY = /pass(word|wd)?|token|secret|api[_-]?key|credential|private[_-]?key|\bpin\b|\bcode\b/i;
+
+/**
+ * Compact, secret-redacted, length-capped rendering of service data for the
+ * approval prompt + audit detail, so a human approves the ACTUAL payload — not
+ * just the service name (a generic execute tool could otherwise smuggle
+ * destructive fields behind a vague "Call service …"). Best-effort and
+ * non-throwing: an object is redacted per-key; a JSON string is parsed first; any
+ * other value is shown truncated. Exported for testing.
+ */
+export function renderServiceData(data: unknown): string {
+  let obj: Record<string, unknown> | undefined;
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    obj = data as Record<string, unknown>;
+  } else if (typeof data === "string" && data.trim()) {
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) obj = parsed as Record<string, unknown>;
+    } catch {
+      return data.length > 200 ? `${data.slice(0, 199)}…` : data;
+    }
+  }
+  if (!obj) return "";
+  if (!Object.keys(obj).length) return "";
+  const redacted: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) redacted[k] = SECRET_DATA_KEY.test(k) ? "[redacted]" : v;
+  const json = JSON.stringify(redacted);
+  return json.length > 200 ? `${json.slice(0, 199)}…` : json;
+}
+
+/** True if a path targets an HA webhook (/api/webhook/<id>). Webhooks are the one
+ *  documented GET-with-side-effects surface (they can fire automations), so the
+ *  read-only ha_get refuses them. Matches regardless of a leading slash or case.
+ *  Exported for testing. */
+export function isWebhookPath(path: string): boolean {
+  return /(^|\/)api\/webhook(\/|$)/i.test(path.replace(/^\/+/, ""));
+}
+
 /** Zod for a service-data dict: a real object in the JSON schema (so the client
  *  sends an object, not a string — the root cause of the old double-encoded 400),
  *  but tolerant of a stringified object at runtime via preprocess. A test asserts
@@ -188,8 +230,17 @@ class HomeAssistant {
   }
 
   /** Raw GET passthrough for endpoints without a dedicated tool (e.g.
-   *  /api/config, /api/history/period). */
+   *  /api/config, /api/history/period). Read-tier, so it must stay side-effect
+   *  free: HA webhooks (/api/webhook/<id>) can be configured to fire automations
+   *  on GET, which would let this read tool change state — those are refused.
+   *  Actions go through ha_call_service (execute-tier, approval-gated). */
   async getRaw(path: string): Promise<ToolResult> {
+    if (isWebhookPath(path)) {
+      return {
+        text: "Refused: /api/webhook paths can trigger automations, so they are not allowed from the read-only ha_get. Use ha_call_service (execute) for actions.",
+        isError: true,
+      };
+    }
     const res = await this.request("GET", path);
     return { text: `HTTP ${res.status} ${res.statusText}\n${res.text.slice(0, 20_000)}`, isError: !res.ok };
   }
@@ -286,7 +337,8 @@ function buildTools(target: Target): ConnectorTool[] {
       name: "ha_get",
       description:
         `Raw authenticated GET against the Home Assistant REST API on ${target.name} (e.g. /api/config, ` +
-        `/api/history/period, /api/states/<id>). Read-only escape hatch for endpoints without a dedicated tool.`,
+        `/api/history/period, /api/states/<id>). Read-only escape hatch for endpoints without a dedicated tool; ` +
+        `/api/webhook paths are refused (they can fire automations — use ha_call_service for actions).`,
       tier: "read",
       inputSchema: z.object({ path: z.string().describe("API path, e.g. /api/config") }),
       run: run((ha, i) => ha.getRaw(i.path)),
@@ -318,10 +370,15 @@ function buildTools(target: Target): ConnectorTool[] {
         data: serviceData,
       }),
       confirm: (input, t) => {
-        const i = input as { domain: string; service: string; data?: Record<string, unknown> };
-        const ent = i.data?.["entity_id"];
+        const i = input as { domain: string; service: string; data?: unknown };
+        const d = i.data && typeof i.data === "object" ? (i.data as Record<string, unknown>) : undefined;
+        const ent = d?.["entity_id"];
         const on = ent ? ` on ${Array.isArray(ent) ? ent.join(", ") : String(ent)}` : "";
-        return `Call Home Assistant service ${i.domain}.${i.service}${on} (${t.name})`;
+        // Render the FULL (secret-redacted) payload so the approval + audit detail
+        // reflect exactly what will run, not just the service name.
+        const rendered = renderServiceData(i.data);
+        const dataClause = rendered ? ` — data: ${rendered}` : "";
+        return `Call Home Assistant service ${i.domain}.${i.service}${on}${dataClause} (${t.name})`;
       },
       run: run((ha, i) => ha.callService(i.domain, i.service, i.data)),
     },
