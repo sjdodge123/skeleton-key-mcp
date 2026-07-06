@@ -114,6 +114,17 @@ describe("stateful MCP endpoint", () => {
     expect(app.audit.recent().some((e) => e.tool === "mcp.session_stale")).toBe(true);
   });
 
+  it("throttles session_stale so a flood of unknown-session requests can't bloat the audit log", async () => {
+    // Measure the delta (the audit db path is shared across this file's tests) —
+    // six rapid unknown-session hits within the throttle window add just one row.
+    const staleCount = () => app.audit.recent(1000).filter((e) => e.tool === "mcp.session_stale").length;
+    const before = staleCount();
+    for (let i = 0; i < 6; i++) {
+      await fetch(base, { method: "POST", headers: { ...H, "mcp-session-id": "bogus" + i }, body: JSON.stringify({ jsonrpc: "2.0", id: 200 + i, method: "tools/list", params: {} }) });
+    }
+    expect(staleCount() - before).toBe(1);
+  });
+
   it("rejects a non-initialize POST without a session", async () => {
     const r = await fetch(base, { method: "POST", headers: H, body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list", params: {} }) });
     expect(r.status).toBe(400);

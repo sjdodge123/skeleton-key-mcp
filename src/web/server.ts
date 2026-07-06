@@ -41,7 +41,17 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
   // (a `session_stale` 404 followed by a fresh `session_init` = the client
   // auto-recovered; silence = it didn't). Best-effort: never let an audit write
   // break the transport.
+  //
+  // Throttled per event type: an authenticated client can otherwise cheaply
+  // hammer the unknown-session→404 path and flood audit.sqlite. For diagnosis one
+  // record per burst is enough, so we coalesce to at most one write per type per
+  // window — bounding disk growth from this path to a trickle.
+  const SESSION_LOG_THROTTLE_MS = 10_000;
+  const lastSessionLogAt = new Map<string, number>();
   const logSession = (tool: string, detail: string): void => {
+    const now = Date.now();
+    if (now - (lastSessionLogAt.get(tool) ?? 0) < SESSION_LOG_THROTTLE_MS) return;
+    lastSessionLogAt.set(tool, now);
     try {
       app.audit.record({ ts: new Date().toISOString(), tool, target: "(mcp)", tier: "session", args: {}, status: "ok", detail });
     } catch {
