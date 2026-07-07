@@ -8,7 +8,7 @@ import path from "node:path";
  * truncated one. Used for the bootstrap store and the auto-unlock key file,
  * where a torn write would destroy the only copy of a secret.
  */
-export async function writeFileAtomic(file: string, data: string, mode: number): Promise<void> {
+export async function writeFileAtomic(file: string, data: string | Uint8Array, mode: number): Promise<void> {
   const tmp = `${file}.tmp`;
   const fh = await open(tmp, "w", mode);
   try {

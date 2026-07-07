@@ -291,3 +291,19 @@ describe("request bounds", () => {
     }
   });
 });
+
+describe("snapshot", () => {
+  it("captures nodes, storage, guest inventory, per-node network, and per-guest config", async () => {
+    mockFetch([
+      { match: (u) => u.endsWith("/api2/json/nodes"), reply: { json: { data: [{ node: "pve1", status: "online" }] } } },
+      { match: (u) => u.endsWith("/api2/json/storage"), reply: { json: { data: [{ storage: "local", type: "dir" }] } } },
+      { match: (u) => u.includes("/cluster/resources"), reply: { json: { data: [{ vmid: 100, name: "web", node: "pve1", type: "qemu" }] } } },
+      { match: (u) => u.includes("/nodes/pve1/network"), reply: { json: { data: [{ iface: "vmbr0" }] } } },
+      { match: (u) => u.includes("/nodes/pve1/qemu/100/config"), reply: { json: { data: { cores: 4, name: "web" } } } },
+    ]);
+    const arts = await proxmoxConnector.snapshot!(ctx(token()));
+    expect(arts.map((a) => a.name)).toEqual(
+      expect.arrayContaining(["nodes.json", "storage.json", "guests.json", "network-pve1.json", "guest-100-web.config.json"]),
+    );
+  });
+});

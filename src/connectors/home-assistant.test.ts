@@ -651,3 +651,15 @@ describe("request bounds", () => {
     }
   });
 });
+
+describe("snapshot", () => {
+  it("triggers a backup and captures /api/config as a reference", async () => {
+    mockFetch([
+      { match: (u, i) => u.endsWith("/api/services/backup/create_automatic") && i?.method === "POST", reply: { json: [] } },
+      { match: (u) => u.endsWith("/api/config"), reply: { json: { version: "2026.7.1", location_name: "Home" } } },
+    ]);
+    const arts = await homeAssistantConnector.snapshot!(ctx(cred({ secret: "TKN" })));
+    expect(arts.map((a) => a.name)).toEqual(expect.arrayContaining(["backup-status.txt", "config.json"]));
+    expect(arts.find((a) => a.name === "config.json")!.data.toString()).toContain("2026.7.1");
+  });
+});

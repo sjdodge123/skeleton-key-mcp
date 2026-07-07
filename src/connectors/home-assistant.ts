@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
@@ -591,6 +591,26 @@ class HomeAssistant {
     if (res.isError) return res;
     return { text: `Home Assistant backup started via backup.create_automatic on ${this.target.name}. Check Settings → System → Backups for completion.` };
   }
+
+  /** Disaster-recovery snapshot: TRIGGER the native backup (the .tar stays on the
+   *  HA device in v1 — noted in the artifact) and capture /api/config as a
+   *  human-readable reference. Both steps are best-effort. */
+  async snapshot(): Promise<SnapshotArtifact[]> {
+    const arts: SnapshotArtifact[] = [];
+    try {
+      const b = await this.backup();
+      arts.push({ name: "backup-status.txt", data: Buffer.from(b.text, "utf8"), note: "HA backup trigger result — the .tar stays on the HA device (v1)" });
+    } catch (e) {
+      arts.push({ name: "backup-status.txt", data: Buffer.from(`backup trigger failed: ${e instanceof Error ? e.message : String(e)}`, "utf8"), note: "HA backup trigger failed" });
+    }
+    try {
+      const res = await this.request("GET", "/api/config");
+      if (res.ok && res.text.trim()) arts.push({ name: "config.json", data: Buffer.from(res.text, "utf8"), note: "HA /api/config reference" });
+    } catch {
+      /* config reference is best-effort */
+    }
+    return arts;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (ha: HomeAssistant) => Promise<T>): Promise<T> {
@@ -697,4 +717,5 @@ export const homeAssistantConnector: Connector = {
   configSchema: optionsSchema,
   requiresCredential: true,
   buildTools,
+  snapshot: (ctx) => withClient(ctx, (ha) => ha.snapshot()),
 };

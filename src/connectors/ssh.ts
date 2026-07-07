@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { runSsh, shellQuote } from "./ssh-exec.js";
 import { checkCommand, READONLY_ALLOW, type CommandPolicyOptions } from "./command-policy.js";
 
@@ -9,6 +9,9 @@ const optionsSchema = z
     denyPatterns: z.array(z.string()).optional(),
     /** Restrict `run_command` to an allowlist (in addition to run_readonly). */
     allowPatterns: z.array(z.string()).optional(),
+    /** Config-dump commands run by `form_skeleton` for this host. Each becomes one
+     *  artifact. If unset, a default read-only system profile is captured. */
+    snapshotCommands: z.array(z.string()).optional(),
   })
   .default({});
 
@@ -144,10 +147,80 @@ function buildTools(target: Target): ConnectorTool[] {
   return [...readTools, ...executeTools];
 }
 
+/** Read-only host profile captured when a target defines no `snapshotCommands`.
+ *  Each yields one artifact; failures are skipped (a partial profile is fine). */
+const DEFAULT_PROFILE: { name: string; cmd: string }[] = [
+  { name: "uname.txt", cmd: "uname -a" },
+  { name: "os-release.txt", cmd: "cat /etc/os-release 2>/dev/null" },
+  { name: "ip-addr.txt", cmd: "ip a 2>/dev/null || ifconfig -a 2>/dev/null" },
+  { name: "packages.txt", cmd: "dpkg -l 2>/dev/null || rpm -qa 2>/dev/null || apk info -v 2>/dev/null" },
+  { name: "crontab.txt", cmd: "crontab -l 2>/dev/null" },
+  { name: "docker-ps.txt", cmd: "docker ps -a 2>/dev/null" },
+];
+
+/**
+ * Capture a config skeleton of an SSH host: the operator's `snapshotCommands`
+ * if set, else a read-only system profile — plus a Pi-hole teleporter backup
+ * when `pihole` is present. Uses `runSsh` directly (fixed backup commands, not
+ * subject to the interactive command policy). Every step is best-effort so one
+ * failing command never aborts the whole target's snapshot.
+ */
+async function snapshot(ctx: ToolContext): Promise<SnapshotArtifact[]> {
+  const cred = await ctx.getCredential();
+  const target = ctx.target;
+  const opts = optionsSchema.parse(target.options ?? {});
+  const arts: SnapshotArtifact[] = [];
+
+  const commands = opts.snapshotCommands?.length
+    ? opts.snapshotCommands.map((cmd, i) => ({ name: `cmd-${i + 1}.txt`, cmd }))
+    : DEFAULT_PROFILE;
+
+  for (const { name, cmd } of commands) {
+    try {
+      const { stdout, stderr, code } = await runSsh(target, cred, cmd);
+      const body = stdout || (code !== 0 ? `exit ${code}\n${stderr}` : "");
+      if (body.trim()) arts.push({ name, data: Buffer.from(body, "utf8"), note: cmd });
+    } catch {
+      /* skip a failing profile command — a partial profile is acceptable */
+    }
+  }
+
+  // Pi-hole: the teleporter tarball is the real one-click restore artifact.
+  try {
+    const { stdout: hasPihole } = await runSsh(target, cred, "command -v pihole 2>/dev/null");
+    if (hasPihole.trim()) {
+      // Create the teleporter in a temp dir, base64 it back over the (text-only)
+      // ssh channel with a portable encoder (BSD base64 has no GNU -w0), clean up.
+      const teleporterCmd =
+        'd=$(mktemp -d) && cd "$d" && pihole -a -t >/dev/null 2>&1 && ' +
+        'f=$(ls -1 *.tar.gz 2>/dev/null | head -1) && [ -n "$f" ] && ' +
+        "base64 \"$f\" | tr -d '\\n'; cd / && rm -rf \"$d\"";
+      const { stdout: b64 } = await runSsh(target, cred, teleporterCmd);
+      const trimmed = b64.trim();
+      if (trimmed) {
+        arts.push({
+          name: "teleporter.tar.gz",
+          data: Buffer.from(trimmed, "base64"),
+          note: "Pi-hole teleporter backup (contains secrets)",
+        });
+      }
+      const { stdout: setupVars } = await runSsh(target, cred, "cat /etc/pihole/setupVars.conf 2>/dev/null");
+      if (setupVars.trim()) {
+        arts.push({ name: "pihole-setupVars.conf", data: Buffer.from(setupVars, "utf8"), note: "Pi-hole config reference" });
+      }
+    }
+  } catch {
+    /* pihole capture is best-effort */
+  }
+
+  return arts;
+}
+
 export const sshConnector: Connector = {
   type: "ssh",
   label: "SSH host",
   configSchema: optionsSchema,
   requiresCredential: true,
   buildTools,
+  snapshot,
 };

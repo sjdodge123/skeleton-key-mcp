@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { tlsFetch } from "./net.js";
 
 /**
@@ -398,6 +398,48 @@ class Proxmox {
       text: `Proxmox ${action} started on ${kind} ${vmid} (${name}) on node ${node}.${upid ? ` Task ${upid} — read it with task_log.` : ""} Confirm with guest_status.`,
     };
   }
+
+  /** Disaster-recovery snapshot: nodes, storage config, per-node network config,
+   *  and every guest's config (the artifact you rebuild a VM/CT from — may embed
+   *  cloud-init secrets, encrypted at rest by the snapshot service). Per-item
+   *  failures are skipped. */
+  async snapshot(): Promise<SnapshotArtifact[]> {
+    const arts: SnapshotArtifact[] = [];
+    const jsonArt = (name: string, value: unknown, note?: string): SnapshotArtifact => ({
+      name,
+      data: Buffer.from(JSON.stringify(value ?? null, null, 2), "utf8"),
+      ...(note ? { note } : {}),
+    });
+
+    const nodes = (await this.getData<PveNode[]>("/nodes")) ?? [];
+    arts.push(jsonArt("nodes.json", nodes, "cluster nodes"));
+    arts.push(jsonArt("storage.json", (await this.getData("/storage")) ?? [], "storage configuration"));
+
+    const guests = (await this.getData<PveResource[]>("/cluster/resources?type=vm")) ?? [];
+    arts.push(jsonArt("guests.json", guests, "VM/CT inventory"));
+
+    for (const n of nodes) {
+      if (!n.node || !NODE_NAME.test(n.node)) continue;
+      try {
+        arts.push(jsonArt(`network-${n.node}.json`, (await this.getData(`/nodes/${encodeURIComponent(n.node)}/network`)) ?? [], `node ${n.node} network`));
+      } catch {
+        /* skip a node whose network can't be read */
+      }
+    }
+
+    for (const g of guests) {
+      const type = g.type === "lxc" ? "lxc" : g.type === "qemu" ? "qemu" : undefined;
+      if (!type || !g.node || !NODE_NAME.test(g.node) || typeof g.vmid !== "number") continue;
+      try {
+        const cfg = await this.getData(`/nodes/${encodeURIComponent(g.node)}/${type}/${g.vmid}/config`);
+        const nm = (g.name ?? String(g.vmid)).replace(/[^a-zA-Z0-9._-]/g, "_");
+        arts.push(jsonArt(`guest-${g.vmid}-${nm}.config.json`, cfg ?? {}, `${type} ${g.vmid} config`));
+      } catch {
+        /* skip an unreadable guest config */
+      }
+    }
+    return arts;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (p: Proxmox) => Promise<T>): Promise<T> {
@@ -507,4 +549,5 @@ export const proxmoxConnector: Connector = {
   configSchema: optionsSchema,
   requiresCredential: true,
   buildTools,
+  snapshot: (ctx) => withClient(ctx, (p) => p.snapshot()),
 };
