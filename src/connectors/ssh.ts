@@ -171,17 +171,30 @@ async function snapshot(ctx: ToolContext): Promise<SnapshotArtifact[]> {
   const opts = optionsSchema.parse(target.options ?? {});
   const arts: SnapshotArtifact[] = [];
 
-  const commands = opts.snapshotCommands?.length
-    ? opts.snapshotCommands.map((cmd, i) => ({ name: `cmd-${i + 1}.txt`, cmd }))
-    : DEFAULT_PROFILE;
+  const custom = !!opts.snapshotCommands?.length;
+  const commands = custom ? opts.snapshotCommands!.map((cmd, i) => ({ name: `cmd-${i + 1}.txt`, cmd })) : DEFAULT_PROFILE;
+  const policy = policyFor(target);
 
   for (const { name, cmd } of commands) {
+    // Operator-supplied snapshotCommands are a model-influenceable command path,
+    // so they MUST honor the same deny-list as run_command (rm -rf / mkfs / dd …);
+    // the fixed read-only DEFAULT_PROFILE is trusted and skips the check.
+    if (custom) {
+      const verdict = checkCommand(cmd, policy);
+      if (!verdict.allowed) {
+        arts.push({ name, data: Buffer.from(`Refused by command policy: ${verdict.reason}`, "utf8") });
+        continue;
+      }
+    }
     try {
       const { stdout, stderr, code } = await runSsh(target, cred, cmd);
       const body = stdout || (code !== 0 ? `exit ${code}\n${stderr}` : "");
-      if (body.trim()) arts.push({ name, data: Buffer.from(body, "utf8"), note: cmd });
+      // `note` is written UNENCRYPTED into the manifest, so never store an
+      // operator's custom command there (it can embed inline credentials, e.g.
+      // `mysqldump -pPASS`); the fixed profile commands are safe to label.
+      if (body.trim()) arts.push({ name, data: Buffer.from(body, "utf8"), ...(custom ? {} : { note: cmd }) });
     } catch {
-      /* skip a failing profile command — a partial profile is acceptable */
+      /* skip a failing command — a partial profile is acceptable */
     }
   }
 
@@ -198,10 +211,14 @@ async function snapshot(ctx: ToolContext): Promise<SnapshotArtifact[]> {
       const { stdout: b64 } = await runSsh(target, cred, teleporterCmd);
       const trimmed = b64.trim();
       if (trimmed) {
+        arts.push({ name: "teleporter.tar.gz", data: Buffer.from(trimmed, "base64"), note: "Pi-hole teleporter backup (contains secrets)" });
+      } else {
+        // Pi-hole present but no teleporter produced (Pi-hole v6 replaced
+        // `pihole -a -t`) — surface the gap instead of silently omitting a backup.
         arts.push({
-          name: "teleporter.tar.gz",
-          data: Buffer.from(trimmed, "base64"),
-          note: "Pi-hole teleporter backup (contains secrets)",
+          name: "pihole-BACKUP-MISSING.txt",
+          data: Buffer.from("Pi-hole detected but `pihole -a -t` produced no teleporter archive (Pi-hole v6 changed this command). Capture a backup manually.", "utf8"),
+          note: "teleporter capture failed",
         });
       }
       const { stdout: setupVars } = await runSsh(target, cred, "cat /etc/pihole/setupVars.conf 2>/dev/null");

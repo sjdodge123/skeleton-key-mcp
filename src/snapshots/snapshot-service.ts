@@ -61,15 +61,55 @@ function sanitize(name: string): string {
 }
 
 /**
+ * Produce a per-target-unique artifact leaf whose `<target>/<leaf>` tar entry
+ * stays within the 100-byte ustar name limit (over-long names are shortened
+ * deterministically with a content-hash suffix), disambiguating collisions with
+ * a counter. Guarantees the stored skeleton is always fully re-tarrable on
+ * download. Returns null only if even the shortest form can't fit (target name
+ * too long — unreachable given the registry's short name schema). Exported for
+ * testing.
+ */
+export function uniqueName(targetName: string, base: string, data: Buffer, used: Set<string>): string | null {
+  const prefix = Buffer.byteLength(`${targetName}/`, "utf8");
+  const fits = (n: string) => prefix + Buffer.byteLength(n, "utf8") <= 100;
+
+  let name = base;
+  if (!fits(name)) {
+    const suffix = "-" + sha256(data).slice(0, 8);
+    const budget = 100 - prefix - suffix.length;
+    if (budget < 1) return null;
+    name = base.slice(0, budget) + suffix;
+  }
+  if (!used.has(name)) return name;
+
+  // Collision: insert a counter before the extension, trimming the stem to fit.
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let i = 2; i < 100000; i++) {
+    const sfx = `-${i}${ext}`;
+    const room = 100 - prefix - Buffer.byteLength(sfx, "utf8");
+    if (room < 1) return null;
+    const cand = stem.slice(0, room) + sfx;
+    if (!used.has(cand)) return cand;
+  }
+  return null;
+}
+
+/**
  * Snapshot every registered target's config to an ENCRYPTED skeleton on disk and
  * return a summary only. A backup necessarily contains secrets, so artifact bytes
  * are encrypted at rest and never returned here, put in the manifest, or audited.
  * Per-target failures are isolated (partial skeleton), never a hard fail.
  */
-export async function formSkeleton(app: AppState, snapshotsDir: string = paths.snapshotsDir): Promise<{ id: string; summary: string }> {
+export async function formSkeleton(
+  app: AppState,
+  snapshotsDir: string = paths.snapshotsDir,
+  maxArtifactBytes: number = MAX_ARTIFACT_BYTES,
+): Promise<{ id: string; summary: string }> {
   const key = await getOrCreateSnapshotKey(app);
   const createdAt = new Date().toISOString();
-  const id = `${createdAt.replace(/[:.]/g, "-")}-${randomBytes(2).toString("hex")}`;
+  const id = `${createdAt.replace(/[:.]/g, "-")}-${randomBytes(8).toString("hex")}`;
   const dir = path.join(snapshotsDir, id);
   await mkdir(dir, { recursive: true });
 
@@ -103,13 +143,22 @@ export async function formSkeleton(app: AppState, snapshotsDir: string = paths.s
 
     const mArts: ManifestArtifact[] = [];
     const errors: string[] = [];
+    const used = new Set<string>();
     await mkdir(path.join(dir, target.name), { recursive: true });
     for (const art of artifacts) {
-      const safeName = sanitize(art.name);
-      if (art.data.length > MAX_ARTIFACT_BYTES) {
-        errors.push(`${safeName}: ${art.data.length} bytes over the ${MAX_ARTIFACT_BYTES}-byte cap`);
+      if (art.data.length > maxArtifactBytes) {
+        errors.push(`${sanitize(art.name)}: ${art.data.length} bytes over the ${maxArtifactBytes}-byte cap`);
         continue;
       }
+      // A per-target-unique leaf whose `<target>/<name>` tar entry fits the 100-
+      // byte ustar limit, so the skeleton is always fully re-tarrable on download
+      // and the .enc file, AAD, and manifest name stay 1:1.
+      const safeName = uniqueName(target.name, sanitize(art.name), art.data, used);
+      if (!safeName) {
+        errors.push(`${sanitize(art.name)}: name too long for a tar entry`);
+        continue;
+      }
+      used.add(safeName);
       const rel = path.join(target.name, `${safeName}.enc`);
       const blob = encryptArtifact(key, art.data, `${id}/${target.name}/${safeName}`);
       await writeFileAtomic(path.join(dir, rel), blob, 0o600);
@@ -185,15 +234,22 @@ export async function streamSkeletonTar(app: AppState, id: string, out: Writable
   const manifest = JSON.parse(manifestRaw) as Manifest;
   const key = await getOrCreateSnapshotKey(app);
 
+  // Build the ENTIRE gzipped tar in memory first (skeletons are config-sized), so
+  // ANY decrypt/integrity/name failure throws BEFORE a byte reaches `out` — the
+  // caller can then return a clean error rather than a truncated 200. This also
+  // avoids a dangling stream whose 'error' could go unhandled if the client aborts
+  // mid-download.
   const gzip = createGzip();
-  const done = new Promise<void>((resolve, reject) => {
-    out.on("finish", resolve);
-    out.on("error", reject);
+  const chunks: Buffer[] = [];
+  gzip.on("data", (c: Buffer) => chunks.push(c));
+  const gzDone = new Promise<void>((resolve, reject) => {
+    gzip.on("end", resolve);
     gzip.on("error", reject);
   });
-  gzip.pipe(out);
-  const tar = new TarWriter(gzip);
+  gzDone.catch(() => {}); // never let a build-time rejection become unhandled
+
   try {
+    const tar = new TarWriter(gzip);
     tar.addFile("manifest.json", Buffer.from(manifestRaw, "utf8"));
     try {
       tar.addFile("RESTORE.md", await readFile(path.join(dir, "RESTORE.md")));
@@ -210,11 +266,25 @@ export async function streamSkeletonTar(app: AppState, id: string, out: Writable
     }
     tar.finish();
     gzip.end();
-    await done;
+    await gzDone;
   } catch (e) {
     gzip.destroy();
     throw e;
   }
+
+  // Everything above succeeded and was verified — only NOW touch `out`.
+  const payload = Buffer.concat(chunks);
+  await new Promise<void>((resolve, reject) => {
+    out.on("error", reject);
+    out.write(payload, (err) => {
+      if (err) {
+        reject(err);
+      } else {
+        out.end();
+        resolve();
+      }
+    });
+  });
 }
 
 function auditTarget(app: AppState, target: string, status: "ok" | "error", detail: string): void {

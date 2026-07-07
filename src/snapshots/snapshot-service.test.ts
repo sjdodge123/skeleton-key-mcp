@@ -30,10 +30,20 @@ registerConnector(mk({
 }));
 registerConnector(mk({ type: "snaptest-fail", snapshot: async () => { throw new Error("unreachable host"); } }));
 registerConnector(mk({ type: "snaptest-none" })); // no snapshot → skipped
+registerConnector(mk({
+  type: "snaptest-edge",
+  snapshot: async () => [
+    { name: "dup.json", data: Buffer.from("AAA") },
+    { name: "dup.json", data: Buffer.from("BBB") }, // collides → disambiguated
+    { name: "x".repeat(200) + ".json", data: Buffer.from("longname-artifact") }, // >100 → shortened
+    { name: "toobig.bin", data: Buffer.alloc(4096) }, // over the test cap → skipped
+  ],
+}));
 
 let dir: string;
 let snapDir: string;
 let auditLog: any[];
+let store: BootstrapStore;
 let app: AppState;
 
 const targets: Target[] = [
@@ -46,7 +56,7 @@ beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "skmcp-snap-svc-"));
   snapDir = path.join(dir, "skeletons");
   auditLog = [];
-  const store = await BootstrapStore.open(path.join(dir, "bootstrap.store"));
+  store = await BootstrapStore.open(path.join(dir, "bootstrap.store"));
   await store.initialize("correct horse battery staple");
   app = {
     store,
@@ -149,5 +159,34 @@ describe("listSkeletons + streamSkeletonTar", () => {
   it("throws for an unknown id (missing manifest)", async () => {
     const { stream } = collector();
     await expect(streamSkeletonTar(app, "nope-does-not-exist", stream, snapDir)).rejects.toThrow();
+  });
+});
+
+describe("formSkeleton edge cases (name collisions, over-long names, size cap)", () => {
+  it("disambiguates duplicate + over-long names, caps oversized artifacts, and still downloads", async () => {
+    const edgeApp = {
+      store,
+      registry: { list: () => [{ name: "edge", type: "snaptest-edge", host: "h", credentialRef: "c" }] },
+      credentialFor: async () => ({ ref: "c", fields: {}, uris: [] }),
+      audit: { record: (e: any) => auditLog.push(e) },
+    } as unknown as AppState;
+
+    const { id } = await formSkeleton(edgeApp, snapDir, 1024); // cap = 1024 bytes
+    const manifest = JSON.parse(await readFile(path.join(snapDir, id, "manifest.json"), "utf8"));
+    const edge = manifest.targets.find((t: any) => t.name === "edge");
+    const names: string[] = edge.artifacts.map((a: any) => a.name);
+
+    expect(new Set(names).size).toBe(names.length); // unique on disk (1:1 with .enc + manifest)
+    expect(names.filter((n) => n.startsWith("dup")).length).toBe(2); // both dup.json kept, disambiguated
+    expect(names.every((n) => Buffer.byteLength(`edge/${n}`, "utf8") <= 100)).toBe(true); // long name shortened to fit
+    expect(names.some((n) => n.startsWith("toobig"))).toBe(false); // over-cap artifact omitted
+    expect(edge.status).toBe("partial");
+    expect(edge.error).toMatch(/over the 1024-byte cap/);
+
+    // Every stored artifact's integrity passes → the whole skeleton downloads.
+    const { stream, done } = collector();
+    await streamSkeletonTar(edgeApp, id, stream, snapDir);
+    const tar = gunzipSync(await done);
+    expect(tar.includes("edge/dup.json")).toBe(true);
   });
 });

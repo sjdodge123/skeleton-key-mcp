@@ -39,7 +39,7 @@ describe("ssh snapshot", () => {
     expect(arts.some((a) => a.name === "pihole-setupVars.conf")).toBe(true);
   });
 
-  it("honors options.snapshotCommands when configured", async () => {
+  it("honors options.snapshotCommands when configured (no command stored as a manifest note)", async () => {
     vi.mocked(runSsh).mockImplementation(async (_t, _c, cmd: string) => {
       if (cmd.includes("command -v pihole")) return { stdout: "", stderr: "", code: 1 };
       return { stdout: `ran ${cmd}`, stderr: "", code: 0 };
@@ -48,6 +48,20 @@ describe("ssh snapshot", () => {
     const arts = await sshConnector.snapshot!(ctxFor(t));
     expect(arts.map((a) => a.name)).toEqual(["cmd-1.txt", "cmd-2.txt"]);
     expect(arts[0]!.data.toString()).toContain("cat /etc/a");
+    expect(arts[0]!.note).toBeUndefined(); // custom command not echoed into the cleartext manifest
+  });
+
+  it("refuses a denied snapshotCommand via the command policy and never runs it", async () => {
+    const ran: string[] = [];
+    vi.mocked(runSsh).mockImplementation(async (_t, _c, cmd: string) => {
+      ran.push(cmd);
+      return { stdout: cmd.includes("pihole") ? "" : "ok", stderr: "", code: cmd.includes("pihole") ? 1 : 0 };
+    });
+    const t: Target = { ...base, options: { snapshotCommands: ["rm -rf /srv/data", "cat /etc/ok"] } };
+    const arts = await sshConnector.snapshot!(ctxFor(t));
+    expect(arts.find((a) => a.name === "cmd-1.txt")!.data.toString()).toContain("Refused by command policy");
+    expect(ran).not.toContain("rm -rf /srv/data"); // deny-list stopped it before execution
+    expect(ran).toContain("cat /etc/ok");
   });
 
   it("skips profile commands that produce no output (partial profile)", async () => {
