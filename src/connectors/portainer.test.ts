@@ -209,8 +209,8 @@ describe("snapshot", () => {
     ]);
     const arts = await portainerConnector.snapshot!(ctx(cred({ fields: { token: "ptr_key" } })));
     expect(arts.map((a) => a.name)).toEqual(
-      expect.arrayContaining(["endpoints.json", "stacks.json", "stack-media.compose.yml", "containers.json", "container-plex.inspect.json"]),
+      expect.arrayContaining(["endpoints.json", "stacks.json", "stack-1-media.compose.yml", "containers.json", "container-plex.inspect.json"]),
     );
-    expect(arts.find((a) => a.name === "stack-media.compose.yml")!.data.toString()).toContain("services:");
+    expect(arts.find((a) => a.name === "stack-1-media.compose.yml")!.data.toString()).toContain("services:");
   });
 });

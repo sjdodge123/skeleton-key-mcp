@@ -218,7 +218,8 @@ class Portainer {
     for (const s of stacks) {
       try {
         const content = await this.stackFile(s.Id);
-        arts.push({ name: `stack-${safe(s.Name)}.compose.yml`, data: Buffer.from(content, "utf8"), note: `compose for stack #${s.Id}` });
+        // Include the endpoint id so a same-named stack on two endpoints can't collide.
+        arts.push({ name: `stack-${s.EndpointId}-${safe(s.Name)}.compose.yml`, data: Buffer.from(content, "utf8"), note: `compose for stack #${s.Id}` });
       } catch {
         /* skip a stack whose compose file can't be read */
       }
