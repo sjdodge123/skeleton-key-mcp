@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { unifiConnector, baseUrl, apiKeyFrom, scrubSecrets, summarizeDevices, summarizeNetworks } from "./unifi.js";
+import { unifiConnector, baseUrl, apiKeyFrom, scrubSecrets, summarizeDevices, summarizeNetworks, isPrivateIPv4 } from "./unifi.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 
 const WG_KEY = "aVeryPrivateWireguardKey1234567890AB=";
@@ -70,6 +70,13 @@ describe("pure helpers", () => {
     expect(out).not.toContain(WG_KEY);
     expect(out).toContain('"name":"Default"');
     expect(out).toContain('"ipv6_interface_type":"pd"');
+  });
+
+  it("scrubSecrets masks the widened families in a raw error body (never leaks into an error string)", () => {
+    const raw = JSON.stringify({ utm_token: "UTMTOKEN123", psk: "PEERPSK123", x_ssh_sha512passwd: "$6$HASH", x_mgmt_key: "MGMTKEY", name: "ok" });
+    const out = scrubSecrets(raw);
+    for (const s of ["UTMTOKEN123", "PEERPSK123", "$6$HASH", "MGMTKEY"]) expect(out).not.toContain(s);
+    expect(out).toContain('"name":"ok"'); // benign field survives
   });
 
   it("summarizeDevices flags a firmware change and offline state", () => {
@@ -153,6 +160,325 @@ describe("get_settings", () => {
     const res = await tool("get_settings").run({ section: "nope" }, ctx(cred({ fields: { api_key: "KEY123" } })));
     expect(res.text).toContain("No settings section matching 'nope'");
     expect(res.text).toContain("dpi");
+  });
+
+  it("redacts the widened secret families (token, *_key, passwd, psk) but keeps benign fields visible", async () => {
+    // Regression for the observed leak: the original denylist let these through.
+    mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      {
+        match: (u) => u.includes("/rest/setting"),
+        reply: {
+          json: {
+            data: [
+              { key: "mgmt", _id: "m1", site_id: "s", x_api_token: "APITOKEN123", x_mgmt_key: "MGMTKEY123", x_ssh_sha512passwd: "$6$HASHXYZ", x_ssh_username: "adminuser", auto_upgrade: false },
+              { key: "peer_to_peer", _id: "p1", psk: "PEERPSK123", ssid: "hidden-ssid" },
+              { key: "ips", _id: "i1", utm_token: "UTMTOKEN123", ips_mode: "disabled" },
+              { key: "ether_lighting", _id: "e1", network_defaults: [{ raw_color_hex: "abc", key: "none" }] },
+            ],
+          },
+        },
+      },
+    ]);
+    const res = await tool("get_settings").run({}, ctx(cred({ fields: { api_key: "KEY123" } })));
+    // Every secret family is masked.
+    for (const secret of ["APITOKEN123", "MGMTKEY123", "$6$HASHXYZ", "PEERPSK123", "UTMTOKEN123"]) {
+      expect(res.text).not.toContain(secret);
+    }
+    // Benign fields survive — including a nested label literally named `key`.
+    expect(res.text).toContain("adminuser"); // x_ssh_username is not a secret
+    expect(res.text).toContain('"ips_mode":"disabled"');
+    expect(res.text).toContain("hidden-ssid"); // an SSID name is not key material
+    expect(res.text).toContain('"key":"none"'); // bare `key` label stays (only *_key is masked)
+  });
+
+  it("does not over-redact the diagnostic fields the crash A/B depends on", async () => {
+    mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      {
+        match: (u) => u.includes("/rest/setting"),
+        reply: {
+          json: {
+            data: [
+              { key: "usg_geo", _id: "g1", ip_filtering: { action: "block", countries: "CN,RU", enabled: true, traffic_direction: "both" } },
+              { key: "usg", _id: "u1", offload_sch: true, offload_accounting: true, offload_l2_blocking: true, upnp_enabled: false },
+              { key: "rsyslogd", _id: "r1", ip: "", netconsole_enabled: false, netconsole_host: "", netconsole_port: "6666" },
+            ],
+          },
+        },
+      },
+    ]);
+    const res = await tool("get_settings").run({}, ctx(cred({ fields: { api_key: "K" } })));
+    for (const f of ['"countries":"CN,RU"', '"traffic_direction":"both"', '"offload_sch":true', '"upnp_enabled":false', '"netconsole_host":""', '"netconsole_port":"6666"']) {
+      expect(res.text).toContain(f);
+    }
+  });
+});
+
+describe("isPrivateIPv4", () => {
+  it("accepts RFC1918 addresses and rejects everything else", () => {
+    for (const ok of ["192.168.0.32", "10.1.2.3", "172.16.5.5", "172.31.255.255"]) expect(isPrivateIPv4(ok)).toBe(true);
+    for (const no of ["8.8.8.8", "172.32.0.1", "172.15.0.1", "1.1.1.1", "300.1.1.1", "192.168.0.32:514", "example.com", ""]) {
+      expect(isPrivateIPv4(no)).toBe(false);
+    }
+  });
+});
+
+describe("set_remote_logging (crash-log capture)", () => {
+  const rsyslogd = () => ({
+    key: "rsyslogd",
+    _id: "r1",
+    site_id: "s",
+    enabled: true,
+    this_controller: true,
+    ip: "",
+    log_all_contents: true,
+    netconsole_enabled: false,
+    netconsole_host: "",
+    netconsole_port: "6666",
+    port: "514",
+  });
+
+  // Stateful mock: a successful PUT updates in-memory state so the post-write
+  // verification GET reflects it (mirrors the set_gateway_feature harness).
+  function mock(settings: any[], putReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
+    const state: any[] = settings.map((s) => ({ ...s }));
+    const calls: { url: string; init: any }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let status = 200;
+        let json: unknown = {};
+        if (url.includes("/self")) {
+          json = { data: [{}] };
+        } else if (url.includes("/rest/setting/rsyslogd/r1") && method === "PUT") {
+          status = putReply.status ?? 200;
+          json = putReply.json ?? {};
+          const rc = (json as { meta?: { rc?: string } })?.meta?.rc;
+          if (status >= 200 && status < 300 && rc !== "error") {
+            const idx = state.findIndex((s) => s._id === "r1");
+            if (idx >= 0) state[idx] = JSON.parse(init.body);
+          }
+        } else if (url.includes("/rest/setting") && method === "GET") {
+          json = { data: state };
+        }
+        return { ok: status >= 200 && status < 300, status, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    return calls;
+  }
+  const run = (input: any) => tool("set_remote_logging").run(input, ctx(cred({ fields: { api_key: "K" } })));
+  const putBody = (calls: { init: any }[]) => JSON.parse(calls.find((c) => c.init.method === "PUT")!.init.body);
+  const wrote = (calls: { init: any }[]) => calls.some((c) => c.init.method === "PUT");
+
+  it("enables both syslog and netconsole to a LAN collector, preserving siblings", async () => {
+    const calls = mock([rsyslogd()]);
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBeFalsy();
+    const body = putBody(calls);
+    expect(body.ip).toBe("192.168.0.32");
+    expect(body.enabled).toBe(true);
+    expect(body.this_controller).toBe(true);
+    expect(body.port).toBe("514");
+    expect(body.netconsole_enabled).toBe(true);
+    expect(body.netconsole_host).toBe("192.168.0.32");
+    expect(body.netconsole_port).toBe("6666");
+    expect(body.log_all_contents).toBe(true); // sibling untouched
+    expect(res.text).toContain("CONFIGURED");
+    expect(res.text).toContain("delivery isn't verified"); // honest about netconsole/UDP reachability
+    expect(res.text).toContain("syslog→192.168.0.32:514");
+    expect(res.text).toContain("netconsole→192.168.0.32:6666");
+    expect(res.text).toContain("Revert with enabled=false");
+  });
+
+  it("mode=syslog touches only the remote-syslog fields (works with no netconsole schema)", async () => {
+    // A group lacking netconsole_host must still succeed in syslog-only mode,
+    // because the netconsole fields aren't in `need` when doNet is false.
+    const noNet = { key: "rsyslogd", _id: "r1", site_id: "s", enabled: true, this_controller: true, ip: "", log_all_contents: true, port: "514" };
+    const calls = mock([noNet]);
+    const res = await run({ enabled: true, host: "192.168.0.32", mode: "syslog", syslogPort: 5514 });
+    expect(res.isError).toBeFalsy();
+    const body = putBody(calls);
+    expect(body.ip).toBe("192.168.0.32");
+    expect(body.enabled).toBe(true);
+    expect(body.port).toBe("5514");
+    expect(body.netconsole_enabled).toBeUndefined(); // netconsole branch never ran
+    expect(res.text).toContain("syslog→192.168.0.32:5514");
+    expect(res.text).not.toContain("netconsole→");
+  });
+
+  it("mode=netconsole touches only the netconsole fields", async () => {
+    const calls = mock([rsyslogd()]);
+    const res = await run({ enabled: true, host: "10.0.0.5", mode: "netconsole", netconsolePort: 7000 });
+    expect(res.isError).toBeFalsy();
+    const body = putBody(calls);
+    expect(body.netconsole_enabled).toBe(true);
+    expect(body.netconsole_host).toBe("10.0.0.5");
+    expect(body.netconsole_port).toBe("7000");
+    expect(body.ip).toBe(""); // remote syslog untouched
+    expect(res.text).toContain("netconsole→10.0.0.5:7000");
+    expect(res.text).not.toContain("syslog→");
+  });
+
+  it("disable clears both targets", async () => {
+    const active = { ...rsyslogd(), ip: "192.168.0.32", netconsole_enabled: true, netconsole_host: "192.168.0.32" };
+    const calls = mock([active]);
+    const res = await run({ enabled: false });
+    expect(res.isError).toBeFalsy();
+    const body = putBody(calls);
+    expect(body.ip).toBe("");
+    expect(body.enabled).toBe(false);
+    expect(body.netconsole_enabled).toBe(false);
+    expect(body.netconsole_host).toBe("");
+    expect(res.text).toContain("DISABLED");
+    expect(res.text).toContain("targets cleared");
+  });
+
+  it("rejects an off-LAN collector host and never writes", async () => {
+    const calls = mock([rsyslogd()]);
+    const res = await run({ enabled: true, host: "8.8.8.8" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("private LAN IPv4");
+    expect(wrote(calls)).toBe(false);
+  });
+
+  it("requires a host when enabling", async () => {
+    const calls = mock([rsyslogd()]);
+    const res = await run({ enabled: true });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("needs a collector 'host'");
+    expect(wrote(calls)).toBe(false);
+  });
+
+  it("rejects an out-of-range port before any network I/O", async () => {
+    const calls = mock([rsyslogd()]);
+    const res = await run({ enabled: true, host: "192.168.0.32", syslogPort: 70000 });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Invalid syslogPort");
+    expect(calls.length).toBe(0); // validated before the GET
+  });
+
+  it("fails closed when the rsyslogd group is absent", async () => {
+    const calls = mock([{ key: "dpi", _id: "d1", enabled: true }]);
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no 'rsyslogd'");
+    expect(wrote(calls)).toBe(false);
+  });
+
+  it("fails closed on schema drift (netconsole_host missing) instead of writing", async () => {
+    const drifted = { key: "rsyslogd", _id: "r1", site_id: "s", enabled: true, this_controller: true, ip: "", log_all_contents: true, netconsole_enabled: false, netconsole_port: "6666", port: "514" }; // no netconsole_host
+    const calls = mock([drifted]);
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("expected shape");
+    expect(res.text).toContain("netconsole_host");
+    expect(wrote(calls)).toBe(false);
+  });
+
+  it("aborts without writing if the group changed between read and write", async () => {
+    let getN = 0;
+    const v1 = rsyslogd();
+    const v2 = { ...rsyslogd(), log_all_contents: false }; // a sibling changed concurrently
+    const calls: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (url.includes("/rest/setting") && method === "GET") json = { data: [getN++ === 0 ? v1 : v2] };
+        else if (method === "PUT") json = { meta: { rc: "ok" } };
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("changed under us");
+    expect(calls.some((c) => (c.init?.method ?? "GET") === "PUT")).toBe(false);
+  });
+
+  it("errors if the change doesn't hold after the write (post-write revert detected)", async () => {
+    // GET always reports netconsole off (a concurrent writer keeps reverting), yet PUT 'succeeds'.
+    const calls: any[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (url.includes("/rest/setting") && method === "GET") json = { data: [rsyslogd()] };
+        else if (method === "PUT") json = { meta: { rc: "ok" } };
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("did not hold");
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(true);
+  });
+
+  it("surfaces a meta.rc='error' envelope on the PUT as a failure", async () => {
+    const calls = mock([rsyslogd()], { status: 200, json: { meta: { rc: "error", msg: "api.err.NoSiteContext" } } });
+    const res = await run({ enabled: true, host: "192.168.0.32" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("api.err.NoSiteContext");
+    expect(wrote(calls)).toBe(true); // it did attempt the write
+  });
+
+  it("catches a post-write revert on the netconsole-only branch (independent of ip)", async () => {
+    // PUT 'succeeds' but GET keeps netconsole_enabled:false — the held check must
+    // fail on the netconsole toggle, pinning that branch of the verification.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (url.includes("/rest/setting") && method === "GET") json = { data: [rsyslogd()] };
+        else if (method === "PUT") json = { meta: { rc: "ok" } };
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    const res = await run({ enabled: true, host: "192.168.0.32", mode: "netconsole" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("did not hold");
+  });
+
+  it("disable succeeds even when the gateway normalizes a cleared target to null", async () => {
+    // Fix for the string-field held regression: a cleared host coming back as null
+    // (not "") after the write must NOT throw a phantom "did not hold".
+    const active = { ...rsyslogd(), ip: "192.168.0.32", enabled: true, netconsole_enabled: true, netconsole_host: "192.168.0.32" };
+    let put = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        const method = init?.method ?? "GET";
+        let json: unknown = {};
+        if (url.includes("/self")) json = { data: [{}] };
+        else if (method === "PUT") {
+          put = true;
+          json = { meta: { rc: "ok" } };
+        } else if (url.includes("/rest/setting") && method === "GET") {
+          json = { data: [put ? { ...active, ip: null, enabled: false, netconsole_enabled: false, netconsole_host: null } : active] };
+        }
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
+      }),
+    );
+    const res = await run({ enabled: false });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("DISABLED");
+  });
+
+  it("confirmation names the collector and the group rewrite", () => {
+    const c = tool("set_remote_logging").confirm!;
+    expect(c({ enabled: true, host: "192.168.0.32" }, target())).toContain("Enable UniFi remote logging (both) → 192.168.0.32 on unifi");
+    expect(c({ enabled: true, host: "192.168.0.32" }, target())).toContain("rewrites the rsyslogd settings group");
+    expect(c({ enabled: false }, target())).toContain("Disable UniFi remote logging");
   });
 });
 
@@ -438,5 +764,133 @@ describe("username/password login", () => {
     expect(put.init.headers["Cookie"]).toContain("unifises=sess123"); // legacy cookie preserved
     expect(put.url).toContain("/api/s/default/"); // legacy prefix (no /proxy/network)
     expect(put.url).not.toContain("/proxy/network");
+  });
+});
+
+describe("force_provision", () => {
+  const devices = [
+    { name: "Cloud Gateway Ultra", ip: "10.0.0.1", mac: "aa:bb:cc:00:00:01", type: "ugw", model: "UCGMax", state: 1 },
+    { name: "AP-Rack", ip: "10.0.0.5", mac: "aa:bb:cc:00:00:02", type: "uap", model: "U7Pro", state: 1 },
+  ];
+  function mock(devs: any[] = devices, cmdReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
+    return mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u, i) => u.includes("/stat/device") && (i?.method ?? "GET") === "GET", reply: { json: { data: devs } } },
+      { match: (u, i) => u.includes("/cmd/devmgr") && i?.method === "POST", reply: cmdReply },
+    ]);
+  }
+  const run = (input: any) => tool("force_provision").run(input, ctx(cred({ fields: { api_key: "K" } })));
+  const post = (calls: { url: string; init: any }[]) => calls.find((c) => c.url.includes("/cmd/devmgr") && c.init.method === "POST")!;
+
+  it("provisions the gateway by default (the sole gateway-class device) with a force-provision cmd", async () => {
+    const calls = mock();
+    const res = await run({});
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(post(calls).init.body);
+    expect(body.cmd).toBe("force-provision");
+    expect(body.mac).toBe("aa:bb:cc:00:00:01"); // the gateway (type ugw), not the AP
+    expect(res.text).toContain("Force-provisioned");
+    expect(res.text).toContain("Cloud Gateway Ultra");
+  });
+
+  it("targets a specific device by name", async () => {
+    const calls = mock();
+    const res = await run({ device: "AP-Rack" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02");
+  });
+
+  it("targets a specific device by MAC (case-insensitive)", async () => {
+    const calls = mock();
+    const res = await run({ device: "AA:BB:CC:00:00:02" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02");
+  });
+
+  it("selects the gateway-class device regardless of list order (not array[0])", async () => {
+    const calls = mock([
+      { name: "AP-Rack", ip: "10.0.0.5", mac: "cc:dd", type: "uap" },
+      { name: "UXG", ip: "10.9.9.9", mac: "gw:mac", type: "ugw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("gw:mac");
+  });
+
+  it("resolves an explicit device by IP", async () => {
+    const calls = mock();
+    const res = await run({ device: "10.0.0.5" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02"); // AP-Rack
+  });
+
+  it("refuses an ambiguous deviceRef instead of provisioning the first match", async () => {
+    const calls = mock([
+      { name: "dup", ip: "10.0.0.5", mac: "m1", type: "uap" },
+      { name: "dup", ip: "10.0.0.6", mac: "m2", type: "uap" },
+    ]);
+    const res = await run({ device: "dup" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("ambiguous");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("refuses when more than one gateway-class device is present (default resolution)", async () => {
+    const calls = mock([
+      { name: "GW-A", ip: "10.0.0.1", mac: "g1", type: "ugw" },
+      { name: "GW-B", ip: "10.0.0.2", mac: "g2", type: "ugw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Multiple gateway-class");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when no gateway-class device exists (default resolution)", async () => {
+    const calls = mock([
+      { name: "AP", ip: "10.0.0.5", mac: "a1", type: "uap" },
+      { name: "SW", ip: "10.0.0.6", mac: "s1", type: "usw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Couldn't identify a gateway");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors (no POST) when the resolved gateway has no MAC", async () => {
+    const calls = mock([{ name: "UXG", ip: "10.9.9.9", type: "ugw" }]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no MAC");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when the named device is not found and never POSTs", async () => {
+    const calls = mock();
+    const res = await run({ device: "nope" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("No UniFi device matching");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when there are no devices", async () => {
+    mock([]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no devices");
+  });
+
+  it("surfaces a meta.rc='error' envelope as a failure", async () => {
+    mock(devices, { status: 200, json: { meta: { rc: "error", msg: "api.err.NoPermission" } } });
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("api.err.NoPermission");
+  });
+
+  it("confirmation names the device and warns about the blip", () => {
+    const c = tool("force_provision").confirm!;
+    expect(c({}, target())).toContain("Force-provision UniFi gateway on unifi");
+    expect(c({}, target())).toContain("may briefly blip the gateway");
+    expect(c({ device: "AP-Rack" }, target())).toContain("Force-provision UniFi AP-Rack on unifi");
   });
 });
