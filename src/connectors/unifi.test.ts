@@ -766,3 +766,131 @@ describe("username/password login", () => {
     expect(put.url).not.toContain("/proxy/network");
   });
 });
+
+describe("force_provision", () => {
+  const devices = [
+    { name: "Cloud Gateway Ultra", ip: "10.0.0.1", mac: "aa:bb:cc:00:00:01", type: "ugw", model: "UCGMax", state: 1 },
+    { name: "AP-Rack", ip: "10.0.0.5", mac: "aa:bb:cc:00:00:02", type: "uap", model: "U7Pro", state: 1 },
+  ];
+  function mock(devs: any[] = devices, cmdReply: { status?: number; json?: unknown } = { json: { meta: { rc: "ok" } } }) {
+    return mockFetch([
+      { match: (u) => u.includes("/self"), reply: { json: { data: [{}] } } },
+      { match: (u, i) => u.includes("/stat/device") && (i?.method ?? "GET") === "GET", reply: { json: { data: devs } } },
+      { match: (u, i) => u.includes("/cmd/devmgr") && i?.method === "POST", reply: cmdReply },
+    ]);
+  }
+  const run = (input: any) => tool("force_provision").run(input, ctx(cred({ fields: { api_key: "K" } })));
+  const post = (calls: { url: string; init: any }[]) => calls.find((c) => c.url.includes("/cmd/devmgr") && c.init.method === "POST")!;
+
+  it("provisions the gateway by default (the sole gateway-class device) with a force-provision cmd", async () => {
+    const calls = mock();
+    const res = await run({});
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(post(calls).init.body);
+    expect(body.cmd).toBe("force-provision");
+    expect(body.mac).toBe("aa:bb:cc:00:00:01"); // the gateway (type ugw), not the AP
+    expect(res.text).toContain("Force-provisioned");
+    expect(res.text).toContain("Cloud Gateway Ultra");
+  });
+
+  it("targets a specific device by name", async () => {
+    const calls = mock();
+    const res = await run({ device: "AP-Rack" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02");
+  });
+
+  it("targets a specific device by MAC (case-insensitive)", async () => {
+    const calls = mock();
+    const res = await run({ device: "AA:BB:CC:00:00:02" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02");
+  });
+
+  it("selects the gateway-class device regardless of list order (not array[0])", async () => {
+    const calls = mock([
+      { name: "AP-Rack", ip: "10.0.0.5", mac: "cc:dd", type: "uap" },
+      { name: "UXG", ip: "10.9.9.9", mac: "gw:mac", type: "ugw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("gw:mac");
+  });
+
+  it("resolves an explicit device by IP", async () => {
+    const calls = mock();
+    const res = await run({ device: "10.0.0.5" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(post(calls).init.body).mac).toBe("aa:bb:cc:00:00:02"); // AP-Rack
+  });
+
+  it("refuses an ambiguous deviceRef instead of provisioning the first match", async () => {
+    const calls = mock([
+      { name: "dup", ip: "10.0.0.5", mac: "m1", type: "uap" },
+      { name: "dup", ip: "10.0.0.6", mac: "m2", type: "uap" },
+    ]);
+    const res = await run({ device: "dup" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("ambiguous");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("refuses when more than one gateway-class device is present (default resolution)", async () => {
+    const calls = mock([
+      { name: "GW-A", ip: "10.0.0.1", mac: "g1", type: "ugw" },
+      { name: "GW-B", ip: "10.0.0.2", mac: "g2", type: "ugw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Multiple gateway-class");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when no gateway-class device exists (default resolution)", async () => {
+    const calls = mock([
+      { name: "AP", ip: "10.0.0.5", mac: "a1", type: "uap" },
+      { name: "SW", ip: "10.0.0.6", mac: "s1", type: "usw" },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Couldn't identify a gateway");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors (no POST) when the resolved gateway has no MAC", async () => {
+    const calls = mock([{ name: "UXG", ip: "10.9.9.9", type: "ugw" }]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no MAC");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when the named device is not found and never POSTs", async () => {
+    const calls = mock();
+    const res = await run({ device: "nope" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("No UniFi device matching");
+    expect(calls.some((c) => c.init.method === "POST")).toBe(false);
+  });
+
+  it("errors when there are no devices", async () => {
+    mock([]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no devices");
+  });
+
+  it("surfaces a meta.rc='error' envelope as a failure", async () => {
+    mock(devices, { status: 200, json: { meta: { rc: "error", msg: "api.err.NoPermission" } } });
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("api.err.NoPermission");
+  });
+
+  it("confirmation names the device and warns about the blip", () => {
+    const c = tool("force_provision").confirm!;
+    expect(c({}, target())).toContain("Force-provision UniFi gateway on unifi");
+    expect(c({}, target())).toContain("may briefly blip the gateway");
+    expect(c({ device: "AP-Rack" }, target())).toContain("Force-provision UniFi AP-Rack on unifi");
+  });
+});

@@ -597,6 +597,48 @@ class UniFi {
     // can't confirm the collector is actually receiving (esp. netconsole/UDP).
     return `UniFi remote logging CONFIGURED on ${this.target.name} (${targets}) — persisted to the gateway; confirm the collector is receiving (delivery isn't verified by this write). Changed ${changed}. Revert with enabled=false.`;
   }
+
+  /** Force a device to re-provision (`POST /cmd/devmgr {cmd:'force-provision'}`).
+   *  A `/rest/setting` PUT only updates the controller DB; the device keeps
+   *  running its previously-generated config until it provisions — so a settings
+   *  write (set_remote_logging, set_gateway_feature) can verify-succeed yet never
+   *  take effect on the datapath. This re-applies the stored config. Defaults to
+   *  the gateway (identified positively by device role/model — NOT by IP, since a
+   *  gateway's stat/device `ip` is often its WAN address); `deviceRef` (name / MAC
+   *  / IP) targets another device. Refuses an ambiguous match rather than guessing.
+   *  Re-applies in place — normally no reboot, but can briefly blip the gateway. */
+  async forceProvision(deviceRef?: string): Promise<string> {
+    const devices = await this.getData<UniFiDevice>("/stat/device");
+    if (!devices.length) throw new Error("UniFi returned no devices to provision.");
+    const isGateway = (d: UniFiDevice) => d.type === "ugw" || d.type === "udm" || /gateway|udm|ucg|udr|uxg/i.test(d.model ?? "");
+
+    let dev: UniFiDevice;
+    if (deviceRef) {
+      const q = deviceRef.toLowerCase();
+      const matches = devices.filter((d) => d.mac?.toLowerCase() === q || d.name?.toLowerCase() === q || d.ip === deviceRef);
+      if (!matches.length) throw new Error(`No UniFi device matching '${deviceRef}'. Use list_devices to see options.`);
+      if (matches.length > 1) {
+        throw new Error(`'${deviceRef}' is ambiguous — matches ${matches.map((m) => `${m.name ?? m.model ?? "?"}/${m.mac ?? "?"}`).join(", ")}. Pass an exact MAC.`);
+      }
+      dev = matches[0]!;
+    } else {
+      // Default = the gateway, identified POSITIVELY by role/model. A UniFi site
+      // has exactly one gateway; if more than one gateway-class device turns up we
+      // refuse and ask for an explicit ref rather than blipping the wrong one.
+      const gateways = devices.filter(isGateway);
+      if (!gateways.length) throw new Error("Couldn't identify a gateway device to provision; pass an explicit device name/MAC (see list_devices).");
+      if (gateways.length > 1) {
+        throw new Error(`Multiple gateway-class devices found (${gateways.map((g) => g.name ?? g.model ?? g.mac).join(", ")}); pass an explicit device name/MAC.`);
+      }
+      dev = gateways[0]!;
+    }
+    if (!dev.mac) throw new Error(`UniFi device '${dev.name ?? deviceRef}' has no MAC address; can't provision it.`);
+
+    const path = "/cmd/devmgr";
+    const res = await this.api(path, { method: "POST", body: { cmd: "force-provision", mac: dev.mac } });
+    this.ensureOk(res, path);
+    return `Force-provisioned UniFi ${dev.name ?? dev.model ?? dev.mac} (${dev.mac}) on ${this.target.name} — the device re-applies its stored config (allow ~30–60s). Confirm the intended change actually took effect.`;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (u: UniFi) => Promise<T>): Promise<T> {
@@ -671,7 +713,8 @@ function buildTools(target: Target): ConnectorTool[] {
       description:
         `Enable or disable a UniFi gateway feature on ${target.name}: 'dpi' (Traffic Identification), 'upnp', ` +
         `'offload' (hardware offload), or 'geoip' (country firewall). Surgical server-side read-modify-write — ` +
-        `VPN/portal secrets never surface — and it reports the prior state so you can revert.`,
+        `VPN/portal secrets never surface — and it reports the prior state so you can revert. ` +
+        `The change hits the controller DB; run force_provision to make the gateway actually apply it.`,
       tier: "execute",
       inputSchema: z.object({
         feature: z.enum(GATEWAY_FEATURES).describe("dpi | upnp | offload | geoip"),
@@ -693,7 +736,8 @@ function buildTools(target: Target): ConnectorTool[] {
         `configures the gateway's rsyslogd group for userspace remote syslog and/or kernel netconsole (which fires ` +
         `at the crash instant). Surgical server-side read-modify-write; the collector must be a private LAN IPv4 and ` +
         `reachable from the gateway (this write persists the target but can't confirm delivery — verify the collector ` +
-        `is receiving). Reports prior state so you can revert with enabled=false.`,
+        `is receiving). Reports prior state so you can revert with enabled=false. ` +
+        `Run force_provision afterward — the gateway won't start forwarding until it re-provisions.`,
       tier: "execute",
       inputSchema: z.object({
         enabled: z.boolean().describe("true = stream logs to host; false = clear the syslog + netconsole targets (revert)."),
@@ -710,6 +754,23 @@ function buildTools(target: Target): ConnectorTool[] {
           : `Disable UniFi remote logging (clear syslog + netconsole targets) on ${t.name} — rewrites the rsyslogd settings group`;
       },
       run: run((u, i) => u.setRemoteLogging(i)),
+    },
+    {
+      name: "force_provision",
+      description:
+        `Force a UniFi device on ${target.name} to re-provision (re-apply its stored config) so a settings change actually ` +
+        `takes effect on the device — a set_gateway_feature / set_remote_logging write only updates the controller DB until ` +
+        `the device provisions. Defaults to the gateway; pass 'device' (name/MAC/IP) to target another. Re-applies config in ` +
+        `place (normally no reboot) but may briefly blip the gateway.`,
+      tier: "execute",
+      inputSchema: z.object({
+        device: z.string().optional().describe("Device name, MAC, or IP to provision. Omit to target the gateway."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { device?: string };
+        return `Force-provision UniFi ${i.device ?? "gateway"} on ${t.name} — re-applies stored config; may briefly blip the gateway`;
+      },
+      run: run((u, i) => u.forceProvision(i.device)),
     },
   ];
 }
