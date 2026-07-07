@@ -197,3 +197,20 @@ describe("connector registration", () => {
     expect(byName.get("get_stack_file")).toBe("read");
   });
 });
+
+describe("snapshot", () => {
+  it("captures endpoints, stacks + compose files, and container inspects", async () => {
+    mockFetch([
+      { match: (u) => u.endsWith("/api/endpoints"), reply: { json: [{ Id: 1, Name: "local", Type: 1, Status: 1 }] } },
+      { match: (u) => u.endsWith("/api/stacks"), reply: { json: [{ Id: 5, Name: "media", EndpointId: 1, Status: 1 }] } },
+      { match: (u) => u.includes("/api/stacks/5/file"), reply: { json: { StackFileContent: "services:\n  plex: {}" } } },
+      { match: (u) => u.includes("/docker/containers/json"), reply: { json: [{ Id: "abc123", Names: ["/plex"] }] } },
+      { match: (u) => u.includes("/docker/containers/abc123/json"), reply: { json: { Id: "abc123", Config: { Env: ["X=1"] } } } },
+    ]);
+    const arts = await portainerConnector.snapshot!(ctx(cred({ fields: { token: "ptr_key" } })));
+    expect(arts.map((a) => a.name)).toEqual(
+      expect.arrayContaining(["endpoints.json", "stacks.json", "stack-media.compose.yml", "containers.json", "container-plex.inspect.json"]),
+    );
+    expect(arts.find((a) => a.name === "stack-media.compose.yml")!.data.toString()).toContain("services:");
+  });
+});

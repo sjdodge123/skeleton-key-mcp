@@ -40,6 +40,21 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/**
+ * One captured backup artifact from a connector's `snapshot()`. `data` is
+ * PLAINTEXT — it is encrypted at rest by the snapshot service. A backup
+ * necessarily CONTAINS SECRETS, so an artifact's bytes must never reach a
+ * ToolResult, the manifest, the audit log, or the model context; the only
+ * plaintext egress is the TOTP-gated download.
+ */
+export interface SnapshotArtifact {
+  /** Filename-safe leaf, e.g. "settings.json", "backup.unf", "teleporter.tar.gz". */
+  name: string;
+  data: Buffer;
+  /** Human context recorded in the manifest — must contain NO secret. */
+  note?: string;
+}
+
 /** A single tool a connector exposes for a given target. */
 export interface ConnectorTool {
   /** Short name, unique within the connector (e.g. "tail_log"). Namespaced by
@@ -73,4 +88,11 @@ export interface Connector {
   requiresCredential: boolean;
   /** Build the tool set for one target. */
   buildTools: (target: Target) => ConnectorTool[];
+  /**
+   * Optional: capture disaster-recovery backup artifacts for one target (config
+   * exports + cheap native backups). Optional so connectors that don't implement
+   * it (e.g. the generic `http` connector) don't break. Artifacts are PLAINTEXT
+   * and may contain secrets — the snapshot service encrypts them at rest.
+   */
+  snapshot?: (ctx: ToolContext) => Promise<SnapshotArtifact[]>;
 }

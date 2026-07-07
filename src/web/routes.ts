@@ -9,6 +9,7 @@ import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
+import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
 
 /** Wrap an async handler so thrown errors become 400s with a message. */
 function h(fn: (req: Request, res: Response) => Promise<void>) {
@@ -344,6 +345,64 @@ export function buildApiRouter(app: AppState): Router {
         tier: "execute", args: {}, status: ok ? "ok" : "error", detail: "agent access revoked",
       });
       res.json({ ok });
+    }),
+  );
+
+  // --- Disaster-recovery skeletons (encrypted config backups) ---
+  // TOTP-gated. The list is metadata only. The download decrypts and streams a
+  // .tar.gz — the ONLY plaintext egress for skeleton artifacts (which contain
+  // secrets), so both need an unlocked store + a fresh TOTP code.
+  router.post(
+    "/snapshots",
+    h(async (req, res) => {
+      if (app.store.locked) {
+        res.status(409).json({ error: "Unlock the store first." });
+        return;
+      }
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
+      if (!app.verifyTotp(totp)) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return;
+      }
+      res.json({ skeletons: await listSkeletons() });
+    }),
+  );
+
+  router.post(
+    "/snapshots/:id/download",
+    h(async (req, res) => {
+      if (app.store.locked) {
+        res.status(409).json({ error: "Unlock the store first." });
+        return;
+      }
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
+      if (!app.verifyTotp(totp)) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return;
+      }
+      const id = req.params.id!;
+      if (!/^[0-9A-Za-z._-]+$/.test(id)) {
+        res.status(400).json({ error: "Invalid skeleton id." });
+        return;
+      }
+      res.setHeader("Content-Type", "application/gzip");
+      res.setHeader("Content-Disposition", `attachment; filename="skeleton-${id}.tar.gz"`);
+      try {
+        // Streams gzip→res; validates the id stays inside the snapshots dir and
+        // verifies each artifact's plaintext hash before writing it.
+        await streamSkeletonTar(app, id, res);
+        app.audit.record({ ts: new Date().toISOString(), tool: "snapshots.download", target: id, tier: "execute", args: { id }, status: "ok", detail: "skeleton downloaded" });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        app.audit.record({ ts: new Date().toISOString(), tool: "snapshots.download", target: id, tier: "execute", args: { id }, status: "error", detail: msg.slice(0, 300) });
+        if (!res.headersSent) {
+          res.removeHeader("Content-Type");
+          res.removeHeader("Content-Disposition");
+          res.status(404).json({ error: "Skeleton not found or unreadable." });
+        } else {
+          res.destroy();
+        }
+      }
     }),
   );
 

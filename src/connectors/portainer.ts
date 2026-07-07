@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
@@ -196,6 +196,46 @@ class Portainer {
     if (!started.ok) throw new Error(`HTTP ${started.status} starting exec on '${ref}'.`);
     return demuxDockerLogs(started.buf ?? Buffer.alloc(0)) || "(no output)";
   }
+
+  /** Disaster-recovery snapshot: environments, stacks + their full compose files,
+   *  and every container's inspect JSON (which may embed env-var secrets — a
+   *  backup by design, encrypted at rest by the snapshot service). Per-item
+   *  failures are skipped so one bad stack/container doesn't abort the target. */
+  async snapshot(): Promise<SnapshotArtifact[]> {
+    const arts: SnapshotArtifact[] = [];
+    const jsonArt = (name: string, value: unknown, note?: string): SnapshotArtifact => ({
+      name,
+      data: Buffer.from(JSON.stringify(value, null, 2), "utf8"),
+      ...(note ? { note } : {}),
+    });
+    const safe = (s: string) => s.replace(/^\//, "").replace(/[^a-zA-Z0-9._-]/g, "_") || "unnamed";
+    const eid = await this.endpointId();
+
+    arts.push(jsonArt("endpoints.json", await this.get<unknown[]>("/api/endpoints"), "Portainer environments"));
+
+    const stacks = await this.get<PortainerStack[]>("/api/stacks");
+    arts.push(jsonArt("stacks.json", stacks, "stack metadata"));
+    for (const s of stacks) {
+      try {
+        const content = await this.stackFile(s.Id);
+        arts.push({ name: `stack-${safe(s.Name)}.compose.yml`, data: Buffer.from(content, "utf8"), note: `compose for stack #${s.Id}` });
+      } catch {
+        /* skip a stack whose compose file can't be read */
+      }
+    }
+
+    const containers = await this.get<{ Id: string; Names?: string[] }[]>(`/api/endpoints/${eid}/docker/containers/json?all=1`);
+    arts.push(jsonArt("containers.json", containers, "container list"));
+    for (const c of containers) {
+      try {
+        const inspect = await this.get<unknown>(`/api/endpoints/${eid}/docker/containers/${encodeURIComponent(c.Id)}/json`);
+        arts.push(jsonArt(`container-${safe(c.Names?.[0] ?? c.Id)}.inspect.json`, inspect, "container config (may contain env secrets)"));
+      } catch {
+        /* skip an un-inspectable container */
+      }
+    }
+    return arts;
+  }
 }
 
 /** Split a command line into exact argv tokens on whitespace (no shell / no
@@ -379,4 +419,5 @@ export const portainerConnector: Connector = {
   configSchema: optionsSchema,
   requiresCredential: true,
   buildTools,
+  snapshot: (ctx) => withClient(ctx, (p) => p.snapshot()),
 };

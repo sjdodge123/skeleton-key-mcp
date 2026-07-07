@@ -27,6 +27,9 @@ export const paths = {
   /** SHA-256 hash of the MCP bearer token, so it can be verified while the vault
    *  is locked. Non-secret (hash of a 256-bit random token). */
   bearerHash: path.join(DATA_DIR, "mcp-bearer.hash"),
+  /** Encrypted disaster-recovery skeletons:
+   *  skeletons/<id>/<target>/<artifact>.enc + manifest.json + RESTORE.md. */
+  snapshotsDir: path.join(DATA_DIR, "skeletons"),
 } as const;
 
 /**

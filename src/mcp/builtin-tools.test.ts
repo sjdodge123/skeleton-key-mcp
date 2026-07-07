@@ -28,6 +28,14 @@ describe("global tool registry", () => {
     const lockedTools = tools.filter((t) => t.availableWhenLocked).map((t) => t.name);
     expect(lockedTools).toEqual(["get_started"]);
   });
+
+  it("registers form_skeleton as an execute tool with a confirm, not available while locked", () => {
+    const t = byName.get("form_skeleton")!;
+    expect(t).toBeDefined();
+    expect(t.tier).toBe("execute");
+    expect(typeof t.confirm).toBe("function");
+    expect(t.availableWhenLocked).toBeFalsy();
+  });
 });
 
 describe("network_scan gateway-first recommendation", () => {

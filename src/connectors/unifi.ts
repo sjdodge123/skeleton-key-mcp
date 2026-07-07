@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
@@ -639,6 +639,35 @@ class UniFi {
     this.ensureOk(res, path);
     return `Force-provisioned UniFi ${dev.name ?? dev.model ?? dev.mac} (${dev.mac}) on ${this.target.name} — the device re-applies its stored config (allow ~30–60s). Confirm the intended change actually took effect.`;
   }
+
+  /** Disaster-recovery snapshot: scrubbed settings/networks/devices as a
+   *  human-readable reference, plus the authoritative native `.unf` backup
+   *  (which DOES contain secrets — encrypted at rest by the snapshot service).
+   *  The `.unf` fetch is best-effort; the reference exports always land. */
+  async snapshot(): Promise<SnapshotArtifact[]> {
+    const arts: SnapshotArtifact[] = [];
+    arts.push({ name: "settings.txt", data: Buffer.from(await this.getSettings()), note: "scrubbed settings reference" });
+    arts.push({ name: "networks.txt", data: Buffer.from(await this.listNetworks()), note: "networks (VPN keys stripped)" });
+    arts.push({ name: "devices.txt", data: Buffer.from(await this.listDevices()), note: "adopted devices" });
+    try {
+      // POST /cmd/backup makes the controller write a .unf and returns its URL
+      // (shape verified live; coded defensively). The /dl/backup path is outside
+      // the site-API root and binary, so fetch it raw with the same auth headers.
+      const res = await this.api("/cmd/backup", { method: "POST", body: { cmd: "backup" } });
+      this.ensureOk(res, "/cmd/backup");
+      const url = (res.json as { data?: { url?: string }[] })?.data?.[0]?.url;
+      if (typeof url === "string" && url) {
+        const dl = await tlsFetch(`${this.base}${this.prefix}${url}`, { headers: await this.authHeaders(false) }, this.insecure);
+        if (dl.ok) {
+          const buf = Buffer.from(await dl.arrayBuffer());
+          if (buf.length) arts.push({ name: "backup.unf", data: buf, note: "UniFi native backup (contains secrets)" });
+        }
+      }
+    } catch {
+      /* .unf is best-effort; the scrubbed references above still captured */
+    }
+    return arts;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (u: UniFi) => Promise<T>): Promise<T> {
@@ -781,4 +810,5 @@ export const unifiConnector: Connector = {
   configSchema: optionsSchema,
   requiresCredential: true,
   buildTools,
+  snapshot: (ctx) => withClient(ctx, (u) => u.snapshot()),
 };

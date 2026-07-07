@@ -894,3 +894,63 @@ describe("force_provision", () => {
     expect(c({ device: "AP-Rack" }, target())).toContain("Force-provision UniFi AP-Rack on unifi");
   });
 });
+
+describe("snapshot (disaster-recovery backup)", () => {
+  // Fetch stub that also supplies arrayBuffer() for the binary .unf download.
+  function mock(routes: (url: string, method: string) => { json?: unknown; bytes?: Buffer; ok?: boolean; status?: number } | undefined) {
+    const calls: { url: string; init: any }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const r = routes(url, init?.method ?? "GET");
+        if (!r) throw new Error(`no route for ${init?.method ?? "GET"} ${url}`);
+        const status = r.status ?? 200;
+        return {
+          ok: r.ok ?? (status >= 200 && status < 300),
+          status,
+          statusText: "",
+          headers: { get: () => null, getSetCookie: () => [] },
+          text: async () => (r.json !== undefined ? JSON.stringify(r.json) : ""),
+          arrayBuffer: async () => {
+            const b = r.bytes ?? Buffer.alloc(0);
+            return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+          },
+        } as any;
+      }),
+    );
+    return calls;
+  }
+
+  it("captures scrubbed references plus the native .unf backup", async () => {
+    const calls = mock((url, method) => {
+      if (url.includes("/self")) return { json: { data: [{}] } };
+      if (url.includes("/rest/setting")) return { json: { data: [{ key: "usg", _id: "u1", upnp_enabled: false, x_ssh_password: "pw", x_wireguard_private_key: WG_KEY }] } };
+      if (url.includes("/rest/networkconf")) return { json: { data: [{ _id: "n1", name: "Default", x_wireguard_private_key: WG_KEY }] } };
+      if (url.includes("/stat/device")) return { json: { data: [{ name: "UCG", state: 1, mac: "aa" }] } };
+      if (url.includes("/cmd/backup") && method === "POST") return { json: { data: [{ url: "/dl/backup/site.unf" }] } };
+      if (url.includes("/dl/backup/")) return { bytes: Buffer.from("UNF-BINARY-DATA") };
+      return undefined;
+    });
+    const arts = await unifiConnector.snapshot!(ctx(cred({ fields: { api_key: "K" } })));
+    const names = arts.map((a) => a.name);
+    expect(names).toEqual(expect.arrayContaining(["settings.txt", "networks.txt", "devices.txt", "backup.unf"]));
+    expect(arts.find((a) => a.name === "backup.unf")!.data.toString()).toBe("UNF-BINARY-DATA");
+    expect(arts.find((a) => a.name === "settings.txt")!.data.toString()).not.toContain(WG_KEY); // scrubbed reference
+    expect(calls.some((c) => c.url.includes("/cmd/backup") && c.init.method === "POST")).toBe(true);
+    expect(calls.some((c) => c.url.includes("/dl/backup/"))).toBe(true);
+  });
+
+  it("still returns the reference exports when the .unf backup fails", async () => {
+    mock((url) => {
+      if (url.includes("/self")) return { json: { data: [{}] } };
+      if (url.includes("/rest/setting")) return { json: { data: [{ key: "usg", _id: "u1" }] } };
+      if (url.includes("/rest/networkconf")) return { json: { data: [{ _id: "n1", name: "Default" }] } };
+      if (url.includes("/stat/device")) return { json: { data: [{ name: "UCG" }] } };
+      if (url.includes("/cmd/backup")) return { json: { meta: { rc: "error", msg: "no perms" } } }; // ensureOk throws
+      return undefined;
+    });
+    const arts = await unifiConnector.snapshot!(ctx(cred({ fields: { api_key: "K" } })));
+    expect(arts.map((a) => a.name)).toEqual(["settings.txt", "networks.txt", "devices.txt"]);
+  });
+});

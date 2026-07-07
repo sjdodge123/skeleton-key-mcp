@@ -35,4 +35,8 @@ export interface BootstrapSecrets {
   totpSecret?: string;
   /** Argon2id-hashed admin passphrase for the web UI (separate from the store key). */
   adminPassphraseHash?: string;
+  /** Base64 32-byte key that encrypts disaster-recovery skeleton artifacts at
+   *  rest. Generated lazily on the first `form_skeleton`; lives inside this
+   *  encrypted store so `/data` alone can't decrypt a skeleton. */
+  snapshotKey?: string;
 }

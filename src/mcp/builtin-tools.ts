@@ -5,6 +5,7 @@ import { generateSshKey } from "../connectors/ssh-keygen.js";
 import { scanLan } from "../discovery/scan.js";
 import { getConnector, registerableType } from "../connectors/index.js";
 import { runSsh, shellQuote } from "../connectors/ssh-exec.js";
+import { formSkeleton } from "../snapshots/snapshot-service.js";
 
 /** Safe, filename-like identifier for vault item names (they double as credentialRefs). */
 const safeName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, "Use letters, digits, dot, dash, underscore.");
@@ -410,6 +411,25 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         if (!targets.length) return ok("No targets registered yet. Use network_scan then register_target.");
         const lines = targets.map((t) => `- ${t.name} (${t.type}) → ${t.host}${t.port ? ":" + t.port : ""}${t.credentialRef ? ` [cred: ${t.credentialRef}]` : ""}`);
         return ok(`Registered targets:\n${lines.join("\n")}`);
+      },
+    },
+    {
+      name: "form_skeleton",
+      description:
+        "Snapshot every registered target's configuration to an ENCRYPTED disaster-recovery skeleton on the Skeleton Key host " +
+        "(config exports + cheap native backups: Pi-hole teleporter, UniFi .unf, a triggered Home Assistant backup). " +
+        "Returns a summary only — artifact bytes never leave the box here. Pull a skeleton off-box via the TOTP-gated web download.",
+      tier: "execute",
+      inputSchema: z.object({}),
+      confirm: () =>
+        "Snapshot every registered target's config to an encrypted on-box skeleton (triggers native backups on Pi-hole / UniFi / Home Assistant)",
+      run: async (_input, a) => {
+        try {
+          const { id, summary } = await formSkeleton(a);
+          return ok(`Formed skeleton ${id}.\n\n${summary}\n\nDownload it off-box from the admin web UI (TOTP-gated).`);
+        } catch (e) {
+          return err(`form_skeleton failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
       },
     },
   ];
