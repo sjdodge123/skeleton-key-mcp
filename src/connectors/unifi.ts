@@ -52,8 +52,16 @@ export function apiKeyFrom(cred: Credential): string | undefined {
   return cred.fields["api_key"] ?? cred.fields["token"] ?? cred.secret ?? undefined;
 }
 
-/** Field-name fragments that mark a value as secret in a UniFi config object. */
-const SECRET_KEY = /private_key|wireguard|openvpn|passphrase|password|_psk|pre_shared|x_ca|x_secret|radius_secret/i;
+/** Field-name fragments that mark a value as secret in a UniFi config object.
+ *  This is a DENYLIST, so it fails open on an unrecognized field — the families
+ *  below were widened after `get_settings` was observed leaking a gateway API
+ *  token, an SSH password *hash*, the mgmt key, an IPS/UTM token, and a bare
+ *  `psk`, none of which the original `password|_psk|x_secret` set caught. Match
+ *  the secret families broadly: any `*_key` (word-boundary, so benign label
+ *  fields literally named `key` — e.g. lighting/ID keys — stay visible), any
+ *  `token`/`secret`/`passwd`/`password`/`psk`, plus explicit key/cert material. */
+const SECRET_KEY =
+  /private|_key\b|passphrase|passwd|password|psk|pre_shared|secret|token|wireguard|openvpn|x_ca|cert|credential/i;
 
 /** Maps a high-level gateway feature to the UniFi setting group + field(s) that
  *  toggle it. Keeps the execute tool constrained to known, meaningful switches
@@ -105,6 +113,21 @@ export function redactSecrets(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+/** True only for an RFC1918 (private / LAN) IPv4 literal. `set_remote_logging`
+ *  requires this so the gateway's logs can only ever be streamed to a LAN
+ *  collector we control — never an off-LAN sink (the project is LAN-only, and a
+ *  crash-log stream is sensitive). Exported for testing. */
+export function isPrivateIPv4(ip: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const c = Number(m[3]);
+  const d = Number(m[4]);
+  if ([a, b, c, d].some((n) => n > 255)) return false;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 function humanUptime(seconds?: number): string {
@@ -444,6 +467,136 @@ class UniFi {
 
     return `UniFi ${spec.label} set to ${enabled ? "ENABLED" : "DISABLED"} on ${this.target.name} (was ${prevDesc}).`;
   }
+
+  /** Point the gateway's off-box logging at a LAN collector we control, so a
+   *  crash-reboot no longer wipes the evidence. Writes the `rsyslogd` setting
+   *  group: userspace remote syslog (`ip`/`enabled`) and/or kernel **netconsole**
+   *  (`netconsole_*`), which fires at the crash instant before userspace dies.
+   *  Same server-side read-modify-write with fail-closed schema checks,
+   *  concurrency abort, and post-write verification as setGatewayFeature. The
+   *  group carries no key material, but the result is redacted as a matter of
+   *  course. `enabled:false` clears the targets, restoring local-only logging. */
+  async setRemoteLogging(opts: {
+    enabled: boolean;
+    host?: string;
+    mode?: "both" | "syslog" | "netconsole";
+    syslogPort?: number;
+    netconsolePort?: number;
+  }): Promise<string> {
+    const mode = opts.mode ?? "both";
+    const doSyslog = mode === "both" || mode === "syslog";
+    const doNet = mode === "both" || mode === "netconsole";
+
+    if (opts.enabled && !opts.host) {
+      throw new Error("set_remote_logging needs a collector 'host' (e.g. 192.168.0.32) when enabling.");
+    }
+    // LAN-only: the gateway's crash-log stream may only ever go to an RFC1918
+    // collector, never a routable/off-LAN sink (defense-in-depth vs. a bad host).
+    if (opts.host && !isPrivateIPv4(opts.host)) {
+      throw new Error(`Invalid collector host '${opts.host}' — expected a private LAN IPv4 (e.g. 192.168.0.32).`);
+    }
+    const portStr = (name: string, v: number | undefined, dflt: number): string => {
+      const n = v ?? dflt;
+      if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(`Invalid ${name} '${v}' — expected 1..65535.`);
+      return String(n);
+    };
+    // Validate every input BEFORE the network round-trip, so a bad port can't
+    // cost a GET/PUT.
+    const syslogPortStr = doSyslog && opts.enabled ? portStr("syslogPort", opts.syslogPort, 514) : undefined;
+    const netconsolePortStr = doNet && opts.enabled ? portStr("netconsolePort", opts.netconsolePort, 6666) : undefined;
+
+    const grp = (await this.getData<Record<string, unknown> & { key?: string; _id?: string }>("/rest/setting")).find(
+      (g) => g.key === "rsyslogd",
+    );
+    if (!grp?._id) throw new Error("UniFi has no 'rsyslogd' (remote logging) setting group on this gateway.");
+
+    // Fail closed on schema drift — require EVERY field the write will touch to
+    // already exist with the expected type, so version drift can't make us invent
+    // a setting shape. Includes the enable-only fields (port/this_controller/
+    // netconsole_port) so the invariant actually holds for them too.
+    const need: Array<[string, string]> = [];
+    if (doSyslog) {
+      need.push(["ip", "string"], ["enabled", "boolean"]);
+      if (opts.enabled) need.push(["port", "string"], ["this_controller", "boolean"]);
+    }
+    if (doNet) {
+      need.push(["netconsole_enabled", "boolean"], ["netconsole_host", "string"]);
+      if (opts.enabled) need.push(["netconsole_port", "string"]);
+    }
+    const bad = need.filter(([f, t]) => typeof grp[f] !== t);
+    if (bad.length) {
+      throw new Error(
+        `UniFi 'rsyslogd' isn't in the expected shape on this gateway (missing/wrong-type: ${bad.map(([f]) => f).join(", ")}); refusing to write.`,
+      );
+    }
+
+    const prev: Record<string, unknown> = {};
+    const updated: Record<string, unknown> = { ...grp };
+    if (doSyslog) {
+      prev.ip = grp.ip;
+      prev.enabled = grp.enabled;
+      updated.ip = opts.enabled ? opts.host : "";
+      updated.enabled = opts.enabled;
+      if (opts.enabled) {
+        updated.this_controller = true; // include the gateway's own logs
+        updated.port = syslogPortStr;
+      }
+    }
+    if (doNet) {
+      prev.netconsole_enabled = grp.netconsole_enabled;
+      prev.netconsole_host = grp.netconsole_host;
+      updated.netconsole_enabled = opts.enabled;
+      updated.netconsole_host = opts.enabled ? opts.host : "";
+      if (opts.enabled) updated.netconsole_port = netconsolePortStr;
+    }
+
+    // Best-effort concurrency handling (UniFi has no CAS/ETag write) — abort on
+    // any drift visible before writing; the residual final-window race is caught
+    // by the post-write verification below. Same contract as setGatewayFeature.
+    const fresh = (await this.getData<Record<string, unknown> & { _id?: string }>("/rest/setting")).find((g) => g._id === grp._id);
+    if (!fresh || JSON.stringify(fresh) !== JSON.stringify(grp)) {
+      throw new Error("UniFi 'rsyslogd' settings changed under us (concurrent edit); aborted to avoid clobbering other fields — retry.");
+    }
+
+    const path = `/rest/setting/rsyslogd/${grp._id}`;
+    const res = await this.api(path, { method: "PUT", body: updated });
+    this.ensureOk(res, path);
+
+    // Post-write verification — re-read and confirm OUR fields hold, so a
+    // concurrent write that reverted them is reported rather than a phantom success.
+    const after = (await this.getData<Record<string, unknown> & { _id?: string }>("/rest/setting")).find((g) => g._id === grp._id);
+    // Verify the boolean toggles (enabled / netconsole_enabled — the real source
+    // of truth for whether logging is active) strictly; treat cleared string
+    // targets as null/undefined/"" equivalent so a server-side normalization of a
+    // blanked host can't throw a phantom failure (matches setGatewayFeature's
+    // boolean-only contract while still checking the targets when present).
+    const held =
+      !!after &&
+      Object.keys(prev).every((f) =>
+        typeof updated[f] === "boolean" ? after[f] === updated[f] : (after[f] ?? "") === (updated[f] ?? ""),
+      );
+    if (!held) {
+      throw new Error("UniFi remote logging did not hold after the write (a concurrent settings change may have reverted it); retry and check the UniFi UI.");
+    }
+
+    const changed = Object.keys(prev)
+      .map((f) => `${f}: ${JSON.stringify(prev[f])} → ${JSON.stringify(updated[f])}`)
+      .join(", ");
+    if (!opts.enabled) {
+      return `UniFi remote logging DISABLED on ${this.target.name} (targets cleared). Changed ${changed}.`;
+    }
+    // Report the ports the gateway actually stored (post-write re-read), not the
+    // requested values, in case it normalized them.
+    const targets = [
+      doSyslog ? `syslog→${opts.host}:${after?.port ?? updated.port}` : null,
+      doNet ? `netconsole→${opts.host}:${after?.netconsole_port ?? updated.netconsole_port}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    // "CONFIGURED", not "streaming": the PUT persisted the target, but this write
+    // can't confirm the collector is actually receiving (esp. netconsole/UDP).
+    return `UniFi remote logging CONFIGURED on ${this.target.name} (${targets}) — persisted to the gateway; confirm the collector is receiving (delivery isn't verified by this write). Changed ${changed}. Revert with enabled=false.`;
+  }
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (u: UniFi) => Promise<T>): Promise<T> {
@@ -532,6 +685,31 @@ function buildTools(target: Target): ConnectorTool[] {
         );
       },
       run: run((u, i) => u.setGatewayFeature(i.feature, i.enabled)),
+    },
+    {
+      name: "set_remote_logging",
+      description:
+        `Stream ${target.name}'s off-box logs to a LAN collector so a crash-reboot doesn't wipe the evidence — ` +
+        `configures the gateway's rsyslogd group for userspace remote syslog and/or kernel netconsole (which fires ` +
+        `at the crash instant). Surgical server-side read-modify-write; the collector must be a private LAN IPv4 and ` +
+        `reachable from the gateway (this write persists the target but can't confirm delivery — verify the collector ` +
+        `is receiving). Reports prior state so you can revert with enabled=false.`,
+      tier: "execute",
+      inputSchema: z.object({
+        enabled: z.boolean().describe("true = stream logs to host; false = clear the syslog + netconsole targets (revert)."),
+        host: z.string().optional().describe("Collector's private LAN IPv4 (e.g. 192.168.0.32). Required when enabled=true."),
+        mode: z.enum(["both", "syslog", "netconsole"]).optional().describe("Which channel(s) to configure. Default 'both'."),
+        syslogPort: z.number().int().optional().describe("Remote syslog UDP port (default 514)."),
+        netconsolePort: z.number().int().optional().describe("Netconsole UDP port (default 6666)."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { enabled: boolean; host?: string; mode?: string };
+        const ch = i.mode ?? "both";
+        return i.enabled
+          ? `Enable UniFi remote logging (${ch}) → ${i.host} on ${t.name} — rewrites the rsyslogd settings group`
+          : `Disable UniFi remote logging (clear syslog + netconsole targets) on ${t.name} — rewrites the rsyslogd settings group`;
+      },
+      run: run((u, i) => u.setRemoteLogging(i)),
     },
   ];
 }
