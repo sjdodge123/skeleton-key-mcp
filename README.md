@@ -167,7 +167,7 @@ Ask Claude to `form_skeleton` and it walks every registered target and captures 
 Because a backup contains secrets, this is handled with the same care as the vault:
 
 - Each artifact is **encrypted at rest** (XChaCha20-Poly1305) under a key held inside the already-encrypted bootstrap store, written to `data/skeletons/<id>/…` alongside a manifest and a `RESTORE.md`. A copy of the `/data` volume alone can't decrypt a skeleton — the store's key is wrapped by the off-volume auto-unlock key.
-- The snapshot bytes **never reach the chat, a tool result, the manifest, or the audit log** — `form_skeleton` returns only a summary. The one plaintext egress is a **TOTP-gated download** (`POST /api/snapshots/:id/download`) from the web UI, which decrypts and streams a `.tar.gz`. Per-target failures are isolated, so one unreachable host yields a partial skeleton rather than no skeleton.
+- The snapshot bytes **never reach the chat, a tool result, the manifest, or the audit log** — `form_skeleton` returns only a summary. The one plaintext egress is a **TOTP-gated download** (`POST /api/snapshots/:id/download`) that decrypts and streams a `.tar.gz` — API-only today; a web-UI page to list and download skeletons is tracked in [#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50). Per-target failures are isolated, so one unreachable host yields a partial skeleton rather than no skeleton.
 
 ## Development
 
