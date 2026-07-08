@@ -127,6 +127,7 @@ After the wizard (scoped vault + first MCP connection), you don't hand-build the
 | `vault_validate_ssh` | read | SSH-connects to a host with a stored key and runs a harmless `id` to confirm access works. |
 | `register_target` | execute | Registers a service as a target so its tools become available. |
 | `list_targets` | read | Lists registered targets. |
+| `form_skeleton` | execute | Captures an encrypted disaster-recovery snapshot of every registered target (see [Disaster-recovery skeletons](#disaster-recovery-skeletons)). |
 
 A typical first session, entirely in chat:
 
@@ -150,9 +151,23 @@ The service account belongs to exactly one Vaultwarden organization/collection. 
 | `ssh` | ✅ read + gated execute | tail_log, journalctl, service_status, disk_usage, grep_logs, run_readonly, run_command, restart_service |
 | `http` | ✅ generic | get (read), request (execute) |
 | `portainer` | ✅ read + gated execute | list_endpoints, list_containers, container_logs, list_stacks, get_stack_file, start/stop/restart_container, exec_container, update_stack |
-| synology, proxmox, unifi, home-assistant, pihole | 🔜 later phases | — |
+| `home-assistant` | ✅ read + gated execute | ha_states, ha_get, ha_logbook, ha_call_service, ha_backup |
+| `proxmox` | ✅ read + gated execute | list_nodes, list_guests, node_status, guest_status, list_tasks, task_log, guest_power |
+| `unifi` | ✅ read + gated execute | list_devices, list_clients, list_networks, get_settings, set_network_ipv6, set_gateway_feature, set_remote_logging, force_provision |
+| synology, pihole | 🔜 later phases | — |
 
 Every tool is tagged `read` or `execute`. Execute tools produce a precise confirmation string, are surfaced to Claude's permission prompt, and are written to an append-only audit log. Destructive shell commands (`rm -rf`, `mkfs`, `dd`, …) are refused by policy even when approved.
+
+The UniFi connector can also stream a gateway's logs off-box (`set_remote_logging` — syslog / kernel netconsole to a LAN collector, RFC1918-only) and push a pending controller change onto the device (`force_provision`) so a `/rest/setting` write actually applies rather than sitting in the controller DB.
+
+## Disaster-recovery skeletons
+
+Ask Claude to `form_skeleton` and it walks every registered target and captures a **config snapshot** — scrubbed settings plus native backups where the service offers one: UniFi's `.unf` export, a Home Assistant backup, Pi-hole's teleporter, Proxmox guest/storage/network configs, Portainer stack compose + container inspects, and read-only system profiles over SSH. It's your pre-change safety net (e.g. before a risky network experiment).
+
+Because a backup contains secrets, this is handled with the same care as the vault:
+
+- Each artifact is **encrypted at rest** (XChaCha20-Poly1305) under a key held inside the already-encrypted bootstrap store, written to `data/skeletons/<id>/…` alongside a manifest and a `RESTORE.md`. A copy of the `/data` volume alone can't decrypt a skeleton — the store's key is wrapped by the off-volume auto-unlock key.
+- The snapshot bytes **never reach the chat, a tool result, the manifest, or the audit log** — `form_skeleton` returns only a summary. The one plaintext egress is a **TOTP-gated download** (`POST /api/snapshots/:id/download`) from the web UI, which decrypts and streams a `.tar.gz`. Per-target failures are isolated, so one unreachable host yields a partial skeleton rather than no skeleton.
 
 ## Development
 
