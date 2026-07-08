@@ -13,7 +13,7 @@
 | Deployment | Docker container on the NAS, MCP over Streamable HTTP with bearer auth |
 | Exposure | LAN only. Never exposed to the open internet. |
 | 2FA | TOTP on the admin web UI; scoped service account has its own credentials + API key |
-| v1 execute targets | Portainer (Docker), SSH, Home Assistant, Proxmox VMs/LXC |
+| v1 execute targets | Portainer (Docker), SSH, Home Assistant, Proxmox VMs/LXC, UniFi network changes (gateway feature toggles, IPv6, remote logging, force-provision) |
 
 ## Supported service types (examples — users register their own)
 
@@ -88,6 +88,41 @@ connection exist, the rest is driven by chat: `network_scan` (map the LAN),
 key generation uses `ssh-keygen` (OpenSSH format, so the ssh2 connector parses
 it). Private keys are stored, never returned to the caller.
 
+## Disaster-recovery snapshots (`form_skeleton`)
+
+A global `execute` tool, `form_skeleton`, captures an **encrypted config-only
+"skeleton"** of the whole homelab so it can be rebuilt after a loss. It iterates
+every registered target and asks each connector for a disaster-recovery
+artifact via an optional `Connector.snapshot()` hook:
+
+- **unifi** — scrubbed settings/networks/devices references + a native `.unf` backup
+- **ssh / pihole** — read-only system profile + the Pi-hole teleporter export
+- **proxmox** — guest / storage / network configs
+- **portainer** — stack compose files + container inspects
+- **home-assistant** — a triggered native backup (see limitation below) + `/api/config` reference
+
+Each artifact is encrypted (`crypto_aead_xchacha20poly1305_ietf`) under a
+dedicated **`snapshotKey` held in the bootstrap store** and written to
+`data/skeletons/<id>/<target>/<artifact>.enc` alongside a `manifest.json` and a
+human `RESTORE.md`. Per-target failures are isolated — a snapshot degrades to a
+partial skeleton rather than failing hard.
+
+**Security invariant (consistent with "secrets never in chat"):** a backup
+contains secrets, so **artifact bytes never reach a ToolResult, manifest, audit
+log, or the model context** — `form_skeleton` returns a summary only. The
+**only** plaintext egress is a **TOTP-gated web download** (`POST
+/api/snapshots` to list metadata, `POST /api/snapshots/:id/download` to decrypt
+and stream a `.tar.gz`; both `409` when the vault is locked and `403` on a bad
+TOTP). Encrypted at rest under a key inside the already-encrypted bootstrap
+store, whose key is wrapped by the off-volume auto-unlock key, so a copy of
+`/data` alone cannot decrypt a skeleton. No new dependencies (Node `zlib` gzip +
+a hand-rolled streaming `ustar` writer).
+
+**v1 limitations:** the Home Assistant full `.tar` backup stays **on the HA
+device** (the skeleton records the trigger result + config reference, not the
+archive). Skeletons are **not auto-pruned** — old ones are removed manually from
+the data volume.
+
 ## Connector modules (one per integration)
 
 | Connector | Transport | Read tools | Execute tools |
@@ -96,7 +131,7 @@ it). Private keys are stored, never returned to the caller.
 | **portainer** | Portainer REST API | list stacks/containers, container logs, stats | deploy stack/container, start/stop/restart, pull image |
 | **proxmox** | Proxmox VE REST API (token auth) | node/VM/LXC status, task logs, resource usage | start/stop/reboot VM & LXC, snapshot |
 | **home-assistant** | HA REST + WebSocket (long-lived token) | states, error log, logbook, config check, automation traces | call services, reload configs, restart HA |
-| **unifi** | UniFi OS API (cookie/CSRF) | clients, health, WAN status, firewall/port-forward rules, events | (v1: read-only) block client, firewall edits later |
+| **unifi** | UniFi OS API (cookie/CSRF) | clients, devices, networks, settings (secret-scrubbed), WAN status, firewall/port-forward rules, events | toggle gateway feature (DPI/UPnP/hardware offload/GeoIP), per-network IPv6, remote logging (syslog + netconsole), force-provision |
 | **synology** | DSM Web API (multi-host) | system health, storage/SMART, package status, shares | packages/shares (careful tier, later) |
 | **pihole** | Pi-hole API | query stats, blocklist status, top domains, DNS logs | enable/disable blocking, flush cache |
 | **network** | local exec inside container | ping, traceroute, DNS lookup, port check, mtr | — (diagnostics only) |
@@ -106,7 +141,7 @@ it). Private keys are stored, never returned to the caller.
 - **Tool tiers:** every tool declares `read` or `execute`. Execute tools route through the approval gate and name the exact action + target in confirmation text so the permission prompt is meaningful. Per-connector dry-run where feasible.
 - **MCP auth:** **OAuth 2.1** authorization server (dynamic client registration, PKCE S256, short-lived access + refresh tokens) with a **TOTP-gated consent screen** ("Authorize an AI agent"). Tokens are stored only as SHA-256 hashes and are revocable per-client. A static bearer token remains as a fallback for non-OAuth clients. `/mcp` 401s carry an RFC 9728 `WWW-Authenticate` discovery hint.
 - **Audit:** append-only SQLite table — tool, target, args digest, caller, timestamp, result status. Viewable in the web UI.
-- **Blast-radius limits:** SSH allow/deny command lists (deny `rm -rf`, `mkfs`, `dd`, etc.); destructive UniFi/DSM endpoints excluded from v1.
+- **Blast-radius limits:** SSH allow/deny command lists (deny `rm -rf`, `mkfs`, `dd`, etc.). UniFi execute tools are scoped to gateway feature toggles / IPv6 / remote logging / force-provision (each a surgical read-modify-write that reports prior state so it can be reverted); remote-logging egress is guarded to private LAN IPv4; destructive DSM endpoints stay out of v1.
 - **Web UI:** LAN-bound only, HTTPS (local/self-signed cert), single admin account (+ optional second user later).
 
 ## Build phases
