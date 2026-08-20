@@ -32,6 +32,17 @@ export interface ToolContext {
   target: Target;
   /** Resolves the target's credential from the vault (offline-cache backed). */
   getCredential: () => Promise<Credential>;
+  /**
+   * Resolves ANY vault item by name — for tools that must inject a credential
+   * other than the target's own (e.g. Portainer's `secretEnv`, which puts an
+   * app's DB password into a stack's environment without it ever transiting the
+   * chat/MCP channel). Lazy and in-memory only, like `getCredential`.
+   *
+   * Optional because non-MCP call sites (e.g. the snapshot service) build a
+   * ToolContext with only the target's own credential; a tool that needs it must
+   * fail with a clear error when it is absent, never silently skip the value.
+   */
+  resolveCredential?: (ref: string) => Promise<Credential>;
 }
 
 export interface ToolResult {

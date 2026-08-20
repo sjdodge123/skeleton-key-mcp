@@ -186,6 +186,29 @@ describe("buildLoginItemJson", () => {
     ]);
   });
 
+  it("carries an arbitrary named field set (multi-field credential hand-off) onto one item", () => {
+    const item = buildLoginItemJson({
+      name: "sxm-bot",
+      username: "svc-account",
+      notes: "migrated off fly.io",
+      organizationId: "org-1",
+      collectionId: "col-1",
+      fields: [
+        { name: "DISCORD_BOT_TOKEN", value: "d", hidden: true },
+        { name: "SXM_USERNAME", value: "svc-account", hidden: false },
+        { name: "SXM_PASSWORD", value: "p", hidden: true },
+      ],
+    }) as any;
+
+    expect(item.login.username).toBe("svc-account");
+    expect(item.login.uris).toEqual([]); // not an SSH login — no mislabeled URI
+    expect(item.fields).toEqual([
+      { name: "DISCORD_BOT_TOKEN", value: "d", type: 1 },
+      { name: "SXM_USERNAME", value: "svc-account", type: 0 },
+      { name: "SXM_PASSWORD", value: "p", type: 1 },
+    ]);
+  });
+
   it("omits uris when no url is given and defaults empty fields", () => {
     const item = buildLoginItemJson({ name: "x", organizationId: "o", collectionId: "c" }) as any;
     expect(item.login.uris).toEqual([]);

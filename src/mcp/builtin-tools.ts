@@ -11,6 +11,63 @@ import { formSkeleton } from "../snapshots/snapshot-service.js";
 const safeName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, "Use letters, digits, dot, dash, underscore.");
 
 /**
+ * Env-var style name for one field of a multi-field credential request. It
+ * becomes both the form input name and the Vaultwarden custom-field name, so it
+ * stays deliberately narrow (no spaces, dots, dashes, or leading digits).
+ */
+const credentialFieldName = z
+  .string()
+  .max(64)
+  .regex(/^[A-Za-z][A-Za-z0-9_]*$/, "Use an env-var style name: a letter, then letters/digits/underscores (e.g. DISCORD_BOT_TOKEN).");
+
+/** Backstop so one link can't ask for an unbounded wall of inputs. */
+const MAX_REQUEST_FIELDS = 10;
+
+const requestCredentialSchema = z
+  .object({
+    name: safeName.describe("Vault item name to create (also the future credentialRef)."),
+    host: z.string().describe("Host/IP (or app/service) the credential is for."),
+    kind: z
+      .enum(["password", "token"])
+      .optional()
+      .describe("Single-secret mode: password = username/password login; token = API token/key. Omit when passing `fields`."),
+    reason: z.string().describe("Short reason shown to the user, e.g. 'SSH access to onboard nas1'."),
+    username: z.string().optional().describe("Remote username, for password logins."),
+    fields: z
+      .array(
+        z.object({
+          name: credentialFieldName.describe("Field name, env-var style, e.g. 'DISCORD_BOT_TOKEN'. Becomes the vault custom-field name."),
+          label: z.string().max(200).optional().describe("Optional help text shown next to the input (never a value)."),
+          secret: z.boolean().optional().describe("Masked input + hidden vault field type. Defaults to true."),
+        }),
+      )
+      .min(1)
+      .max(MAX_REQUEST_FIELDS)
+      .optional()
+      .describe(
+        `Multi-field mode: collect this named SET of values (max ${MAX_REQUEST_FIELDS}) on ONE vault item, one input per field on a single link. ` +
+          "A field named 'username' also becomes the item's login username. Replaces `kind`.",
+      ),
+  })
+  .superRefine((v, ctx) => {
+    if (v.fields && v.kind) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["kind"], message: "Pass either `kind` (single secret) or `fields` (multi-field), not both." });
+    }
+    if (!v.fields && !v.kind) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["kind"], message: "Pass `kind` (single secret) or `fields` (multi-field)." });
+    }
+    const seen = new Set<string>();
+    for (const f of v.fields ?? []) {
+      if (seen.has(f.name)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["fields"], message: `Duplicate field name '${f.name}'.` });
+      }
+      seen.add(f.name);
+    }
+  });
+
+type RequestCredentialInput = z.infer<typeof requestCredentialSchema>;
+
+/**
  * Global MCP tools that operate on the vault and registry themselves rather than
  * a single target. These make onboarding conversational: Claude can generate and
  * store SSH keys, validate them, map the LAN, and register targets — so once the
@@ -56,7 +113,8 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
               "Recommended onboarding (offer to do this with the user):\n" +
               "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services. If it finds the router/gateway (e.g. UniFi), start there — its API names every other device on the network, so the rest of the scan stops being anonymous IPs.\n" +
               "2. Get a credential for the host, WITHOUT asking for secrets in chat:\n" +
-              "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status.\n" +
+              "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status. " +
+              "Several secrets for one app (e.g. env vars for a migration)? Pass `fields` so one link collects them all onto one vault item.\n" +
               "   • SSH host you already have access to? Call vault_generate_ssh_key, then either install the returned key via that host's run_command (if you already have a working credential) or give the user the one-liner to install it themselves.\n" +
               "3. register_target to add the host so its tools appear.\n" +
               "4. vault_validate_ssh (for ssh) to confirm access.\n\n" +
@@ -352,31 +410,38 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
     {
       name: "request_credential",
       description:
-        "Ask the user to provide a credential (password or API token) for a host WITHOUT it passing through the chat. Returns a one-time, TOTP-gated web link; the user enters the secret in their browser and it is stored straight in the vault. Poll credential_request_status to know when it's done, then register_target with the item name.",
+        "Ask the user to provide credentials for a host WITHOUT them passing through the chat. Returns a one-time, TOTP-gated web link; the user types the value(s) in their browser and they are stored straight in the vault. " +
+        "Single-secret mode: pass `kind` (password or token). Multi-field mode: pass `fields` to collect a NAMED SET of values (e.g. an app's env secrets DISCORD_BOT_TOKEN / SXM_USERNAME / SXM_PASSWORD) onto ONE vault item — each becomes a custom field of that name. " +
+        "Poll credential_request_status to know when it's done, then register_target with the item name.",
       tier: "execute",
-      inputSchema: z.object({
-        name: safeName.describe("Vault item name to create (also the future credentialRef)."),
-        host: z.string().describe("Host/IP the credential is for."),
-        kind: z.enum(["password", "token"]).describe("password = username/password login; token = API token/key."),
-        reason: z.string().describe("Short reason shown to the user, e.g. 'SSH access to onboard nas1'."),
-        username: z.string().optional().describe("Remote username, for password logins."),
-      }),
+      inputSchema: requestCredentialSchema,
       confirm: (input) => {
-        const i = input as { name: string; host: string };
-        return `Create a one-time credential-request link for '${i.name}' (${i.host})`;
+        const i = input as { name: string; host: string; fields?: { name: string }[] };
+        const what = i.fields?.length ? ` for ${i.fields.length} field(s): ${i.fields.map((f) => f.name).join(", ")}` : "";
+        return `Create a one-time credential-request link for '${i.name}' (${i.host})${what}`;
       },
       run: async (input, a) => {
-        const i = input as { name: string; host: string; kind: "password" | "token"; reason: string; username?: string };
+        const i = input as RequestCredentialInput;
         const names = await a.vault.listItemNames();
         if (names.includes(i.name)) return err(`A vault item named '${i.name}' already exists — pick a different name.`);
-        const request = a.credentialRequests.create({ name: i.name, host: i.host, username: i.username, kind: i.kind, reason: i.reason });
+        const fields = i.fields?.map((f) => ({ name: f.name, label: f.label, secret: f.secret ?? true }));
+        const request = a.credentialRequests.create({
+          name: i.name,
+          host: i.host,
+          username: i.username,
+          kind: fields ? undefined : i.kind,
+          fields,
+          reason: i.reason,
+        });
         const base = a.publicUrl();
         const link = `${base ?? ""}/credential/${request.id}`;
         const shown = base ? link : `${link}  (open on your Skeleton Key host; set SKELETON_KEY_PUBLIC_URL for absolute links)`;
+        const asks = fields ? `these ${fields.length} value(s) — ${fields.map((f) => f.name).join(", ")} —` : `the ${i.kind}`;
         return ok(
-          `Ask the user to open this one-time link and enter the ${i.kind} for ${i.host} — you will not see the value:\n\n${shown}\n\n` +
+          `Ask the user to open this one-time link and enter ${asks} for ${i.host} — you will not see ${fields ? "the values" : "the value"}:\n\n${shown}\n\n` +
             `The link is TOTP-gated and expires in 15 minutes. After they submit, call credential_request_status with id "${request.id}"; ` +
-            `once it reports 'fulfilled', register the target with credentialRef '${i.name}'.`,
+            `once it reports 'fulfilled', register the target with credentialRef '${i.name}'` +
+            `${fields ? ` (all ${fields.length} values live on that one item as custom fields)` : ""}.`,
         );
       },
     },
@@ -390,8 +455,15 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         const request = a.credentialRequests.get(i.id);
         if (!request) return err(`No credential request with id '${i.id}' (it may have expired and been evicted). Create a new one with request_credential.`);
         switch (request.status) {
-          case "fulfilled":
-            return ok(`✅ fulfilled — credential '${request.fulfilledName}' is in the vault. Register the target with credentialRef '${request.fulfilledName}'.`);
+          case "fulfilled": {
+            // Field NAMES only — the values are in the vault and never surface here.
+            const names = request.fields?.map((f) => f.name);
+            return ok(
+              `✅ fulfilled — credential '${request.fulfilledName}' is in the vault` +
+                `${names?.length ? ` with ${names.length} field(s): ${names.join(", ")}` : ""}. ` +
+                `Register the target with credentialRef '${request.fulfilledName}'.`,
+            );
+          }
           case "pending":
             return ok(`⏳ pending — the user hasn't submitted the credential for '${request.name}' yet. Ask them to open the link, or check again shortly.`);
           case "expired":

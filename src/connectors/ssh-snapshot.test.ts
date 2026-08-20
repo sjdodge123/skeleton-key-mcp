@@ -1,9 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 
-vi.mock("./ssh-exec.js", () => ({
-  runSsh: vi.fn(),
-  shellQuote: (s: string) => `'${s}'`,
-}));
+vi.mock("./ssh-exec.js", async () => {
+  const actual = await vi.importActual<typeof import("./ssh-exec.js")>("./ssh-exec.js");
+  return {
+    ...actual,
+    runSsh: vi.fn(),
+    shellQuote: (s: string) => `'${s}'`,
+  };
+});
 
 import { sshConnector } from "./ssh.js";
 import { runSsh } from "./ssh-exec.js";

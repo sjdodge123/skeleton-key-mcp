@@ -8,6 +8,11 @@ export interface SshExecResult {
   code: number | null;
 }
 
+/** Preserves today's behavior when no `commandTimeoutMs` / `timeoutSeconds` is set. */
+export const DEFAULT_SSH_TIMEOUT_MS = 20_000;
+/** Hard ceiling for both the per-target option and the per-call override (10 minutes). */
+export const MAX_SSH_TIMEOUT_MS = 600_000;
+
 /** True only for text that is actually an SSH private key. Used so freeform
  *  notes (which `getCredential` exposes via `cred.secret`) aren't mistaken for a
  *  key and handed to ssh2, which would fail with "Unsupported key format" even
@@ -68,14 +73,19 @@ export function runSsh(
   command: string,
   opts: { timeoutMs?: number } = {},
 ): Promise<SshExecResult> {
-  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
   const config = buildConnectConfig(target, cred, timeoutMs);
 
   return new Promise<SshExecResult>((resolve, reject) => {
     const conn = new Client();
     const timer = setTimeout(() => {
       conn.end();
-      reject(new Error(`SSH to ${target.name} (${target.host}) timed out after ${timeoutMs}ms.`));
+      reject(
+        new Error(
+          `SSH command on ${target.name} (${target.host}) timed out after ${timeoutMs}ms (${Math.round(timeoutMs / 1000)}s). ` +
+            `Raise it via the target's "commandTimeoutMs" option (max ${MAX_SSH_TIMEOUT_MS}ms), or pass "timeoutSeconds" on this call (max ${MAX_SSH_TIMEOUT_MS / 1000}s).`,
+        ),
+      );
     }, timeoutMs);
 
     // Answer keyboard-interactive prompts with the password (the server-prompted
