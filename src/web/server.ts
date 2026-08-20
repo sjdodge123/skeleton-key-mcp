@@ -172,9 +172,22 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
  *   /mcp   — the MCP Streamable HTTP endpoint (OAuth/bearer-authed, stateful)
  *   /api   — wizard + admin REST API
  *   /      — the setup wizard UI
+ *
+ * When the process serves TLS, pass the active certificate PEM so it's
+ * downloadable at /tls/cert.pem (unauthenticated by design — the certificate is
+ * public material, presented in every handshake; the download exists for the
+ * one-time trust step and NODE_EXTRA_CA_CERTS. Verify its SHA-256 fingerprint
+ * against the one printed in the boot log).
  */
-export function buildHttpApp(app: AppState): express.Express {
+export function buildHttpApp(app: AppState, opts: { tlsCertPem?: string | null } = {}): express.Express {
   const server = express();
+
+  if (opts.tlsCertPem) {
+    const pem = opts.tlsCertPem;
+    server.get("/tls/cert.pem", (_req, res) => {
+      res.type("application/x-pem-file").send(pem);
+    });
+  }
   server.use(express.json({ limit: "4mb" }));
   // OAuth token/consent requests are form-encoded.
   server.use(express.urlencoded({ extended: false }));

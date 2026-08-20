@@ -26,11 +26,11 @@ function rank(ip: string): number {
 }
 
 /**
- * Best-guess LAN base URL from the host's own network interfaces, or null if no
- * private IPv4 is found (e.g. a bridged container with only Docker addresses).
- * `ifaces` is injectable for testing.
+ * All non-internal private IPv4 addresses of this host, best (192.168) first.
+ * Used for the base-URL guess below and as the SANs of the self-signed TLS
+ * certificate. `ifaces` is injectable for testing.
  */
-export function detectLanBaseUrl(port: number, ifaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string | null {
+export function detectLanIps(ifaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string[] {
   const candidates: string[] = [];
   for (const addrs of Object.values(ifaces)) {
     for (const a of addrs ?? []) {
@@ -40,8 +40,39 @@ export function detectLanBaseUrl(port: number, ifaces: ReturnType<typeof network
     }
   }
   candidates.sort((a, b) => rank(a) - rank(b));
-  const ip = candidates[0];
-  return ip ? `http://${ip}:${port}` : null;
+  return [...new Set(candidates)];
+}
+
+/**
+ * Best-guess LAN base URL from the host's own network interfaces, or null if no
+ * private IPv4 is found (e.g. a bridged container with only Docker addresses).
+ * `scheme` follows whether the server booted with TLS.
+ */
+export function detectLanBaseUrl(
+  port: number,
+  scheme: "http" | "https" = "http",
+  ifaces: ReturnType<typeof networkInterfaces> = networkInterfaces(),
+): string | null {
+  const ip = detectLanIps(ifaces)[0];
+  return ip ? `${scheme}://${ip}:${port}` : null;
+}
+
+/**
+ * Rewrite just the scheme of a persisted base URL (http ↔ https), preserving
+ * host and port — used to migrate `data/public-url` when TLS is enabled on an
+ * existing deployment (or disabled again). Returns null when the input isn't an
+ * absolute http(s) URL with an explicit port: without one, switching the scheme
+ * would silently change the default port (80 ↔ 443), so we leave it alone.
+ */
+export function switchScheme(url: string, scheme: "http" | "https"): string | null {
+  try {
+    const u = new URL(url);
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.port) return null;
+    u.protocol = `${scheme}:`;
+    return u.origin;
+  } catch {
+    return null;
+  }
 }
 
 /** Read the persisted public URL, or null if none has been written. */

@@ -21,7 +21,7 @@ docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
 ```
 
 1. **Deploy the container** on your NAS/home server (e.g. import `docker-compose.yml` as a stack in Portainer). Edit the `ports:` line to bind your host's LAN IP.
-2. **Open the web UI** at `http://<host>:8787/` and follow the wizard:
+2. **Open the web UI** at `https://<host>:8787/` and follow the wizard (your browser warns about the self-signed certificate on first visit — see [LAN TLS](#lan-tls) for the one-time trust step):
    - set a master passphrase (encrypts Skeleton Key's own secrets; also your admin login),
    - create a scoped **Vaultwarden** org + collection + service-account user (the wizard tells you exactly how) and connect it,
    - review the automatic **scoping & durability** checks,
@@ -29,18 +29,43 @@ docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
    - enroll **TOTP** 2FA,
    - optionally enable **boot auto-unlock** (see [Boot auto-unlock](#boot-auto-unlock)),
    - copy the **Claude connect command**.
-3. **Connect Claude** (Code or Desktop): `claude mcp add --transport http skeleton-key http://<host>:8787/mcp`. On first use, Claude opens a browser **consent page**; approve it with your authenticator code. Claude now sees tools for each registered service.
+3. **Connect Claude** (Code or Desktop): trust the certificate ([LAN TLS](#lan-tls)), then `claude mcp add --transport http skeleton-key https://<host>:8787/mcp`. On first use, Claude opens a browser **consent page**; approve it with your authenticator code. Claude now sees tools for each registered service.
 
 ## Connecting Claude (OAuth)
 
 Skeleton Key is an **OAuth 2.1** resource+authorization server, so there's no token to copy or store in plaintext:
 
-- Add the server (`claude mcp add --transport http skeleton-key http://<host>:8787/mcp`).
+- Add the server (`claude mcp add --transport http skeleton-key https://<host>:8787/mcp`).
 - The first request 401s with a discovery hint; Claude auto-registers, then opens the **"Authorize an AI agent"** page served by Skeleton Key.
 - You approve with your **TOTP code** (PKCE + short-lived access tokens that auto-refresh).
 - Revoke an agent anytime — it's TOTP-gated (`POST /api/oauth/clients/:id/revoke`); a future admin console surfaces this in the UI.
 
 A **static bearer token** is still accepted as a fallback for clients without OAuth support (shown under "Advanced" in the wizard).
+
+## LAN TLS
+
+Everything the web UI carries — the master passphrase at unlock, credentials typed into hand-off forms — must not cross the LAN in the clear, and MCP clients refuse to send OAuth tokens to a non-HTTPS endpoint. So Skeleton Key serves **HTTPS by default**: on first boot it generates a self-signed certificate into `data/tls/` (SANs cover `localhost`, the host's LAN IPs, and the public-URL host) and re-issues it automatically near expiry or when the pinned public URL points at a host the certificate doesn't cover. Existing deployments migrate seamlessly on upgrade: the persisted public URL's scheme flips to `https://`, and if certificate generation ever fails the server falls back to plain HTTP with a loud log warning instead of refusing to boot.
+
+Because the certificate is self-signed, each client trusts it **once**:
+
+1. **Get the certificate.** It's served at `https://<host>:8787/tls/cert.pem` (public material — it's presented in every TLS handshake anyway):
+
+   ```bash
+   curl -k https://<host>:8787/tls/cert.pem -o skeleton-key.pem
+   ```
+
+   Verify its SHA-256 fingerprint against the one printed in the container's boot log (`docker logs skeleton-key | grep fingerprint`) — that closes the trust-on-first-use gap of the `-k` fetch.
+2. **Browsers** — either click through the warning once, or import `skeleton-key.pem` into your OS trust store (macOS: Keychain Access → System → import, set *Always Trust*; Windows: `certmgr.msc` → Trusted Root Certification Authorities) for a clean padlock.
+3. **Claude Code / Node-based MCP clients** — point Node at the certificate before launching:
+
+   ```bash
+   export NODE_EXTRA_CA_CERTS=/path/to/skeleton-key.pem
+   claude mcp add --transport http skeleton-key https://<host>:8787/mcp
+   ```
+
+   Put the `export` in your shell profile so every `claude` session gets it. (This *adds* a trusted CA; it does not disable verification for anything else.)
+
+Prefer your own CA? Mount a pair and set `SKELETON_KEY_TLS_CERT_FILE` / `SKELETON_KEY_TLS_KEY_FILE` — then clients already trusting your CA need no extra step. To opt out entirely (old behavior), set `SKELETON_KEY_TLS=off`; expect MCP clients to require an `mcp-remote <url> --allow-http` stdio bridge in that mode. TLS here is **in addition to** the LAN-only rule, not a substitute — keep the port bound to the LAN either way.
 
 ## Configuration
 
@@ -56,7 +81,9 @@ All configuration is optional — the defaults work for a standard container dep
 | `SKELETON_KEY_UNLOCK_KEY_FILE` | `/run/secrets/skeleton-key/unlock-key` | Where the **boot auto-unlock key** lives inside the container. This is a non-secret *path* — the key itself is a random value the web UI writes there when you enable auto-unlock (see [Boot auto-unlock](#boot-auto-unlock)). Only set this to override the default location. |
 | `SKELETON_KEY_PASSPHRASE` / `SKELETON_KEY_PASSPHRASE_FILE` | _(unset)_ | **Deprecated.** The old auto-unlock: your master passphrase in the environment (or in a file the `_FILE` variant points at). Still honored, with a warning at boot, so existing deployments keep working — but prefer [Boot auto-unlock](#boot-auto-unlock), which never puts the passphrase on disk at all. |
 | `SKELETON_KEY_DISABLE_EXECUTE` | _(unset)_ | Set to `1` as a kill-switch: all `execute`-tier tools are refused and audited as denied, leaving only read-only tools. Useful while testing or if you want Claude to look but not touch. |
-| `SKELETON_KEY_PUBLIC_URL` | _(unset)_ | The externally-reachable base URL (e.g. `http://192.168.1.10:8787`). Used as the OAuth issuer / discovery origin so it can't be steered by a forged `Host` header. Set this if a reverse proxy sits in front; otherwise the request's own host is used and `X-Forwarded-*` is ignored. |
+| `SKELETON_KEY_PUBLIC_URL` | _(unset)_ | The externally-reachable base URL (e.g. `https://192.168.1.10:8787`). Used as the OAuth issuer / discovery origin so it can't be steered by a forged `Host` header. Set this if a reverse proxy sits in front; otherwise the request's own host is used and `X-Forwarded-*` is ignored. |
+| `SKELETON_KEY_TLS` | `auto` | [LAN TLS](#lan-tls). `auto` (default) serves HTTPS with a mounted or self-managed certificate; `off` serves plain HTTP (old behavior — passphrases and hand-off credentials then cross the LAN unencrypted). |
+| `SKELETON_KEY_TLS_CERT_FILE` / `SKELETON_KEY_TLS_KEY_FILE` | _(unset)_ | Mount your own PEM certificate + private key (e.g. from a private CA) instead of the auto-generated self-signed pair. Set both or neither; a broken pair fails the boot loudly rather than silently serving a different certificate. |
 
 ### Docker / compose setup
 
@@ -106,7 +133,7 @@ Auto-unlock trades that kill-switch for hands-off recovery, without ever writing
    chmod 700 /volume1/docker/secrets/skeleton-key
    ```
    and add the volume line from the stack example above.
-2. **Enable it in the web UI** — either the wizard's *Auto-unlock* step on first setup, or any time later from the unlock page (`http://<host>:8787/`): unlock, enter your **authenticator code**, and click *Enable auto-unlock*.
+2. **Enable it in the web UI** — either the wizard's *Auto-unlock* step on first setup, or any time later from the unlock page (`https://<host>:8787/`): unlock, enter your **authenticator code**, and click *Enable auto-unlock*.
 
 Skeleton Key then generates a **random unlock key**, enrolls it as a second keyslot on the encrypted store, and writes it to the mounted directory. At boot, that key unlocks the store; your passphrase stays exactly where it was — in your head. Disabling (same TOTP-gated page) removes the keyslot and deletes the file; a leaked copy of the old key is useless afterwards.
 
