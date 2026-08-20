@@ -2,7 +2,7 @@
 
 Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
 
-_Last updated: 2026-07-08._
+_Last updated: 2026-08-20._
 
 ## TL;DR
 
@@ -28,6 +28,8 @@ Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connect
 - **Verify bearer while locked (#20)** — `src/config/bearer-hash.ts` persists a lock-independent SHA-256 of the bearer so a valid legacy bearer is admitted to the banner-only `get_started` (not 401'd) after a restart.
 - **Encrypted disaster-recovery skeletons (`form_skeleton`, #49)** — new `src/snapshots/` (`crypto.ts` snapshotKey lifecycle + `crypto_aead_xchacha20poly1305_ietf`; `tar.ts` a hand-rolled streaming ustar writer, no dependency; `snapshot-service.ts` orchestration + manifest + streaming download) plus an optional `Connector.snapshot?(ctx)` hook / `SnapshotArtifact` type implemented per connector (unifi scrubbed settings/networks/devices + native `.unf` backup; ssh/pihole read-only system profile + Pi-hole teleporter; proxmox guest/storage/network configs; portainer stack compose + container inspects; home-assistant triggered backup + `/api/config` reference). The global execute tool `form_skeleton` (`src/mcp/builtin-tools.ts`) iterates every registered target, encrypts each artifact under a `snapshotKey` in the bootstrap store, writes `data/skeletons/<id>/<target>/<artifact>.enc` + `manifest.json` + `RESTORE.md`, and returns a summary only; per-target failures are isolated (partial skeleton, never a hard fail). New TOTP-gated web routes (`src/web/routes.ts`) `POST /api/snapshots` (list, metadata only) and `POST /api/snapshots/:id/download` (decrypt + stream a `.tar.gz`) are the **only** plaintext egress (locked → 409, bad TOTP → 403). **Load-bearing invariant:** artifact bytes never reach a ToolResult / manifest / audit log / model context — encrypted at rest under a key wrapped by the off-volume auto-unlock key, so a copy of `/data` alone can't decrypt a skeleton. No new dependencies (`node:zlib` gzip + the ustar writer). Merged, deployed, and smoke-tested against all 8 targets.
 
+- **Fly.io → Portainer migration toolkit** — everything an agent needs to stand up a new app from a compose file, built to dogfood the Stella / coworker-bot fly.io exits. Portainer connector: **`create_stack`** (POST `/api/stacks/create/standalone/string`, injects a `# x-skeleton-key-managed: true` marker), **`remove_stack`** (refuses stacks without the marker; verifies id↔name; never touches volumes/bind mounts), **`container_inspect`** (curated state/health/mounts/ports read tool, env values redacted), **`exec_container` now gated by the command deny-list** (was unpoliced), and `list_stacks` redacts stack env values. **`secretEnv` vault bridge** on `create_stack`/`update_stack`: `[{name, credentialRef, field?}]` resolved server-side (new optional `ToolContext.resolveCredential`) into the stack's substitution env — secret values never transit chat/results/audit, and Portainer error bodies are scrubbed of resolved values. **Multi-field `request_credential`**: a `fields` list (≤10, env-var-style names, masked when `secret`) collects an app's whole secret set on ONE TOTP link into ONE vault item (custom fields; a `username` field also fills the login username). **SSH timeouts configurable**: per-target `commandTimeoutMs` and per-call `timeoutSeconds` on `run_command` (precedence per-call > per-target > 20s default, max 10 min) for long `docker compose pull`-style operations.
+
 Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang, locked-state kill-switch gaps, credential-delete guard bypass).
 
 ## Open PRs
@@ -48,7 +50,7 @@ Roughly in priority order — pick up any of these:
 4. **Admin console** — the web UI is first-run-wizard only. Grow it into an authenticated admin page: audit-log viewer, target CRUD, OAuth client list/revoke (endpoints already exist under `/api/oauth/clients`), token rotation, vault re-unlock, and a **snapshots page to list + download DR skeletons** (the `form_skeleton` download is API-only today — tracked in [#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50)). Reuse the wizard's TOTP/verify components.
 5. **Scan accuracy round 2** — fingerprints are content-based now but still imperfect (e.g., SPA shells that don't self-identify show as "likely"/"open"). Consider secondary probes (Portainer `/api/status`, Pi-hole `/admin`) and de-noising the results list.
 6. **Operational polish** — consider a scan progress indicator (the fingerprinting scan is slower than the old port scan).
-7. **Per-target command policies & dry-run** — the deny-list is global; add per-target allow/deny and optional dry-run for execute tools.
+7. **Per-target command policies & dry-run** — per-target `allowPatterns`/`denyPatterns` now exist on ssh AND portainer (`exec_container`); still open: dry-run for execute tools (esp. a `create_stack`/`update_stack` compose preview).
 
 ## Environment notes (not in the repo on purpose)
 

@@ -72,4 +72,27 @@ describe("CredentialRequestStore", () => {
     const { store } = storeAt();
     expect(store.get("nope")).toBeUndefined();
   });
+
+  it("round-trips multi-field metadata (names/labels/secret flags) and drops `kind`", () => {
+    const { store } = storeAt();
+    const fields = [
+      { name: "DISCORD_BOT_TOKEN", label: "From the developer portal", secret: true },
+      { name: "SXM_USERNAME", secret: false },
+    ];
+    const req = store.create({ name: "sxm-bot", host: "fly-app", fields, reason: "migrate off fly.io" });
+    expect(store.get(req.id)!.fields).toEqual(fields);
+    // Multi-field replaces the single-value mode rather than coexisting with it.
+    expect(store.get(req.id)!.kind).toBeUndefined();
+    // The stored metadata is a copy — mutating the caller's array can't change
+    // what the form renders or writes.
+    fields[0]!.name = "TAMPERED";
+    expect(store.get(req.id)!.fields![0]!.name).toBe("DISCORD_BOT_TOKEN");
+  });
+
+  it("keeps single-secret mode intact when no fields are given", () => {
+    const { store } = storeAt();
+    const req = store.create(sample);
+    expect(store.get(req.id)!.kind).toBe("password");
+    expect(store.get(req.id)!.fields).toBeUndefined();
+  });
 });

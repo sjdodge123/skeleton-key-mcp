@@ -14,12 +14,33 @@ import { randomUUID } from "node:crypto";
 export type CredentialKind = "password" | "token";
 export type RequestStatus = "pending" | "fulfilled" | "expired" | "declined";
 
+/**
+ * One named value in a multi-field request (e.g. migrating an app's env secrets:
+ * DISCORD_BOT_TOKEN, SXM_USERNAME, SXM_PASSWORD). This is *metadata only* — the
+ * name/label describe the input to render; the value the user types is written
+ * straight to the vault and never stored here.
+ */
+export interface CredentialField {
+  /** Env-var style name; becomes the Vaultwarden custom-field name. */
+  name: string;
+  /** Optional human help text rendered next to the input. */
+  label?: string;
+  /** Masked input + hidden (secret) Vaultwarden field type. */
+  secret: boolean;
+}
+
 export interface CredentialRequest {
   id: string;
   name: string; // vault item name to create (also the future credentialRef)
   host: string;
   username?: string;
-  kind: CredentialKind;
+  /** Single-secret mode. Undefined when `fields` is set (multi-field mode). */
+  kind?: CredentialKind;
+  /**
+   * Multi-field mode: one link collects this whole named SET onto ONE vault
+   * item. Metadata only — never any value the user types.
+   */
+  fields?: CredentialField[];
   reason: string;
   createdAt: number;
   status: RequestStatus;
@@ -39,7 +60,9 @@ export interface NewRequest {
   name: string;
   host: string;
   username?: string;
-  kind: CredentialKind;
+  /** Omit when `fields` is given — the two modes are mutually exclusive. */
+  kind?: CredentialKind;
+  fields?: CredentialField[];
   reason: string;
 }
 
@@ -60,7 +83,10 @@ export class CredentialRequestStore {
       name: input.name,
       host: input.host,
       username: input.username,
-      kind: input.kind,
+      kind: input.fields?.length ? undefined : (input.kind ?? "password"),
+      // Copy the field metadata so a later mutation by the caller can't change
+      // what the form renders / writes.
+      fields: input.fields?.length ? input.fields.map((f) => ({ ...f })) : undefined,
       reason: input.reason,
       createdAt: this.now(),
       status: "pending",

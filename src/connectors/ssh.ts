@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
-import { runSsh, shellQuote } from "./ssh-exec.js";
+import { runSsh, shellQuote, MAX_SSH_TIMEOUT_MS } from "./ssh-exec.js";
 import { checkCommand, READONLY_ALLOW, type CommandPolicyOptions } from "./command-policy.js";
 
 const optionsSchema = z
@@ -12,6 +12,11 @@ const optionsSchema = z
     /** Config-dump commands run by `form_skeleton` for this host. Each becomes one
      *  artifact. If unset, a default read-only system profile is captured. */
     snapshotCommands: z.array(z.string()).optional(),
+    /** Per-target default for how long a single SSH command may run before it's
+     *  killed, in ms. Unset preserves today's ~20s default (`DEFAULT_SSH_TIMEOUT_MS`).
+     *  Capped at `MAX_SSH_TIMEOUT_MS` (10 minutes) so a long-running migration
+     *  command (docker compose pull, large file ops) doesn't need an unbounded wait. */
+    commandTimeoutMs: z.number().int().positive().max(MAX_SSH_TIMEOUT_MS).optional(),
   })
   .default({});
 
@@ -20,9 +25,21 @@ function policyFor(target: Target): CommandPolicyOptions {
   return { deny: opts.denyPatterns, allow: opts.allowPatterns };
 }
 
-async function exec(ctx: ToolContext, command: string): Promise<ToolResult> {
+/** The target's configured `commandTimeoutMs`, or undefined to fall back to
+ *  `runSsh`'s own default. */
+function targetTimeoutMs(target: Target): number | undefined {
+  return optionsSchema.parse(target.options ?? {}).commandTimeoutMs;
+}
+
+/**
+ * Run a command over SSH. `timeoutMs`, when given (a per-call override, e.g.
+ * `run_command`'s `timeoutSeconds`), wins over the target's `commandTimeoutMs`
+ * option, which in turn wins over `runSsh`'s own default.
+ */
+async function exec(ctx: ToolContext, command: string, timeoutMs?: number): Promise<ToolResult> {
   const cred = await ctx.getCredential();
-  const { stdout, stderr, code } = await runSsh(ctx.target, cred, command);
+  const effectiveTimeoutMs = timeoutMs ?? targetTimeoutMs(ctx.target);
+  const { stdout, stderr, code } = await runSsh(ctx.target, cred, command, { timeoutMs: effectiveTimeoutMs });
   const body = stdout || stderr || "(no output)";
   return {
     text: code === 0 ? body : `exit ${code}\n${body}`,
@@ -117,18 +134,27 @@ function buildTools(target: Target): ConnectorTool[] {
   const executeTools: ConnectorTool[] = [
     {
       name: "run_command",
-      description: `Run an arbitrary shell command on ${target.name}. Destructive commands are refused by policy.`,
+      description: `Run an arbitrary shell command on ${target.name}. Destructive commands are refused by policy. Long-running commands (e.g. docker compose pull, large file ops) can raise the timeout with 'timeoutSeconds'.`,
       tier: "execute",
-      inputSchema: z.object({ command: z.string() }),
+      inputSchema: z.object({
+        command: z.string(),
+        timeoutSeconds: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_SSH_TIMEOUT_MS / 1000)
+          .optional()
+          .describe(`How long to let this command run before it's killed, in seconds (max ${MAX_SSH_TIMEOUT_MS / 1000}). Overrides the target's default.`),
+      }),
       confirm: (input, t) =>
         `Run on ${t.name} (${t.host}): ${(input as { command: string }).command}`,
       run: (input, ctx) => {
-        const { command } = input as { command: string };
+        const { command, timeoutSeconds } = input as { command: string; timeoutSeconds?: number };
         const verdict = checkCommand(command, policyFor(ctx.target));
         if (!verdict.allowed) {
           return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
         }
-        return exec(ctx, command);
+        return exec(ctx, command, timeoutSeconds ? timeoutSeconds * 1000 : undefined);
       },
     },
     {

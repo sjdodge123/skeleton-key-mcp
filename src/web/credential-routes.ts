@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type { AppState } from "../app.js";
-import type { CredentialRequest } from "./credential-requests.js";
+import type { CredentialField, CredentialRequest } from "./credential-requests.js";
 import { firstStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
 
@@ -40,29 +40,51 @@ function messagePage(title: string, body: string): string {
   return shell(title, `<h1>🗝️ ${htmlEscape(title)}</h1><p class="mut">${htmlEscape(body)}</p>`);
 }
 
+/**
+ * Form field name for a multi-field value. Prefixed so a requested field can
+ * never shadow a control field (`formToken`, `totp`, `action`, `username`).
+ */
+export const FIELD_INPUT_PREFIX = "f_";
+
+function fieldInputs(fields: CredentialField[]): string {
+  return fields
+    .map((f, idx) => {
+      const help = f.label ? ` <span class="mut">— ${htmlEscape(f.label)}</span>` : "";
+      return `<label>${htmlEscape(f.name)}${help}</label>
+    <input type="${f.secret ? "password" : "text"}" name="${htmlEscape(FIELD_INPUT_PREFIX + f.name)}" autocomplete="off"${idx === 0 ? " autofocus" : ""}/>`;
+    })
+    .join("\n    ");
+}
+
 function formPage(req: CredentialRequest, error?: string): string {
+  const multi = req.fields?.length ? req.fields : null;
   const secretLabel = req.kind === "token" ? "API token / key" : "Password";
   const usernameField = `<label>Username</label><input type="text" name="username" value="${htmlEscape(req.username ?? "")}" placeholder="e.g. root" autocomplete="off"/>`;
+  const what = multi ? `${multi.length} value${multi.length === 1 ? "" : "s"}` : (req.kind ?? "credential");
+  const title = multi ? "Provide credentials" : "Provide a credential";
+  const inputs = multi
+    ? fieldInputs(multi)
+    : `${req.kind === "password" ? usernameField : ""}
+    <label>${secretLabel}</label>
+    <input type="password" name="secret" autocomplete="off" autofocus/>`;
   return shell(
-    "Provide a credential",
-    `<h1>🗝️ Provide a credential</h1>
-  <p class="mut">Claude is asking you to store a credential so it can access a host. It never sees what you type here — the value goes straight into your scoped vault.</p>
+    title,
+    `<h1>🗝️ ${htmlEscape(title)}</h1>
+  <p class="mut">Claude is asking you to store ${multi ? "credentials" : "a credential"} so it can access a host. It never sees what you type here — ${multi ? "the values go" : "the value goes"} straight into your scoped vault.</p>
   <div class="who">
-    <b>${htmlEscape(req.name)}</b> — ${htmlEscape(req.kind)} for <b>${htmlEscape(req.host)}</b>
+    <b>${htmlEscape(req.name)}</b> — ${htmlEscape(what)} for <b>${htmlEscape(req.host)}</b>
     <div class="row2">Reason: ${htmlEscape(req.reason)}</div>
   </div>
-  <div class="warn">Only continue if <b>you</b> just asked Claude to onboard this host. This stores a credential in your vault.</div>
+  <div class="warn">Only continue if <b>you</b> just asked Claude to onboard this host. This stores ${multi ? "credentials" : "a credential"} in your vault.</div>
   <form method="post" action="/credential/${htmlEscape(req.id)}">
     <input type="hidden" name="formToken" value="${htmlEscape(req.formToken)}"/>
-    ${req.kind === "password" ? usernameField : ""}
-    <label>${secretLabel}</label>
-    <input type="password" name="secret" autocomplete="off" autofocus/>
+    ${inputs}
     <label>6-digit authenticator code</label>
     <input class="code" type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"/>
     <div class="err">${error ? htmlEscape(error) : ""}</div>
     <div class="row">
       <button class="deny" type="submit" name="action" value="decline">Cancel</button>
-      <button class="approve" type="submit" name="action" value="submit">Store credential</button>
+      <button class="approve" type="submit" name="action" value="submit">Store credential${multi ? "s" : ""}</button>
     </div>
   </form>
   <script>
@@ -152,10 +174,29 @@ export function buildCredentialRouter(app: AppState): Router {
       return;
     }
 
-    const secret = firstStr(req.body.secret);
-    if (!secret) {
-      res.status(400).type("html").send(formPage(request, "Enter the credential value."));
-      return;
+    const multi = request.fields?.length ? request.fields : null;
+
+    // Collect the submitted value(s). Multi-field: every requested field is
+    // required, so a half-filled item never lands in the vault.
+    let values: { name: string; value: string; hidden: boolean }[] = [];
+    let secret = "";
+    if (multi) {
+      const missing: string[] = [];
+      for (const f of multi) {
+        const value = firstStr(req.body[FIELD_INPUT_PREFIX + f.name]);
+        if (!value) missing.push(f.name);
+        else values.push({ name: f.name, value, hidden: f.secret });
+      }
+      if (missing.length) {
+        res.status(400).type("html").send(formPage(request, `Fill in every value — missing: ${missing.join(", ")}.`));
+        return;
+      }
+    } else {
+      secret = firstStr(req.body.secret);
+      if (!secret) {
+        res.status(400).type("html").send(formPage(request, "Enter the credential value."));
+        return;
+      }
     }
     const username = firstStr(req.body.username) || request.username;
 
@@ -167,37 +208,52 @@ export function buildCredentialRouter(app: AppState): Router {
     }
 
     try {
+      // One vault item for the whole set: each requested field becomes a custom
+      // field (hidden type when it's a secret). A field literally named
+      // `username` also populates the item's login username so
+      // `Credential.username` resolves naturally for connectors.
+      const loginUsername = multi ? values.find((v) => v.name === "username")?.value : request.kind === "password" ? username : undefined;
       await app.vault.createLoginItem({
         name: request.name,
-        username: request.kind === "password" ? username : undefined,
-        password: request.kind === "password" ? secret : undefined,
-        // An SSH login gets an ssh:// URI; an API token is not SSH, so leave the
-        // URI off rather than mislabel it.
-        url: request.kind === "password" ? `ssh://${request.host}` : undefined,
+        username: loginUsername,
+        password: !multi && request.kind === "password" ? secret : undefined,
+        // An SSH login gets an ssh:// URI; an API token / arbitrary field set is
+        // not SSH, so leave the URI off rather than mislabel it.
+        url: !multi && request.kind === "password" ? `ssh://${request.host}` : undefined,
         notes: `Stored via Skeleton Key credential hand-off. ${request.reason}`,
-        fields: request.kind === "token" ? [{ name: "token", value: secret, hidden: true }] : [],
+        fields: multi ? values : request.kind === "token" ? [{ name: "token", value: secret, hidden: true }] : [],
         collectionName: app.store.get().bwCollectionName,
       });
     } catch (err) {
       // Roll the claim back so the user can retry the same link.
       app.credentialRequests.release(request.id);
       const message = err instanceof Error ? err.message : String(err);
-      res.status(400).type("html").send(formPage(request, `Could not store the credential: ${message}`));
+      res.status(400).type("html").send(formPage(request, `Could not store the credential${multi ? "s" : ""}: ${message}`));
       return;
+    } finally {
+      // Drop the plaintext values as soon as the write is done (or failed) —
+      // they must not linger in this closure.
+      values = [];
+      secret = "";
     }
 
-    // Audit the fulfillment — never the secret value.
+    const fieldNames = multi ? multi.map((f) => f.name) : null;
+    // Audit the fulfillment — field NAMES only, never a submitted value.
     app.audit.record({
       ts: new Date().toISOString(),
       tool: "credential.provide",
       target: request.host,
       tier: "execute",
-      args: { name: request.name, kind: request.kind },
+      args: { name: request.name, kind: request.kind, fields: fieldNames ?? undefined },
       status: "ok",
-      detail: `credential '${request.name}' stored via hand-off`,
+      detail: `credential '${request.name}' stored via hand-off${fieldNames ? ` (${fieldNames.length} fields)` : ""}`,
     });
     res.type("html").send(
-      messagePage("Stored ✓", `Saved as “${request.name}”. Return to Claude — it can now use this credential. You can close this tab.`),
+      messagePage(
+        "Stored ✓",
+        `Saved as “${request.name}”${fieldNames ? ` with ${fieldNames.length} field(s): ${fieldNames.join(", ")}` : ""}. ` +
+          `Return to Claude — it can now use ${fieldNames ? "these credentials" : "this credential"}. You can close this tab.`,
+      ),
     );
   });
 

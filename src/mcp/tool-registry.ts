@@ -80,6 +80,10 @@ export function resolveTools(app: AppState): ResolvedTool[] {
               }
               return app.credentialFor(target.credentialRef);
             },
+            // Any vault item by name, for tools that inject a *different* item's
+            // secret than the target's own (see ToolContext.resolveCredential).
+            // Same in-memory, lazy path as getCredential — nothing is cached here.
+            resolveCredential: (ref: string) => app.credentialFor(ref),
           }),
       });
     }
