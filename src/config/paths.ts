@@ -30,6 +30,10 @@ export const paths = {
   /** Encrypted disaster-recovery skeletons:
    *  skeletons/<id>/<target>/<artifact>.enc + manifest.json + RESTORE.md. */
   snapshotsDir: path.join(DATA_DIR, "skeletons"),
+  /** Self-managed TLS material (auto-generated self-signed cert + key) — see
+   *  src/web/tls.ts. A user-mounted pair via SKELETON_KEY_TLS_CERT_FILE /
+   *  SKELETON_KEY_TLS_KEY_FILE takes precedence over this directory. */
+  tlsDir: path.join(DATA_DIR, "tls"),
 } as const;
 
 /**

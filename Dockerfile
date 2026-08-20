@@ -18,8 +18,9 @@ ENV NODE_ENV=production
 # The Bitwarden CLI (`bw`) is required by the Vaultwarden secrets client.
 # It is installed globally and kept out of the app's node_modules.
 # openssh-client provides ssh-keygen, used by the vault_generate_ssh_key tool.
+# openssl generates the self-signed LAN TLS certificate (src/web/tls.ts).
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates openssh-client \
+  && apt-get install -y --no-install-recommends ca-certificates openssh-client openssl \
   && rm -rf /var/lib/apt/lists/* \
   && npm install -g @bitwarden/cli@2024.9.0 \
   && npm cache clean --force
@@ -37,7 +38,12 @@ VOLUME ["/data"]
 USER node
 
 EXPOSE 8787
+# Probes the scheme implied by SKELETON_KEY_TLS; in auto mode it falls back to
+# HTTP so the cert-generation-failure fallback still reports live (that
+# degradation is deliberate — the boot log carries the warning). Disabling TLS
+# verification is fine HERE only: it's a localhost liveness probe against our
+# own self-signed cert, not a real client connection.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.SKELETON_KEY_PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD NODE_TLS_REJECT_UNAUTHORIZED=0 node -e "const p=process.env.SKELETON_KEY_PORT||8787;const off=(process.env.SKELETON_KEY_TLS||'').trim().toLowerCase()==='off';const t=s=>fetch(s+'://127.0.0.1:'+p+'/healthz').then(r=>{if(!r.ok)throw new Error(s)});(off?t('http'):t('https').catch(()=>t('http'))).then(()=>process.exit(0),()=>process.exit(1))"
 
 CMD ["node", "dist/server.js"]

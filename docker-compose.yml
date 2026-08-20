@@ -23,13 +23,21 @@ services:
     environment:
       SKELETON_KEY_PORT: "8787"
       SKELETON_KEY_BIND_HOST: "0.0.0.0" # inside the container; the port map above scopes it to the LAN
-      # Optional: the absolute URL clients reach this box at. Skeleton Key
-      # auto-detects a LAN address on first boot, so this is only needed to
-      # override it (e.g. a hostname, a different port, or when auto-detection
-      # picks the wrong interface). Used for the clickable unlock and
-      # credential-hand-off links; deliberately never taken from a request Host
-      # header. Example:
-      # SKELETON_KEY_PUBLIC_URL: "http://192.168.1.10:8787"
+      # Recommended on this default (bridged) network: the absolute URL clients
+      # reach this box at. Auto-detection inside a bridged container only sees
+      # Docker-internal addresses, so set this to your real LAN address — the
+      # TLS certificate then covers it (re-issued on the next boot) and the
+      # clickable unlock / credential-hand-off links point at it. Deliberately
+      # never taken from a request Host header. Example:
+      # SKELETON_KEY_PUBLIC_URL: "https://192.168.1.10:8787"
+      # LAN TLS (see README "LAN TLS"): HTTPS is on by default — a self-signed
+      # certificate is generated into /data/tls on first boot and clients trust
+      # it once. To bring your own pair instead, mount it and point these at it:
+      # SKELETON_KEY_TLS_CERT_FILE: "/run/secrets/skeleton-key-tls/cert.pem"
+      # SKELETON_KEY_TLS_KEY_FILE: "/run/secrets/skeleton-key-tls/key.pem"
+      # Or opt out entirely (passphrases + hand-off credentials then cross the
+      # LAN unencrypted, and MCP clients may refuse the OAuth endpoint):
+      # SKELETON_KEY_TLS: "off"
       # Boot auto-unlock: enable it from the web UI (setup wizard or the unlock
       # page). Skeleton Key then writes a RANDOM unlock key — never your
       # passphrase — into the host directory mounted below, and unlocks itself
