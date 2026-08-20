@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { X509Certificate } from "node:crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { X509Certificate, createPrivateKey } from "node:crypto";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { paths } from "../config/paths.js";
 import { detectLanIps } from "../config/public-url.js";
+import { writeFileAtomic } from "../lib/atomic-file.js";
 
 const execFileP = promisify(execFile);
 
@@ -50,16 +51,36 @@ const RENEW_MARGIN_MS = 30 * 24 * 3600 * 1000;
 const CERT_NAME = "cert.pem";
 const KEY_NAME = "key.pem";
 
-/** TLS on/off switch. Anything except an explicit "off"-shaped value means auto. */
+/** TLS on/off switch: exactly the documented `SKELETON_KEY_TLS=off` disables
+ *  (case-insensitive); anything else means auto. */
 export function tlsMode(): "auto" | "off" {
-  const raw = (process.env.SKELETON_KEY_TLS ?? "auto").trim().toLowerCase();
-  return ["off", "0", "false", "disabled", "no"].includes(raw) ? "off" : "auto";
+  return (process.env.SKELETON_KEY_TLS ?? "").trim().toLowerCase() === "off" ? "off" : "auto";
 }
 
 /** SHA-256 fingerprint of a PEM certificate — logged at boot so the one-time
  *  trust step can be verified out-of-band against what the browser shows. */
 export function certFingerprint(certPem: string): string {
   return new X509Certificate(certPem).fingerprint256;
+}
+
+/** URL.hostname wraps IPv6 literals in brackets ("[fd00::1]") — strip them so
+ *  the address can be matched against / written into a SAN. */
+export function normalizeSanHost(host: string): string {
+  return host.replace(/^\[(.+)\]$/, "$1");
+}
+
+/**
+ * True when the certificate and private key are a matching pair. A mismatch
+ * (torn write, half-rotated mounted pair) would otherwise surface only as an
+ * ERR_OSSL_X509_KEY_VALUES_MISMATCH throw from https.createServer — after every
+ * fallback path has already committed to the material.
+ */
+export function pairMatches(certPem: string, keyPem: string): boolean {
+  try {
+    return new X509Certificate(certPem).checkPrivateKey(createPrivateKey(keyPem));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -78,7 +99,12 @@ export function needsRegeneration(certPem: string, requiredHosts: string[], now:
     return true;
   }
   if (Date.parse(cert.validTo) - now.getTime() < RENEW_MARGIN_MS) return true;
-  for (const host of requiredHosts) {
+  for (const raw of requiredHosts) {
+    const host = normalizeSanHost(raw);
+    // A host that can never appear in a SAN must not trigger regeneration —
+    // it would re-issue (new fingerprint, forced re-trust) on every boot,
+    // forever, without ever satisfying the check.
+    if (!isSanHost(host)) continue;
     const covered = net.isIP(host) ? cert.checkIP(host) : cert.checkHost(host, { subject: "never" });
     if (!covered) return true;
   }
@@ -94,8 +120,9 @@ function isSanHost(host: string): boolean {
 
 /**
  * Generate a fresh self-signed cert + key pair into `dir` via the openssl CLI
- * (config-file driven, so it works on both OpenSSL and LibreSSL). Written to
- * temp names and renamed in so a crash mid-generation never leaves a torn pair.
+ * (config-file driven, so it works on both OpenSSL and LibreSSL). The pair is
+ * committed with writeFileAtomic so a crash mid-generation never leaves a torn
+ * pair on disk (and resolveTls additionally verifies the pair matches).
  */
 export async function generateSelfSignedCert(opts: {
   dir: string;
@@ -106,7 +133,7 @@ export async function generateSelfSignedCert(opts: {
   await mkdir(opts.dir, { recursive: true, mode: 0o700 });
   const dns: string[] = [];
   const ips: string[] = [];
-  for (const host of [...new Set(opts.hosts)]) {
+  for (const host of new Set(opts.hosts.map(normalizeSanHost))) {
     if (!isSanHost(host)) continue;
     (net.isIP(host) ? ips : dns).push(host);
   }
@@ -140,6 +167,8 @@ ${alt}
   const cnfFile = path.join(opts.dir, ".openssl.cnf.tmp");
   const keyTmp = path.join(opts.dir, `.${KEY_NAME}.tmp`);
   const certTmp = path.join(opts.dir, `.${CERT_NAME}.tmp`);
+  let cert: string;
+  let key: string;
   try {
     await writeFile(cnfFile, cnf, { mode: 0o600 });
     await execFileP(
@@ -151,19 +180,17 @@ ${alt}
       ],
       { timeout: 60_000 },
     );
-    await chmod(keyTmp, 0o600);
+    key = await readFile(keyTmp, "utf8");
+    cert = await readFile(certTmp, "utf8");
     // Key lands first: a stray cert without its key is harmless, the reverse isn't.
-    await rename(keyTmp, path.join(opts.dir, KEY_NAME));
-    await rename(certTmp, path.join(opts.dir, CERT_NAME));
+    await writeFileAtomic(path.join(opts.dir, KEY_NAME), key, 0o600);
+    await writeFileAtomic(path.join(opts.dir, CERT_NAME), cert, 0o644);
   } finally {
     await unlink(cnfFile).catch(() => {});
     await unlink(keyTmp).catch(() => {});
     await unlink(certTmp).catch(() => {});
   }
-  return {
-    cert: await readFile(path.join(opts.dir, CERT_NAME), "utf8"),
-    key: await readFile(path.join(opts.dir, KEY_NAME), "utf8"),
-  };
+  return { cert, key };
 }
 
 export interface ResolveTlsOptions {
@@ -222,6 +249,13 @@ export async function resolveTls(opts: ResolveTlsOptions = {}): Promise<TlsMater
     } catch {
       throw new Error(`SKELETON_KEY_TLS_CERT_FILE (${certFile}) is not a parseable PEM certificate.`);
     }
+    if (!pairMatches(cert, key)) {
+      // Without this check the mismatch surfaces as a cryptic OpenSSL throw
+      // from https.createServer (e.g. after rotating only one half of the pair).
+      throw new Error(
+        `SKELETON_KEY_TLS_KEY_FILE (${keyFile}) is not the private key for SKELETON_KEY_TLS_CERT_FILE (${certFile}).`,
+      );
+    }
     return { cert, key, source: "mounted" };
   }
 
@@ -234,9 +268,22 @@ export async function resolveTls(opts: ResolveTlsOptions = {}): Promise<TlsMater
       key: await readFile(path.join(dir, KEY_NAME), "utf8"),
     };
   } catch {
-    /* first boot (or torn pair) — generate below */
+    /* first boot (or half-missing pair) — generate below */
+  }
+  if (existing && !pairMatches(existing.cert, existing.key)) {
+    // A torn re-issue (crash between the two writes) or corrupted volume must
+    // never reach https.createServer — it would throw KEY_VALUES_MISMATCH and
+    // crash-loop the boot. Treat it as absent: regenerate, or fall back to HTTP.
+    log(`[skeleton-key] WARNING: the on-disk TLS pair in ${dir} is torn or mismatched — re-issuing.`);
+    existing = null;
   }
   const required = opts.publicUrlHost ? [opts.publicUrlHost] : [];
+  if (opts.publicUrlHost && !isSanHost(normalizeSanHost(opts.publicUrlHost))) {
+    log(
+      `[skeleton-key] WARNING: public URL host "${opts.publicUrlHost}" cannot appear in a certificate SAN — ` +
+        "clients dialing it will fail TLS hostname verification.",
+    );
+  }
   if (existing && !needsRegeneration(existing.cert, required, opts.now)) {
     return { ...existing, source: "generated" };
   }

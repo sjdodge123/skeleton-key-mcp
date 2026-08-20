@@ -44,7 +44,12 @@ A **static bearer token** is still accepted as a fallback for clients without OA
 
 ## LAN TLS
 
-Everything the web UI carries — the master passphrase at unlock, credentials typed into hand-off forms — must not cross the LAN in the clear, and MCP clients refuse to send OAuth tokens to a non-HTTPS endpoint. So Skeleton Key serves **HTTPS by default**: on first boot it generates a self-signed certificate into `data/tls/` (SANs cover `localhost`, the host's LAN IPs, and the public-URL host) and re-issues it automatically near expiry or when the pinned public URL points at a host the certificate doesn't cover. Existing deployments migrate seamlessly on upgrade: the persisted public URL's scheme flips to `https://`, and if certificate generation ever fails the server falls back to plain HTTP with a loud log warning instead of refusing to boot.
+Everything the web UI carries — the master passphrase at unlock, credentials typed into hand-off forms — must not cross the LAN in the clear, and MCP clients refuse to send OAuth tokens to a non-HTTPS endpoint. So Skeleton Key serves **HTTPS by default**: on first boot it generates a self-signed certificate into `data/tls/` (SANs cover `localhost`, the interface addresses the container can see, and the public-URL host) and re-issues it automatically near expiry or when the public URL points at a host the certificate doesn't cover. Existing deployments migrate on upgrade: the persisted public URL's scheme flips to `https://`, and if certificate generation ever fails the server falls back to plain HTTP with a loud log warning instead of refusing to boot (the persisted URL keeps its `https://` scheme in that case — only the explicit `SKELETON_KEY_TLS=off` migrates it back).
+
+Two deployment notes:
+
+- **Bridged Docker networking (the compose default):** inside a bridged container the only detectable addresses are Docker-internal, so the first-boot certificate does **not** cover the LAN IP your clients actually dial through the port mapping. Set `SKELETON_KEY_PUBLIC_URL` (e.g. `https://192.168.1.10:8787`) — on the next boot the certificate re-issues itself to cover that host. Host networking doesn't have this problem.
+- **Upgrading a pre-TLS deployment that pinned `SKELETON_KEY_PUBLIC_URL`:** the server never rewrites an explicit pin, so update the env var from `http://…` to `https://…` (or remove it) — otherwise OAuth discovery and the unlock/credential links keep advertising a scheme the port no longer serves (the boot log warns about the mismatch).
 
 Because the certificate is self-signed, each client trusts it **once**:
 

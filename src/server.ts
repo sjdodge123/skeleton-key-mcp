@@ -5,7 +5,7 @@ import { AppState } from "./app.js";
 import { buildHttpApp } from "./web/server.js";
 import { env, paths } from "./config/paths.js";
 import { detectLanBaseUrl, savePublicUrl, switchScheme } from "./config/public-url.js";
-import { certFingerprint, resolveTls } from "./web/tls.js";
+import { certFingerprint, resolveTls, tlsMode } from "./web/tls.js";
 import { loadUnlockKey } from "./secrets/unlock-key-file.js";
 
 /** Hostname of an absolute URL, or null (used to pin the TLS cert's SANs). */
@@ -25,9 +25,9 @@ async function main(): Promise<void> {
   // SKELETON_KEY_TLS=off opts out. A throw here (broken explicit pair) is a
   // deliberate boot failure; generation problems fall back to HTTP inside
   // resolveTls so an auto-upgraded container always comes up.
-  const tls = await resolveTls({
-    publicUrlHost: urlHost(process.env.SKELETON_KEY_PUBLIC_URL ?? app.publicUrl()),
-  });
+  // app.publicUrl() already encodes the env-over-persisted precedence (and
+  // treats an empty env var as unset) — don't re-derive it here.
+  const tls = await resolveTls({ publicUrlHost: urlHost(app.publicUrl()) });
   const scheme: "http" | "https" = tls ? "https" : "http";
 
   // Determine a public base URL on first boot so user-facing links (unlock
@@ -43,7 +43,8 @@ async function main(): Promise<void> {
     if (!pinned.startsWith(`${scheme}://`)) {
       console.warn(
         `[skeleton-key] SKELETON_KEY_PUBLIC_URL (${pinned}) does not match the ${scheme}:// scheme ` +
-          "this server is actually serving — user-facing links and the OAuth issuer may be unreachable.",
+          "this server is actually serving — user-facing links and the OAuth issuer will be unreachable. " +
+          "Update the env var to the new scheme (see README “LAN TLS”).",
       );
     }
   } else if (!persisted) {
@@ -54,11 +55,27 @@ async function main(): Promise<void> {
       console.log(`[skeleton-key] Auto-detected public URL: ${detected} (override with SKELETON_KEY_PUBLIC_URL).`);
     }
   } else if (!persisted.startsWith(`${scheme}://`)) {
-    const migrated = switchScheme(persisted, scheme);
-    if (migrated) {
-      await savePublicUrl(migrated).catch(() => {});
-      app.setLearnedPublicUrl(migrated);
-      console.log(`[skeleton-key] Public URL scheme updated for ${scheme.toUpperCase()}: ${persisted} → ${migrated}.`);
+    if (scheme === "http" && tlsMode() !== "off") {
+      // TLS failed this boot but wasn't disabled: keep the https:// links —
+      // an accidental fallback must not persist a downgrade of the URLs that
+      // carry the master passphrase and hand-off credentials.
+      console.warn(
+        `[skeleton-key] TLS is unavailable this boot (not disabled) — keeping the persisted public URL (${persisted}) ` +
+          "on https://. User-facing links may fail until TLS recovers.",
+      );
+    } else {
+      const migrated = switchScheme(persisted, scheme);
+      if (migrated) {
+        await savePublicUrl(migrated).catch(() => {});
+        app.setLearnedPublicUrl(migrated);
+        console.log(`[skeleton-key] Public URL scheme updated for ${scheme.toUpperCase()}: ${persisted} → ${migrated}.`);
+      } else {
+        console.warn(
+          `[skeleton-key] Persisted public URL (${persisted}) could not be migrated to ${scheme}:// ` +
+            "(no explicit port, or it carries a path) — user-facing links keep the old scheme. " +
+            "Fix data/public-url or set SKELETON_KEY_PUBLIC_URL.",
+        );
+      }
     }
   }
 

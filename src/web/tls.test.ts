@@ -7,6 +7,7 @@ import {
   certFingerprint,
   generateSelfSignedCert,
   needsRegeneration,
+  pairMatches,
   resolveTls,
   tlsMode,
 } from "./tls.js";
@@ -28,17 +29,19 @@ afterEach(async () => {
 });
 
 describe("tlsMode", () => {
-  it("defaults to auto and honors the off-shaped values", () => {
+  it("defaults to auto; exactly the documented 'off' (case-insensitive) disables", () => {
     const prev = process.env.SKELETON_KEY_TLS;
     try {
       delete process.env.SKELETON_KEY_TLS;
       expect(tlsMode()).toBe("auto");
-      for (const v of ["off", "OFF", "0", "false", "disabled", "no"]) {
+      for (const v of ["off", "OFF", " off "]) {
         process.env.SKELETON_KEY_TLS = v;
         expect(tlsMode()).toBe("off");
       }
-      process.env.SKELETON_KEY_TLS = "auto";
-      expect(tlsMode()).toBe("auto");
+      for (const v of ["auto", "0", "false", "no", "on"]) {
+        process.env.SKELETON_KEY_TLS = v;
+        expect(tlsMode()).toBe("auto");
+      }
     } finally {
       if (prev === undefined) delete process.env.SKELETON_KEY_TLS;
       else process.env.SKELETON_KEY_TLS = prev;
@@ -88,6 +91,25 @@ describe("needsRegeneration", () => {
     expect(needsRegeneration(cert, [], nearExpiry)).toBe(true);
     expect(needsRegeneration("not a certificate", [])).toBe(true);
   });
+
+  it("matches bracketed IPv6 URL hostnames against IP SANs, and never churns on a SAN-impossible host", async () => {
+    const { cert } = await generateSelfSignedCert({ dir, hosts: ["localhost", "[fd00::1]"] });
+    // The bracketed form (what URL.hostname yields) both generates and matches.
+    expect(new X509Certificate(cert).checkIP("fd00::1")).toBeTruthy();
+    expect(needsRegeneration(cert, ["[fd00::1]"])).toBe(false);
+    // A host that can never be a SAN must not force a re-issue on every boot.
+    expect(needsRegeneration(cert, ["under_score.lan"])).toBe(false);
+  });
+});
+
+describe("pairMatches", () => {
+  it("accepts a matching pair and rejects a mismatched or garbage one", async () => {
+    const a = await generateSelfSignedCert({ dir, hosts: ["localhost"] });
+    const b = await generateSelfSignedCert({ dir: path.join(dir, "b"), hosts: ["localhost"] });
+    expect(pairMatches(a.cert, a.key)).toBe(true);
+    expect(pairMatches(a.cert, b.key)).toBe(false);
+    expect(pairMatches(a.cert, "not a key")).toBe(false);
+  });
 });
 
 describe("resolveTls", () => {
@@ -128,8 +150,43 @@ describe("resolveTls", () => {
     await expect(
       resolveTls({ mode: "auto", dir, certFile: path.join(dir, "missing.pem"), keyFile, log: noop }),
     ).rejects.toThrow(/Could not read/);
+    // A key that doesn't belong to the cert must fail loudly by name, not
+    // crash later inside https.createServer.
+    const other = await generateSelfSignedCert({ dir: path.join(dir, "other"), hosts: ["localhost"] });
+    await writeFile(keyFile, other.key);
+    await expect(resolveTls({ mode: "auto", dir, certFile, keyFile, log: noop })).rejects.toThrow(/not the private key/);
     await writeFile(certFile, "garbage");
+    await writeFile(keyFile, key);
     await expect(resolveTls({ mode: "auto", dir, certFile, keyFile, log: noop })).rejects.toThrow(/parseable/);
+  });
+
+  it("re-issues a torn/mismatched on-disk pair instead of serving it", async () => {
+    const base = { mode: "auto" as const, dir, lanIps: ["192.168.1.10"], log: noop };
+    const first = await resolveTls(base);
+    // Simulate a crash between the key and cert writes of a re-issue:
+    // a fresh key lands next to the previous cert.
+    const other = await generateSelfSignedCert({ dir: path.join(dir, "other"), hosts: ["localhost"] });
+    await writeFile(path.join(dir, "key.pem"), other.key);
+    const healed = await resolveTls(base);
+    expect(healed).not.toBeNull();
+    expect(pairMatches(healed!.cert, healed!.key)).toBe(true);
+    expect(healed && certFingerprint(healed.cert)).not.toBe(first && certFingerprint(first.cert));
+  });
+
+  it("falls back to plain HTTP — never the mismatched pair — when a torn pair can't be re-issued", async () => {
+    const base = { mode: "auto" as const, dir, lanIps: ["192.168.1.10"], log: noop };
+    await resolveTls(base);
+    const other = await generateSelfSignedCert({ dir: path.join(dir, "other"), hosts: ["localhost"] });
+    await writeFile(path.join(dir, "key.pem"), other.key);
+    const logs: string[] = [];
+    const out = await resolveTls({
+      ...base,
+      opensslBin: path.join(dir, "no-such-openssl"),
+      log: (m) => logs.push(m),
+    });
+    expect(out).toBeNull();
+    expect(logs.join("\n")).toContain("torn or mismatched");
+    expect(logs.join("\n")).toContain("PLAIN HTTP");
   });
 
   it("falls back to plain HTTP when generation fails with no prior material", async () => {

@@ -71,6 +71,11 @@ describe("switchScheme", () => {
     expect(switchScheme("ftp://x:21", "https")).toBeNull();
     expect(switchScheme("not a url", "https")).toBeNull();
   });
+
+  it("refuses URLs with a path/query (the origin rewrite would truncate them)", () => {
+    expect(switchScheme("http://192.168.1.10:8787/admin", "https")).toBeNull();
+    expect(switchScheme("http://192.168.1.10:8787/?x=1", "https")).toBeNull();
+  });
 });
 
 describe("persisted public URL", () => {

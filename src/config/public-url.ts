@@ -60,14 +60,17 @@ export function detectLanBaseUrl(
 /**
  * Rewrite just the scheme of a persisted base URL (http ↔ https), preserving
  * host and port — used to migrate `data/public-url` when TLS is enabled on an
- * existing deployment (or disabled again). Returns null when the input isn't an
- * absolute http(s) URL with an explicit port: without one, switching the scheme
- * would silently change the default port (80 ↔ 443), so we leave it alone.
+ * existing deployment (or disabled again). Returns null (leave the value alone;
+ * the caller logs) when the input isn't an origin-only absolute http(s) URL
+ * with an explicit port: without a port, switching the scheme would silently
+ * change the default port (80 ↔ 443), and a hand-edited value with a path
+ * would be truncated by the origin rewrite.
  */
 export function switchScheme(url: string, scheme: "http" | "https"): string | null {
   try {
     const u = new URL(url);
     if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.port) return null;
+    if (u.pathname !== "/" || u.search || u.hash) return null;
     u.protocol = `${scheme}:`;
     return u.origin;
   } catch {
