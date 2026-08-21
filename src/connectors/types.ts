@@ -23,6 +23,13 @@ export interface Target {
    * The registry stores this reference only — never the secret itself.
    */
   credentialRef?: string;
+  /**
+   * Immutable Vaultwarden item id the `credentialRef` resolved to when it was
+   * attached. Credential reads prefer this over the name, so renaming or
+   * recreating an item can't make a target silently pick up a different value.
+   * Falls back to the name (and re-pins) when the id is gone. Not a secret.
+   */
+  credentialId?: string;
   /** Connector-specific options, validated against the connector's configSchema. */
   options?: Record<string, unknown>;
 }
@@ -41,8 +48,19 @@ export interface ToolContext {
    * Optional because non-MCP call sites (e.g. the snapshot service) build a
    * ToolContext with only the target's own credential; a tool that needs it must
    * fail with a clear error when it is absent, never silently skip the value.
+   *
+   * `fresh: true` syncs the vault first (bounded, best-effort) so the value
+   * can't come from a stale offline cache — required for anything about to be
+   * injected into a deploy.
    */
-  resolveCredential?: (ref: string) => Promise<Credential>;
+  resolveCredential?: (ref: string, opts?: { fresh?: boolean }) => Promise<Credential>;
+  /**
+   * Keyed fingerprint of a secret value (`len=<n> fp=<8 hex>`, see
+   * `src/lib/fingerprint.ts`) — lets a tool report WHICH value it deployed
+   * (comparable against the vault's) without ever echoing the value. Optional
+   * like `resolveCredential`; tools must degrade to no fingerprint when absent.
+   */
+  fingerprint?: (value: string) => Promise<string>;
 }
 
 export interface ToolResult {

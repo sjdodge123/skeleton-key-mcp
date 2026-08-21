@@ -39,4 +39,8 @@ export interface BootstrapSecrets {
    *  rest. Generated lazily on the first `form_skeleton`; lives inside this
    *  encrypted store so `/data` alone can't decrypt a skeleton. */
   snapshotKey?: string;
+  /** Base64 32-byte HMAC key for keyed value fingerprints (`src/lib/fingerprint.ts`),
+   *  so "is the deployed secret the same as the vault's?" can be answered without
+   *  a fingerprint in a chat transcript being useful for offline guessing. */
+  fingerprintKey?: string;
 }

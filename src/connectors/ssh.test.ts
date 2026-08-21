@@ -93,3 +93,56 @@ describe("ssh timeout precedence: per-call > per-target > default", () => {
     expect(runSsh).toHaveBeenCalledWith(base, cred, expect.any(String), { timeoutMs: undefined });
   });
 });
+
+describe("ssh sudoPrefixes option", () => {
+  it("accepts plain command names and rejects shell metacharacters", () => {
+    expect(sshConnector.configSchema.parse({ sudoPrefixes: ["docker", "synopkg", "/usr/local/bin/docker"] }).sudoPrefixes).toEqual([
+      "docker",
+      "synopkg",
+      "/usr/local/bin/docker",
+    ]);
+    expect(() => sshConnector.configSchema.parse({ sudoPrefixes: ["docker; rm"] })).toThrow();
+    expect(() => sshConnector.configSchema.parse({ sudoPrefixes: ["a b"] })).toThrow();
+  });
+
+  it("run_command passes the target's sudoPrefixes to runSsh (raw command, policy-checked first)", async () => {
+    vi.mocked(runSsh).mockResolvedValue({ stdout: "CONTAINER ID", stderr: "", code: 0 });
+    const t: Target = { ...base, options: { sudoPrefixes: ["docker"] } };
+    await toolNamed(t, "run_command").run({ command: "docker ps" }, ctxFor(t));
+    expect(runSsh).toHaveBeenCalledWith(t, cred, "docker ps", { timeoutMs: undefined, sudoPrefixes: ["docker"] });
+  });
+
+  it("run_command still refuses a denied command BEFORE any wrapping/sudo happens", async () => {
+    vi.mocked(runSsh).mockClear();
+    const t: Target = { ...base, options: { sudoPrefixes: ["rm"] } };
+    const out = await toolNamed(t, "run_command").run({ command: "rm -rf /" }, ctxFor(t));
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("Refused");
+    expect(runSsh).not.toHaveBeenCalled();
+  });
+
+  it("run_readonly passes sudoPrefixes too (allowlist checked on the raw command)", async () => {
+    vi.mocked(runSsh).mockResolvedValue({ stdout: "ok", stderr: "", code: 0 });
+    const t: Target = { ...base, options: { sudoPrefixes: ["docker"] } };
+    await toolNamed(t, "run_readonly").run({ command: "docker ps" }, ctxFor(t));
+    expect(runSsh).toHaveBeenCalledWith(t, cred, "docker ps", { timeoutMs: undefined, sudoPrefixes: ["docker"] });
+  });
+
+  it("appends a NOPASSWD sudoers hint when sudo fails non-interactively", async () => {
+    vi.mocked(runSsh).mockResolvedValue({ stdout: "", stderr: "sudo: a password is required\n", code: 1 });
+    const t: Target = { ...base, options: { sudoPrefixes: ["docker"] } };
+    const ctx: ToolContext = { target: t, getCredential: async () => ({ ...cred, username: "admin" }) };
+    const out = await toolNamed(t, "run_command").run({ command: "docker ps" }, ctx);
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("a password is required");
+    expect(out.text).toContain("NOPASSWD");
+    expect(out.text).toContain("admin ALL=(root)");
+    expect(out.text).toContain("command -v docker");
+  });
+
+  it("adds no hint when sudoPrefixes is unset, even if stderr mentions sudo", async () => {
+    vi.mocked(runSsh).mockResolvedValue({ stdout: "", stderr: "sudo: a password is required\n", code: 1 });
+    const out = await toolNamed(base, "run_command").run({ command: "sudo docker ps" }, ctxFor(base));
+    expect(out.text).not.toContain("NOPASSWD");
+  });
+});

@@ -44,6 +44,14 @@ interface Manifest {
   targets: ManifestTarget[];
 }
 
+/** Per-target progress reported by `formSkeleton` while it runs (no secrets). */
+export interface SnapshotProgress {
+  targetsDone: number;
+  targetsTotal: number;
+  /** The target currently being snapshotted; unset once all are done. */
+  currentTarget?: string;
+}
+
 /** Metadata-only summary of a stored skeleton (no secrets, no artifact bytes). */
 export interface SkeletonSummary {
   id: string;
@@ -101,11 +109,14 @@ export function uniqueName(targetName: string, base: string, data: Buffer, used:
  * return a summary only. A backup necessarily contains secrets, so artifact bytes
  * are encrypted at rest and never returned here, put in the manifest, or audited.
  * Per-target failures are isolated (partial skeleton), never a hard fail.
+ * `onProgress` (optional) is called before each target starts and once at the
+ * end, so a background job can report where it is.
  */
 export async function formSkeleton(
   app: AppState,
   snapshotsDir: string = paths.snapshotsDir,
   maxArtifactBytes: number = MAX_ARTIFACT_BYTES,
+  onProgress?: (p: SnapshotProgress) => void,
 ): Promise<{ id: string; summary: string }> {
   const key = await getOrCreateSnapshotKey(app);
   const createdAt = new Date().toISOString();
@@ -117,7 +128,17 @@ export async function formSkeleton(
   let artifactCount = 0;
   let totalPlaintextBytes = 0;
 
-  for (const target of app.registry.list()) {
+  const all = app.registry.list();
+  const report = (done: number, currentTarget?: string) => {
+    try {
+      onProgress?.({ targetsDone: done, targetsTotal: all.length, ...(currentTarget ? { currentTarget } : {}) });
+    } catch {
+      /* a progress observer must never abort the snapshot */
+    }
+  };
+
+  for (const [i, target] of all.entries()) {
+    report(i, target.name);
     const connector = getConnector(target.type);
     if (!connector?.snapshot) {
       targets.push({ name: target.name, type: target.type, status: "skipped", error: null, artifacts: [] });
@@ -170,6 +191,8 @@ export async function formSkeleton(
     targets.push({ name: target.name, type: target.type, status, error: errors.length ? errors.join("; ") : null, artifacts: mArts });
     auditTarget(app, target.name, status === "error" ? "error" : "ok", `${mArts.length} artifact(s)${errors.length ? `, ${errors.length} skipped` : ""}`);
   }
+
+  report(all.length);
 
   const manifest: Manifest = {
     version: 1,

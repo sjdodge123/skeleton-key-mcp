@@ -11,6 +11,10 @@ const targetSchema = z.object({
   host: z.string().min(1),
   port: z.number().int().positive().optional(),
   credentialRef: z.string().min(1).optional(),
+  // The vault item's immutable id, pinned when the ref is attached so a later
+  // rename / recreate under the same name can't silently re-point the target.
+  // Not a secret (it's an opaque UUID); the name stays the human-facing ref.
+  credentialId: z.string().uuid().optional(),
   options: z.record(z.unknown()).optional(),
 });
 

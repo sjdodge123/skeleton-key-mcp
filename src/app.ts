@@ -1,6 +1,6 @@
 import { access } from "node:fs/promises";
 import { BootstrapStore } from "./secrets/bootstrap-store.js";
-import { VaultwardenClient } from "./secrets/vaultwarden.js";
+import { VaultwardenClient, type GetCredentialOptions } from "./secrets/vaultwarden.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
@@ -10,6 +10,7 @@ import { hashBearer, loadBearerHash, saveBearerHash } from "./config/bearer-hash
 import { authenticator } from "otplib";
 import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
+import { fingerprintValue } from "./lib/fingerprint.js";
 
 /**
  * Shared runtime state for the whole process: the encrypted bootstrap store, the
@@ -174,12 +175,23 @@ export class AppState {
     return authenticator.verify({ token: token.trim(), secret });
   }
 
-  /** Resolve a target's credential from the vault (offline-cache backed). */
-  async credentialFor(credentialRef: string) {
+  /**
+   * Keyed fingerprint (`len=<n> fp=<8 hex>`) of a secret value, for comparing
+   * a vault field against what a stack was deployed with — never the value
+   * itself. See `src/lib/fingerprint.ts`.
+   */
+  fingerprint(value: string): Promise<string> {
+    return fingerprintValue(this, value);
+  }
+
+  /** Resolve a target's credential from the vault (offline-cache backed).
+   *  `opts.fresh` syncs first (bounded, best-effort) for deploy-time reads;
+   *  `opts.byId` treats `credentialRef` as a pinned item id. */
+  async credentialFor(credentialRef: string, opts?: GetCredentialOptions) {
     if (!this.vault.unlocked) {
       throw new Error(this.unlockGuidance());
     }
-    return this.vault.getCredential(credentialRef);
+    return this.vault.getCredential(credentialRef, opts);
   }
 }
 

@@ -190,3 +190,22 @@ describe("formSkeleton edge cases (name collisions, over-long names, size cap)",
     expect(tar.includes("edge/dup.json")).toBe(true);
   });
 });
+
+describe("formSkeleton onProgress", () => {
+  it("reports per-target progress (before each target, then a final all-done) without leaking artifact bytes", async () => {
+    const seen: any[] = [];
+    await formSkeleton(app, snapDir, undefined, (p) => seen.push(p));
+    expect(seen[0]).toEqual({ targetsDone: 0, targetsTotal: 3, currentTarget: "okhost" });
+    expect(seen[1]).toEqual({ targetsDone: 1, targetsTotal: 3, currentTarget: "failhost" });
+    expect(seen[2]).toEqual({ targetsDone: 2, targetsTotal: 3, currentTarget: "nohost" });
+    expect(seen[seen.length - 1]).toEqual({ targetsDone: 3, targetsTotal: 3 });
+    expect(JSON.stringify(seen).includes(SECRET)).toBe(false);
+  });
+
+  it("a throwing onProgress observer never aborts the snapshot", async () => {
+    const { id } = await formSkeleton(app, snapDir, undefined, () => {
+      throw new Error("observer bug");
+    });
+    expect(id).toBeTruthy();
+  });
+});

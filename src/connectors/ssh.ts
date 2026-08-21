@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
-import { runSsh, shellQuote, MAX_SSH_TIMEOUT_MS } from "./ssh-exec.js";
+import { runSsh, shellQuote, MAX_SSH_TIMEOUT_MS, firstWord, looksLikeSudoPasswordFailure, sudoHint } from "./ssh-exec.js";
 import { checkCommand, READONLY_ALLOW, type CommandPolicyOptions } from "./command-policy.js";
 
 const optionsSchema = z
@@ -17,8 +17,22 @@ const optionsSchema = z
      *  Capped at `MAX_SSH_TIMEOUT_MS` (10 minutes) so a long-running migration
      *  command (docker compose pull, large file ops) doesn't need an unbounded wait. */
     commandTimeoutMs: z.number().int().positive().max(MAX_SSH_TIMEOUT_MS).optional(),
+    /** Command names that must run as root on this host, e.g. `["docker", "synopkg"]`
+     *  on a Synology NAS where the SSH user is a non-root admin and the docker
+     *  socket is root-only. When a command's first word (after any leading
+     *  `VAR=value` assignments) matches, `sudo -n` is prefixed to that FIRST
+     *  command only (a pipeline's later stages run unprivileged). Requires a
+     *  NOPASSWD sudoers rule for the SSH user scoped to that binary; when sudo
+     *  asks for a password the result carries a hint with the exact rule. Applies
+     *  to `run_command`, `run_readonly`, and the snapshot's `docker ps` profile. */
+    sudoPrefixes: z.array(z.string().regex(/^[A-Za-z0-9._\/-]+$/, "a plain command name, e.g. docker")).optional(),
   })
   .default({});
+
+/** Target `sudoPrefixes` (or undefined). */
+function sudoPrefixesFor(target: Target): string[] | undefined {
+  return optionsSchema.parse(target.options ?? {}).sudoPrefixes;
+}
 
 function policyFor(target: Target): CommandPolicyOptions {
   const opts = optionsSchema.parse(target.options ?? {});
@@ -36,11 +50,14 @@ function targetTimeoutMs(target: Target): number | undefined {
  * `run_command`'s `timeoutSeconds`), wins over the target's `commandTimeoutMs`
  * option, which in turn wins over `runSsh`'s own default.
  */
-async function exec(ctx: ToolContext, command: string, timeoutMs?: number): Promise<ToolResult> {
+async function exec(ctx: ToolContext, command: string, timeoutMs?: number, sudoPrefixes?: string[]): Promise<ToolResult> {
   const cred = await ctx.getCredential();
   const effectiveTimeoutMs = timeoutMs ?? targetTimeoutMs(ctx.target);
-  const { stdout, stderr, code } = await runSsh(ctx.target, cred, command, { timeoutMs: effectiveTimeoutMs });
-  const body = stdout || stderr || "(no output)";
+  const { stdout, stderr, code } = await runSsh(ctx.target, cred, command, { timeoutMs: effectiveTimeoutMs, ...(sudoPrefixes ? { sudoPrefixes } : {}) });
+  let body = stdout || stderr || "(no output)";
+  if (code !== 0 && sudoPrefixes?.length && looksLikeSudoPasswordFailure(stderr)) {
+    body += `\n${sudoHint(firstWord(command), cred.username ?? cred.fields["username"] ?? "<ssh-user>")}`;
+  }
   return {
     text: code === 0 ? body : `exit ${code}\n${body}`,
     isError: code !== 0,
@@ -122,11 +139,12 @@ function buildTools(target: Target): ConnectorTool[] {
       inputSchema: z.object({ command: z.string() }),
       run: (input, ctx) => {
         const { command } = input as { command: string };
+        // Policy runs on the RAW command; the PATH/sudo wrapping happens inside runSsh afterwards.
         const verdict = checkCommand(command, { allow: READONLY_ALLOW });
         if (!verdict.allowed) {
           return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
         }
-        return exec(ctx, command);
+        return exec(ctx, command, undefined, sudoPrefixesFor(ctx.target));
       },
     },
   ];
@@ -134,7 +152,10 @@ function buildTools(target: Target): ConnectorTool[] {
   const executeTools: ConnectorTool[] = [
     {
       name: "run_command",
-      description: `Run an arbitrary shell command on ${target.name}. Destructive commands are refused by policy. Long-running commands (e.g. docker compose pull, large file ops) can raise the timeout with 'timeoutSeconds'.`,
+      description:
+        `Run an arbitrary shell command on ${target.name}. Destructive commands are refused by policy. Long-running commands (e.g. docker compose pull, large file ops) can raise the timeout with 'timeoutSeconds'. ` +
+        "The session PATH is extended with /usr/local/bin, /usr/local/sbin, /usr/sbin, /sbin (Synology/embedded hosts hide docker, synopkg there). " +
+        "If a command needs root (e.g. docker on a Synology as a non-root user), set the target option `sudoPrefixes` (e.g. [\"docker\"]) via update_target so `sudo -n` is prefixed automatically; a failed sudo returns a hint with the sudoers rule to add.",
       tier: "execute",
       inputSchema: z.object({
         command: z.string(),
@@ -150,11 +171,12 @@ function buildTools(target: Target): ConnectorTool[] {
         `Run on ${t.name} (${t.host}): ${(input as { command: string }).command}`,
       run: (input, ctx) => {
         const { command, timeoutSeconds } = input as { command: string; timeoutSeconds?: number };
+        // Policy runs on the RAW command; the PATH/sudo wrapping happens inside runSsh afterwards.
         const verdict = checkCommand(command, policyFor(ctx.target));
         if (!verdict.allowed) {
           return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
         }
-        return exec(ctx, command, timeoutSeconds ? timeoutSeconds * 1000 : undefined);
+        return exec(ctx, command, timeoutSeconds ? timeoutSeconds * 1000 : undefined, sudoPrefixesFor(ctx.target));
       },
     },
     {
@@ -213,7 +235,9 @@ async function snapshot(ctx: ToolContext): Promise<SnapshotArtifact[]> {
       }
     }
     try {
-      const { stdout, stderr, code } = await runSsh(target, cred, cmd);
+      // The docker-ps profile line honors `sudoPrefixes` (root-only docker socket
+      // on a Synology); custom snapshotCommands do too, since they're operator-set.
+      const { stdout, stderr, code } = await runSsh(target, cred, cmd, opts.sudoPrefixes ? { sudoPrefixes: opts.sudoPrefixes } : {});
       const body = stdout || (code !== 0 ? `exit ${code}\n${stderr}` : "");
       // `note` is written UNENCRYPTED into the manifest, so never store an
       // operator's custom command there (it can embed inline credentials, e.g.

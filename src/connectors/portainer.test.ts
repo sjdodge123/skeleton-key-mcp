@@ -16,6 +16,7 @@ import {
   pickCredentialField,
   summarizeStacks,
   curateInspect,
+  secretFingerprintBlock,
 } from "./portainer.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 
@@ -565,5 +566,106 @@ describe("snapshot", () => {
       expect.arrayContaining(["endpoints.json", "stacks.json", "stack-1-media.compose.yml", "containers.json", "container-plex.inspect.json"]),
     );
     expect(arts.find((a) => a.name === "stack-1-media.compose.yml")!.data.toString()).toContain("services:");
+  });
+});
+
+describe("secret fingerprints", () => {
+  const SECRET = "s3cr3t-db-pw"; // 12 bytes
+  const compose = "services:\n  app:\n    image: ghcr.io/me/app:1";
+  const vault = { "app-db": cred({ ref: "app-db", password: SECRET }) };
+  /** Deterministic stand-in for the keyed HMAC — shape matches src/lib/fingerprint.ts. */
+  const fakeFp = async (v: string) => `len=${Buffer.byteLength(v, "utf8")} fp=deadbeef`;
+  const withFp = (c: ToolContext): ToolContext => ({ ...c, fingerprint: fakeFp });
+
+  it("resolves secretEnv with fresh: true so a deploy never uses a stale cache", async () => {
+    const resolveCredential = vi.fn(async () => vault["app-db"]);
+    mockFetch([{ match: (u) => u.includes("/api/stacks/create/standalone/string"), reply: { json: { Id: 3, Name: "app", EndpointId: 1 } } }]);
+    await tool("create_stack").run(
+      { name: "app", composeContent: compose, secretEnv: [{ name: "DB_PASSWORD", credentialRef: "app-db" }] },
+      { target: target({ endpointId: 1 }), getCredential: async () => cred({ fields: { token: "k" } }), resolveCredential },
+    );
+    expect(resolveCredential).toHaveBeenCalledWith("app-db", { fresh: true });
+  });
+
+  it("create_stack appends one fingerprint line per secretEnv var — and never the value", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/stacks/create/standalone/string"), reply: { json: { Id: 3, Name: "app", EndpointId: 1 } } }]);
+    const res = await tool("create_stack").run(
+      { name: "app", composeContent: compose, env: [{ name: "TZ", value: "UTC" }], secretEnv: [{ name: "DB_PASSWORD", credentialRef: "app-db" }] },
+      withFp(vaultCtx(cred({ fields: { token: "k" } }), vault)),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("DB_PASSWORD: len=12 fp=deadbeef");
+    expect(res.text).not.toContain("TZ: len="); // plain env is not fingerprinted
+    expect(res.text).not.toContain(SECRET);
+  });
+
+  it("update_stack appends the same block", async () => {
+    mockFetch([
+      { match: (u, i) => /\/api\/stacks\/7$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 7, Name: "app", EndpointId: 2, Env: [] } } },
+      { match: (u, i) => u.includes("/api/stacks/7?endpointId=2") && i.method === "PUT", reply: { json: {} } },
+    ]);
+    const res = await tool("update_stack").run(
+      { stackId: 7, stackFileContent: compose, pullImage: false, secretEnv: [{ name: "DB_PASSWORD", credentialRef: "app-db" }] },
+      withFp(vaultCtx(cred({ fields: { token: "k" } }), vault)),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("DB_PASSWORD: len=12 fp=deadbeef");
+    expect(res.text).not.toContain(SECRET);
+  });
+
+  it("omits the block entirely (no values!) when the context has no fingerprinter", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/stacks/create/standalone/string"), reply: { json: { Id: 3, Name: "app", EndpointId: 1 } } }]);
+    const res = await tool("create_stack").run(
+      { name: "app", composeContent: compose, secretEnv: [{ name: "DB_PASSWORD", credentialRef: "app-db" }] },
+      vaultCtx(cred({ fields: { token: "k" } }), vault),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(res.text).not.toContain("fp=");
+    expect(res.text).not.toContain("len=");
+    expect(res.text).not.toContain(SECRET);
+  });
+
+  const inspectRoute = {
+    match: (u: string) => u.includes("/docker/containers/app/json"),
+    reply: { json: { Name: "/app", Config: { Env: ["DB_PASSWORD=hunter2!", "TZ=UTC", "EMPTY=", "NOEQ"] } } },
+  };
+
+  it("container_inspect tags each redacted env entry with its fingerprint", async () => {
+    mockFetch([inspectRoute]);
+    const res = await tool("container_inspect").run({ container: "app" }, withFp(ctx(cred({ fields: { token: "k" } }))));
+    expect(res.isError).toBeFalsy();
+    const env = JSON.parse(res.text).env as string[];
+    expect(env).toEqual([
+      "DB_PASSWORD=<redacted> (len=8 fp=deadbeef)",
+      "TZ=<redacted> (len=3 fp=deadbeef)",
+      "EMPTY=<redacted> (len=0 fp=deadbeef)",
+      "NOEQ=<redacted> (len=0 fp=deadbeef)",
+    ]);
+    expect(res.text).not.toContain("hunter2!");
+  });
+
+  it("container_inspect stays plain-redacted without a fingerprinter", async () => {
+    mockFetch([inspectRoute]);
+    const res = await tool("container_inspect").run({ container: "app" }, ctx(cred({ fields: { token: "k" } })));
+    expect(JSON.parse(res.text).env).toEqual(["DB_PASSWORD=<redacted>", "TZ=<redacted>", "EMPTY=<redacted>", "NOEQ=<redacted>"]);
+    expect(res.text).not.toContain("fp=");
+    expect(res.text).not.toContain("hunter2!");
+  });
+
+  it("list_stacks tags stack env the same way", async () => {
+    mockFetch([{ match: (u) => u.endsWith("/api/stacks"), reply: { json: [{ Id: 5, Name: "media", EndpointId: 1, Status: 1, Env: [{ name: "DB_PASSWORD", value: "hunter2!" }] }] } }]);
+    const res = await tool("list_stacks").run({}, withFp(ctx(cred({ fields: { token: "k" } }))));
+    expect(res.text).toContain("DB_PASSWORD=<redacted> (len=8 fp=deadbeef)");
+    expect(res.text).not.toContain("hunter2!");
+  });
+
+  it("a failing fingerprinter degrades to plain redaction, never to the value", async () => {
+    const broken: ToolContext = { ...ctx(cred({ fields: { token: "k" } })), fingerprint: async () => { throw new Error("store locked"); } };
+    mockFetch([inspectRoute]);
+    const res = await tool("container_inspect").run({ container: "app" }, broken);
+    expect(JSON.parse(res.text).env[0]).toBe("DB_PASSWORD=<redacted>");
+    expect(res.text).not.toContain("hunter2!");
+    expect(await secretFingerprintBlock([{ name: "X", value: "v" }], broken.fingerprint)).toContain("X: (fingerprint unavailable)");
+    expect(await secretFingerprintBlock([{ name: "X", value: "v" }], undefined)).toBe("");
   });
 });
