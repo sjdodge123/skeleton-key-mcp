@@ -4,8 +4,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AppState } from "../app.js";
 import { mountMcp } from "./server.js";
+import { buildMcpServer } from "../mcp/server.js";
+import { registerConnector } from "../connectors/index.js";
+import type { Connector } from "../connectors/types.js";
 
 /**
  * Exercises the real stateful MCP endpoint (mountMcp) end-to-end over HTTP with a
@@ -189,5 +195,77 @@ describe("stateful MCP endpoint", () => {
       // No SKELETON_KEY_PUBLIC_URL in tests → guidance stays host-agnostic.
       expect(text).not.toContain("127.0.0.1");
     });
+  });
+});
+
+/**
+ * Progress heartbeats for long tool calls: drives the real CallTool handler via
+ * the SDK's in-memory transport with an UNLOCKED fake AppState and a connector
+ * whose tool sleeps, so client idle timeouts can be kept alive.
+ */
+describe("CallTool progress heartbeats", () => {
+  const slow: Connector = {
+    type: "slowtest",
+    label: "slow",
+    configSchema: z.object({}),
+    requiresCredential: false,
+    buildTools: () => [
+      {
+        name: "sleep",
+        description: "sleeps",
+        tier: "read",
+        inputSchema: z.object({ ms: z.number() }),
+        run: async (input) => {
+          await new Promise((r) => setTimeout(r, (input as { ms: number }).ms));
+          return { text: "woke" };
+        },
+      },
+    ],
+  };
+  registerConnector(slow);
+
+  const unlockedApp = {
+    locked: false,
+    registry: { list: () => [{ name: "s1", type: "slowtest", host: "h" }] },
+    audit: { record: () => {} },
+    unlockGuidance: () => "locked",
+  } as unknown as AppState;
+
+  async function connect(heartbeatMs: number): Promise<Client> {
+    const server = buildMcpServer(unlockedApp, { heartbeatMs });
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const client = new Client({ name: "t", version: "1" });
+    await client.connect(clientT);
+    return client;
+  }
+
+  it("emits notifications/progress every heartbeat while a slow tool runs when a progressToken is supplied, then stops", async () => {
+    const client = await connect(20);
+    const seen: { progress: number; message?: string }[] = [];
+    const res = await client.callTool({ name: "slowtest.s1.sleep", arguments: { ms: 150 } }, undefined, {
+      onprogress: (p) => seen.push({ progress: p.progress, message: p.message }),
+    });
+    expect((res.content as { text: string }[])[0]!.text).toBe("woke");
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen[0]!.message).toMatch(/slowtest\.s1\.sleep still running \(\d+s\)/);
+    // After the call returns the interval is cleared: no further notifications arrive.
+    const countAfter = seen.length;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(seen.length).toBe(countAfter);
+    await client.close();
+  });
+
+  it("sends no progress notification when the client did not supply a progressToken", async () => {
+    const client = await connect(20);
+    const progress = vi.fn();
+    client.setNotificationHandler(
+      z.object({ method: z.literal("notifications/progress"), params: z.any() }) as any,
+      progress as any,
+    );
+    const res = await client.callTool({ name: "slowtest.s1.sleep", arguments: { ms: 120 } });
+    expect((res.content as { text: string }[])[0]!.text).toBe("woke");
+    expect(progress).not.toHaveBeenCalled();
+    await client.close();
   });
 });

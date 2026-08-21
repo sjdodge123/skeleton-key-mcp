@@ -64,17 +64,91 @@ export function buildConnectConfig(target: Target, cred: Credential, timeoutMs: 
 }
 
 /**
+ * Directories APPENDED to the remote PATH for every command. A non-interactive
+ * SSH session on Synology DSM / embedded hosts gets a minimal PATH that omits
+ * `/usr/local/bin` (docker, synopkg, pihole, …). Appending — not prepending —
+ * keeps the host's own precedence for anything already on its PATH.
+ */
+export const SSH_PATH_APPEND = "/usr/local/bin:/usr/local/sbin:/usr/sbin:/sbin";
+const PATH_PREFIX = `export PATH="$PATH:${SSH_PATH_APPEND}"; `;
+
+export interface WrapCommandOptions {
+  /** Command names (first word, after any leading `VAR=value` assignments) that
+   *  get `sudo -n ` prefixed. Only the FIRST command of a pipeline / `&&` chain
+   *  is sudo'd. */
+  sudoPrefixes?: string[];
+  /** Skip the PATH export (tests / callers that supply their own environment). */
+  noPathExport?: boolean;
+}
+
+/**
+ * Split a raw command into leading `VAR=value` assignments, the first word
+ * (the program), and the rest. Pure helper for `wrapCommand`.
+ */
+function splitFirstWord(command: string): { assignments: string; program: string; rest: string } {
+  const m = /^(\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^\s'"]*)\s+)*)(\S+)([\s\S]*)$/.exec(command);
+  if (!m) return { assignments: "", program: "", rest: command };
+  return { assignments: m[1] ?? "", program: m[2] ?? "", rest: m[3] ?? "" };
+}
+
+/** The command's program name (first word after leading env assignments), or "". */
+export function firstWord(command: string): string {
+  return splitFirstWord(command).program;
+}
+
+/**
+ * Wrap a RAW (already policy-checked) command for a sane non-interactive
+ * environment: append the usual system dirs to PATH and, if the program
+ * matches a configured `sudoPrefixes` entry, prefix `sudo -n` to that first
+ * command (so e.g. `docker ps` on a Synology becomes `sudo -n docker ps`).
+ * Pure, exported for testing. Callers MUST run the command policy on the raw
+ * command BEFORE wrapping — this function never weakens or re-checks it.
+ */
+export function wrapCommand(command: string, opts: WrapCommandOptions = {}): string {
+  let cmd = command;
+  const prefixes = opts.sudoPrefixes ?? [];
+  if (prefixes.length) {
+    const { assignments, program, rest } = splitFirstWord(command);
+    // Match on the basename too, so `/usr/local/bin/docker` hits a `docker` prefix.
+    const base = program.slice(program.lastIndexOf("/") + 1);
+    if (program && program !== "sudo" && (prefixes.includes(program) || prefixes.includes(base))) {
+      // `sudo VAR=value cmd` keeps the assignment visible to the command (sudo's
+      // own env handling applies), which is the least surprising translation.
+      cmd = `sudo -n ${assignments}${program}${rest}`;
+    }
+  }
+  return opts.noPathExport ? cmd : PATH_PREFIX + cmd;
+}
+
+/** True when stderr shows `sudo -n` was refused for lack of a NOPASSWD rule. */
+export function looksLikeSudoPasswordFailure(stderr: string): boolean {
+  return /a password is required|sudo: /.test(stderr);
+}
+
+/** One-line operator hint appended to a result when non-interactive sudo failed. */
+export function sudoHint(program: string, username: string): string {
+  const bin = program || "<binary>";
+  return (
+    `Hint: sudo needs a password for '${bin}' on this host. Grant the SSH user passwordless sudo for that binary only: ` +
+    `echo '${username} ALL=(root) NOPASSWD: $(command -v ${bin})' | sudo tee /etc/sudoers.d/skeleton-key-${bin} && sudo chmod 0440 /etc/sudoers.d/skeleton-key-${bin}`
+  );
+}
+
+/**
  * Open a one-shot SSH connection, run a command, and return its output.
  * Auth comes from the target's resolved Credential (see `resolveSshAuth`).
+ * The command is wrapped by `wrapCommand` (PATH export + optional sudo) —
+ * pass the RAW command, already policy-checked.
  */
 export function runSsh(
   target: Target,
   cred: Credential,
-  command: string,
-  opts: { timeoutMs?: number } = {},
+  rawCommand: string,
+  opts: { timeoutMs?: number } & WrapCommandOptions = {},
 ): Promise<SshExecResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
   const config = buildConnectConfig(target, cred, timeoutMs);
+  const command = wrapCommand(rawCommand, opts);
 
   return new Promise<SshExecResult>((resolve, reject) => {
     const conn = new Client();

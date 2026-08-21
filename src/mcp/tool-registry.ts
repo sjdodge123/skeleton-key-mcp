@@ -1,6 +1,6 @@
 import type { z } from "zod";
 import type { AppState } from "../app.js";
-import type { ToolResult, ToolTier } from "../connectors/types.js";
+import type { Credential, Target, ToolResult, ToolTier } from "../connectors/types.js";
 import { getConnector } from "../connectors/index.js";
 import { buildGlobalTools, type GlobalTool } from "./builtin-tools.js";
 
@@ -74,22 +74,56 @@ export function resolveTools(app: AppState): ResolvedTool[] {
         invoke: (input) =>
           tool.run(input, {
             target,
-            getCredential: async () => {
-              if (!target.credentialRef) {
-                throw new Error(`Target '${target.name}' has no credentialRef configured.`);
-              }
-              return app.credentialFor(target.credentialRef);
-            },
+            getCredential: () => targetCredential(app, target),
             // Any vault item by name, for tools that inject a *different* item's
             // secret than the target's own (see ToolContext.resolveCredential).
             // Same in-memory, lazy path as getCredential — nothing is cached here.
-            resolveCredential: (ref: string) => app.credentialFor(ref),
+            resolveCredential: (ref: string, opts?: { fresh?: boolean }) => app.credentialFor(ref, opts),
+            fingerprint: (value: string) => app.fingerprint(value),
           }),
       });
     }
   }
 
   return resolved;
+}
+
+/**
+ * Resolve a target's own credential, preferring the pinned immutable item id
+ * over the human-facing name. Why: during a migration a vault item was renamed
+ * mid-cleanup and the next deploy resolved the NAME from a stale cache, serving
+ * the wrong value. The id can't be hijacked by a rename or a same-named
+ * duplicate. If the pinned item is gone (deleted and recreated under the same
+ * name), fall back to the name and re-pin the new id best-effort so the next
+ * call is stable again. The returned `ref` is always the name the target was
+ * registered with, so callers/logs never see a bare UUID.
+ */
+export async function targetCredential(app: AppState, target: Target): Promise<Credential> {
+  const ref = target.credentialRef;
+  if (!ref) throw new Error(`Target '${target.name}' has no credentialRef configured.`);
+  if (target.credentialId) {
+    try {
+      const cred = await app.credentialFor(target.credentialId, { byId: true });
+      return { ...cred, ref };
+    } catch (e) {
+      // A locked vault is not "the item is gone" — surface the unlock guidance
+      // rather than hammering the name path (which would fail the same way).
+      if (app.locked) throw e;
+    }
+  }
+  const cred = await app.credentialFor(ref);
+  await repinCredentialId(app, target).catch(() => {});
+  return cred;
+}
+
+/** Best-effort: persist the id the name currently resolves to (missing or stale pin). */
+async function repinCredentialId(app: AppState, target: Target): Promise<void> {
+  if (!target.credentialRef) return;
+  const { id } = await app.vault.resolveRef(target.credentialRef);
+  if (id === target.credentialId) return;
+  const current = app.registry.get(target.name);
+  if (!current || current.credentialRef !== target.credentialRef) return; // target changed under us
+  await app.registry.upsert({ ...current, credentialId: id });
 }
 
 export function findTool(app: AppState, qualifiedName: string): ResolvedTool | undefined {

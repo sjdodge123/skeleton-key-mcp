@@ -85,6 +85,66 @@ function page(): string {
 </body></html>`;
 }
 
+/**
+ * Pending credential hand-off links. Same trust model as the activity page:
+ * the shell is unauthenticated and reveals nothing; the list comes from the
+ * TOTP-gated `POST /api/credential-requests` and is rendered with textContent.
+ * Exists because chat UIs sometimes fail to render the one-time link the
+ * `request_credential` tool returns — the admin can pick it up here instead.
+ */
+function credentialsPage(): string {
+  return `<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Pending credential links — Skeleton Key</title><style>${STYLE}
+.card{background:#171a21;border:1px solid #262b36;border-radius:12px;padding:16px;margin-bottom:12px}
+.card h2{font-size:16px;margin:0 0 6px}.card .meta{color:#8b93a7;font-size:13px;margin:2px 0}
+.card a{color:#8fb7ff;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.card .tag{display:inline-block;font-size:11px;padding:2px 7px;border-radius:20px;border:1px solid #5a4326;color:#ffd38a;margin-left:6px}
+.card .open{display:inline-block;margin-top:10px;padding:8px 14px;border-radius:9px;background:#4d7cfe;color:#fff;text-decoration:none;font-weight:600;font-size:13px}</style></head>
+<body><div class="wrap">
+  <h1>🗝️ Pending credential links</h1>
+  <p class="mut">One-time links Claude has asked you to fill in. If a link didn't show up in your chat, open it from here. Nothing here is a secret — only what's being asked for and where it will be stored.</p>
+  <div class="bar">
+    <div><label>Authenticator code</label><input class="code" id="totp" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"/></div>
+    <button id="load">Show pending links</button>
+  </div>
+  <div class="err" id="err"></div>
+  <div id="list"></div>
+</div>
+<script>
+(function(){
+  var totp=document.getElementById('totp'),err=document.getElementById('err'),list=document.getElementById('list'),btn=document.getElementById('load');
+  function el(tag,cls,text){var d=document.createElement(tag);if(cls)d.className=cls;if(text!=null)d.textContent=String(text);return d;}
+  async function load(){
+    err.textContent='';
+    var r;
+    try{ r=await fetch('/api/credential-requests',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({totp:totp.value.trim()})}); }
+    catch(e){ err.textContent='Network error.'; return; }
+    if(!r.ok){ var j={}; try{j=await r.json();}catch(_){} err.textContent=(j&&j.error)||('HTTP '+r.status); return; }
+    var data=await r.json(); list.innerHTML='';
+    if(!data.requests.length){ err.textContent='No pending credential requests.'; return; }
+    if(!data.publicUrl){ err.textContent='SKELETON_KEY_PUBLIC_URL is not set — links below are relative to this host.'; }
+    data.requests.forEach(function(q){
+      var c=el('div','card');
+      var h=el('h2',null,q.name+' — for '+q.host);
+      if(q.overwrite){ h.appendChild(el('span','tag','replaces existing item')); }
+      c.appendChild(h);
+      c.appendChild(el('div','meta','Reason: '+q.reason));
+      c.appendChild(el('div','meta','Asks for: '+q.fields.join(', ')));
+      if(q.verifyHost){ c.appendChild(el('div','meta','Will be tested against '+q.verifyHost+' before storing')); }
+      c.appendChild(el('div','meta','Expires: '+new Date(q.expiresAt).toLocaleString()));
+      var a=el('a',null,q.link); a.href=q.link; c.appendChild(a);
+      var o=el('a','open','Open link'); o.href=q.link; c.appendChild(document.createElement('br')); c.appendChild(o);
+      list.appendChild(c);
+    });
+  }
+  btn.addEventListener('click',load);
+  totp.addEventListener('keydown',function(e){ if(e.key==='Enter') load(); });
+})();
+</script>
+</body></html>`;
+}
+
 export function buildAdminRouter(app: AppState): Router {
   const router = Router();
   router.get(["/admin", "/admin/activity"], async (_req, res) => {
@@ -93,6 +153,13 @@ export function buildAdminRouter(app: AppState): Router {
       return;
     }
     res.type("html").send(page());
+  });
+  router.get("/admin/credentials", async (_req, res) => {
+    if (!(await app.isSetupComplete())) {
+      res.status(404).type("html").send("<!doctype html><meta charset=utf-8><p>Skeleton Key setup isn't complete yet.</p>");
+      return;
+    }
+    res.type("html").send(credentialsPage());
   });
   return router;
 }

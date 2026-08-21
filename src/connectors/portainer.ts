@@ -163,10 +163,14 @@ export async function resolveSecretEnv(ctx: ToolContext, refs: SecretEnvRef[] | 
   if (!refs?.length) return [];
   if (!ctx.resolveCredential) throw new Error("This context cannot resolve vault items, so secretEnv is unavailable here.");
   const out: EnvEntry[] = [];
-  for (const r of refs) {
+  for (const [idx, r] of refs.entries()) {
     let cred: Credential;
     try {
-      cred = await ctx.resolveCredential(r.credentialRef);
+      // `fresh`: a secret about to be injected into a deploy must never come
+      // from a stale offline cache (a renamed item once served its old value
+      // through a whole deploy cycle). Bounded — an outage degrades to cache.
+      // One sync (before the first lookup) refreshes the cache for all of them.
+      cred = await ctx.resolveCredential(r.credentialRef, { fresh: idx === 0 });
     } catch (e) {
       throw new Error(`secretEnv '${r.name}': cannot read vault item '${r.credentialRef}' — ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -180,6 +184,59 @@ export async function resolveSecretEnv(ctx: ToolContext, refs: SecretEnvRef[] | 
     out.push({ name: r.name, value });
   }
   return out;
+}
+
+/** Keyed-fingerprint function, as handed to a tool via `ToolContext.fingerprint`. */
+export type Fingerprinter = (value: string) => Promise<string>;
+
+/**
+ * Annotate env entries as `NAME=<redacted> (len=<n> fp=<hex>)` — the value is
+ * fingerprinted here in-process and NEVER emitted. A fingerprint can be
+ * compared with the vault's (credential_request_status) to tell whether a
+ * deployed/running secret is the SAME value without revealing either. Without
+ * a fingerprinter the plain `<redacted>` form is returned — never a value.
+ * A fingerprint failure degrades to the plain form the same way.
+ */
+export async function annotateEnv(env: EnvEntry[] | undefined, fp?: Fingerprinter): Promise<string[]> {
+  const out: string[] = [];
+  for (const e of env ?? []) {
+    let tag = "";
+    if (fp) {
+      try {
+        tag = ` (${await fp(e.value)})`;
+      } catch {
+        /* no fingerprint — still never the value */
+      }
+    }
+    out.push(`${e.name}=<redacted>${tag}`);
+  }
+  return out;
+}
+
+/**
+ * Trailing block for a deploy result: one `NAME: len=<n> fp=<hex>` line per
+ * injected secret, so what landed in the stack can be checked against the
+ * vault in seconds. Empty (not a value echo!) when no fingerprinter is present.
+ */
+export async function secretFingerprintBlock(secretEnv: EnvEntry[], fp?: Fingerprinter): Promise<string> {
+  if (!fp || !secretEnv.length) return "";
+  const lines: string[] = [];
+  for (const e of secretEnv) {
+    try {
+      lines.push(`  ${e.name}: ${await fp(e.value)}`);
+    } catch {
+      lines.push(`  ${e.name}: (fingerprint unavailable)`);
+    }
+  }
+  return `\nSecret fingerprints (compare with the vault's via credential_request_status):\n${lines.join("\n")}`;
+}
+
+/** Split Docker's `NAME=value` env strings into entries (a line with no '=' has an empty value). */
+export function parseDockerEnv(env: string[] | undefined): EnvEntry[] {
+  return (env ?? []).map((kv) => {
+    const i = kv.indexOf("=");
+    return i < 0 ? { name: kv, value: "" } : { name: kv.slice(0, i), value: kv.slice(i + 1) };
+  });
 }
 
 /** Portainer client bound to one target — resolves auth lazily per call. */
@@ -289,9 +346,13 @@ class Portainer {
     return `Container '${ref}' ${action}${action === "stop" ? "p" : ""}ed${res.status === 304 ? " (already in that state)" : ""}.`;
   }
 
-  async listStacks(): Promise<string> {
+  /** With a fingerprinter, each stack's env is annotated with per-value
+   *  fingerprints (values still redacted) so it can be compared with the vault. */
+  async listStacks(fp?: Fingerprinter): Promise<string> {
     const ss = await this.get<PortainerStack[]>("/api/stacks");
-    return summarizeStacks(ss);
+    const envLines = new Map<number, string[]>();
+    for (const s of ss) envLines.set(s.Id, await annotateEnv(s.Env, fp));
+    return summarizeStacks(ss, envLines);
   }
 
   async stackFile(id: number): Promise<string> {
@@ -363,11 +424,15 @@ class Portainer {
     return `Stack '${cur.Name}' (#${id}) deleted from endpoint ${cur.EndpointId}, along with its containers. Volumes and bind mounts were NOT deleted.`;
   }
 
-  /** Curated container inspect — env values redacted (stack secrets land there). */
-  async containerInspect(ref: string): Promise<string> {
+  /** Curated container inspect — env values redacted (stack secrets land there).
+   *  With a fingerprinter, each env entry also carries `(len=.. fp=..)` so a
+   *  running container's secrets can be compared with the vault's. */
+  async containerInspect(ref: string, fp?: Fingerprinter): Promise<string> {
     const eid = await this.endpointId();
     const raw = await this.get<unknown>(`/api/endpoints/${eid}/docker/containers/${encodeURIComponent(ref)}/json`);
-    return JSON.stringify(curateInspect(raw), null, 2);
+    const curated = curateInspect(raw);
+    if (fp) curated.env = await annotateEnv(parseDockerEnv((raw as DockerInspect | undefined)?.Config?.Env), fp);
+    return JSON.stringify(curated, null, 2);
   }
 
   /**
@@ -471,13 +536,15 @@ export function summarizeContainers(cs: DockerContainer[]): string {
  * Portainer's stack JSON carries `Env` values in the clear (vault-injected
  * secretEnv among them), so nothing here may echo a value. Exported for testing.
  */
-export function summarizeStacks(ss: PortainerStack[]): string {
+export function summarizeStacks(ss: PortainerStack[], envLines?: Map<number, string[]>): string {
   if (!ss.length) return "No stacks.";
   return ss
     .map((s) => {
       const head = `- #${s.Id} ${s.Name} (endpoint ${s.EndpointId}, ${s.Status === 1 ? "active" : "inactive"})`;
-      const env = redactEnv(s.Env);
-      return env.length ? `${head}\n    env: ${env.map((e) => `${e.name}=${e.value}`).join(", ")}` : head;
+      // Pre-annotated (fingerprinted, still redacted) lines if the caller built
+      // them; otherwise the plain redacted form. Never a value either way.
+      const env = envLines?.get(s.Id) ?? redactEnv(s.Env).map((e) => `${e.name}=${e.value}`);
+      return env.length ? `${head}\n    env: ${env.join(", ")}` : head;
     })
     .join("\n");
 }
@@ -645,19 +712,19 @@ function buildTools(target: Target): ConnectorTool[] {
     },
     {
       name: "list_stacks",
-      description: `List Portainer stacks on ${target.name} (id, name, endpoint, environment variable names — values are redacted).`,
+      description: `List Portainer stacks on ${target.name} (id, name, endpoint, environment variable names — values are redacted, each tagged with a keyed length+fingerprint you can compare against the vault's).`,
       tier: "read",
       inputSchema: z.object({}),
-      run: run((p) => p.listStacks()),
+      run: run((p, _i, ctx) => p.listStacks(ctx.fingerprint)),
     },
     {
       name: "container_inspect",
       description:
         `Inspect a container on ${target.name}: image + digest, state and health, restart policy, mounts, network mode, published ports, ` +
-        `labels, and environment variable NAMES (values are redacted). Use this to debug a container that won't start or keeps restarting.`,
+        `labels, and environment variable NAMES (values are redacted; each carries a keyed length+fingerprint comparable with credential_request_status). Use this to debug a container that won't start or keeps restarting.`,
       tier: "read",
       inputSchema: z.object({ container: z.string().describe("Container name or id.") }),
-      run: run((p, i) => p.containerInspect(i.container)),
+      run: run((p, i, ctx) => p.containerInspect(i.container, ctx.fingerprint)),
     },
     {
       name: "get_stack_file",
@@ -715,7 +782,8 @@ function buildTools(target: Target): ConnectorTool[] {
       },
       run: run(async (p, i, ctx) => {
         const secret = await resolveSecretEnv(ctx, i.secretEnv);
-        return p.createStack(i.name, i.composeContent, mergeEnv(i.env, secret));
+        const result = await p.createStack(i.name, i.composeContent, mergeEnv(i.env, secret));
+        return result + (await secretFingerprintBlock(secret, ctx.fingerprint));
       }),
     },
     {
@@ -738,7 +806,8 @@ function buildTools(target: Target): ConnectorTool[] {
       },
       run: run(async (p, i, ctx) => {
         const secret = await resolveSecretEnv(ctx, i.secretEnv);
-        return p.updateStack(i.stackId, i.stackFileContent, i.pullImage, i.env ?? [], secret);
+        const result = await p.updateStack(i.stackId, i.stackFileContent, i.pullImage, i.env ?? [], secret);
+        return result + (await secretFingerprintBlock(secret, ctx.fingerprint));
       }),
     },
     {

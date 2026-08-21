@@ -20,7 +20,18 @@ vi.mock("ssh2", async () => {
   return { Client: FakeClient };
 });
 
-import { resolveSshAuth, buildConnectConfig, shellQuote, runSsh, MAX_SSH_TIMEOUT_MS } from "./ssh-exec.js";
+import {
+  resolveSshAuth,
+  buildConnectConfig,
+  shellQuote,
+  runSsh,
+  MAX_SSH_TIMEOUT_MS,
+  wrapCommand,
+  firstWord,
+  looksLikeSudoPasswordFailure,
+  sudoHint,
+  SSH_PATH_APPEND,
+} from "./ssh-exec.js";
 import type { Credential } from "../secrets/types.js";
 import type { Target } from "./types.js";
 
@@ -130,5 +141,59 @@ describe("runSsh timeout", () => {
 
   it("MAX_SSH_TIMEOUT_MS is 10 minutes", () => {
     expect(MAX_SSH_TIMEOUT_MS).toBe(600_000);
+  });
+});
+
+describe("wrapCommand (PATH + sudoPrefixes)", () => {
+  it("appends (not prepends) the system dirs to PATH so the host's own precedence wins", () => {
+    const out = wrapCommand("docker ps");
+    expect(out).toBe(`export PATH="$PATH:${SSH_PATH_APPEND}"; docker ps`);
+    expect(out.indexOf("$PATH:")).toBeLessThan(out.indexOf("/usr/local/bin"));
+  });
+
+  it("leaves the command untouched apart from the PATH export when no sudoPrefixes match", () => {
+    expect(wrapCommand("ls -la /tmp", { sudoPrefixes: ["docker"], noPathExport: true })).toBe("ls -la /tmp");
+  });
+
+  it("prefixes `sudo -n` to the first command when its program matches", () => {
+    expect(wrapCommand("docker ps -a", { sudoPrefixes: ["docker"], noPathExport: true })).toBe("sudo -n docker ps -a");
+    expect(wrapCommand("synopkg list", { sudoPrefixes: ["docker", "synopkg"], noPathExport: true })).toBe("sudo -n synopkg list");
+  });
+
+  it("matches on basename too, so an absolute path to the binary is also elevated", () => {
+    expect(wrapCommand("/usr/local/bin/docker ps", { sudoPrefixes: ["docker"], noPathExport: true })).toBe("sudo -n /usr/local/bin/docker ps");
+  });
+
+  it("skips leading VAR=value assignments when finding the program (and keeps them)", () => {
+    expect(wrapCommand("DOCKER_HOST=unix:///var/run/docker.sock docker ps", { sudoPrefixes: ["docker"], noPathExport: true })).toBe(
+      "sudo -n DOCKER_HOST=unix:///var/run/docker.sock docker ps",
+    );
+    expect(wrapCommand(`A=1 B="two words" docker info`, { sudoPrefixes: ["docker"], noPathExport: true })).toBe(`sudo -n A=1 B="two words" docker info`);
+  });
+
+  it("only sudos the FIRST command of a pipeline / && chain", () => {
+    expect(wrapCommand("docker ps | grep nginx", { sudoPrefixes: ["docker", "grep"], noPathExport: true })).toBe("sudo -n docker ps | grep nginx");
+    expect(wrapCommand("cd /tmp && docker ps", { sudoPrefixes: ["docker"], noPathExport: true })).toBe("cd /tmp && docker ps"); // first command is cd
+  });
+
+  it("never double-sudos a command the user already prefixed with sudo", () => {
+    expect(wrapCommand("sudo docker ps", { sudoPrefixes: ["docker", "sudo"], noPathExport: true })).toBe("sudo docker ps");
+  });
+
+  it("firstWord returns the program after env assignments", () => {
+    expect(firstWord("FOO=bar docker ps")).toBe("docker");
+    expect(firstWord("   ls")).toBe("ls");
+    expect(firstWord("")).toBe("");
+  });
+
+  it("detects a non-interactive sudo password failure and the hint names the binary + user", () => {
+    expect(looksLikeSudoPasswordFailure("sudo: a password is required\n")).toBe(true);
+    expect(looksLikeSudoPasswordFailure("sudo: 3 incorrect password attempts")).toBe(true);
+    expect(looksLikeSudoPasswordFailure("permission denied while trying to connect to the Docker daemon socket")).toBe(false);
+    const hint = sudoHint("docker", "skeletonkey");
+    expect(hint).toContain("NOPASSWD");
+    expect(hint).toContain("skeletonkey ALL=(root)");
+    expect(hint).toContain("command -v docker");
+    expect(hint).toContain("/etc/sudoers.d/skeleton-key-docker");
   });
 });

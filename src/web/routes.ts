@@ -368,6 +368,34 @@ export function buildApiRouter(app: AppState): Router {
     }),
   );
 
+  // --- Pending credential hand-off links ---
+  // TOTP-gated, metadata only (names/hosts/expiry — never a value). Lets the
+  // admin recover a one-time link that their chat UI failed to render before
+  // the TTL runs out. Links are built from the configured public URL ONLY,
+  // never the request Host header (anti-phishing, see CLAUDE.md).
+  router.post(
+    "/credential-requests",
+    h(async (req, res) => {
+      if (app.store.locked) {
+        res.status(409).json({ error: "Unlock the store first." });
+        return;
+      }
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
+      if (!app.verifyTotp(totp)) {
+        res.status(403).json({ error: "Invalid authenticator code." });
+        return;
+      }
+      const base = app.publicUrl();
+      const requests = app.credentialRequests.list().map((r) => ({
+        ...r,
+        expiresAt: new Date(r.expiresAt).toISOString(),
+        createdAt: new Date(r.createdAt).toISOString(),
+        link: `${base ?? ""}/credential/${r.id}`,
+      }));
+      res.json({ publicUrl: base, requests });
+    }),
+  );
+
   router.post(
     "/snapshots/:id/download",
     h(async (req, res) => {

@@ -77,3 +77,29 @@ describe("ssh snapshot", () => {
     expect(arts.map((a) => a.name)).toEqual(["uname.txt"]);
   });
 });
+
+describe("ssh snapshot sudoPrefixes", () => {
+  it("passes sudoPrefixes to runSsh for the docker-ps profile line", async () => {
+    const calls: { cmd: string; opts: any }[] = [];
+    vi.mocked(runSsh).mockImplementation(async (_t, _c, cmd: string, opts?: any) => {
+      calls.push({ cmd, opts });
+      if (cmd.includes("command -v pihole")) return { stdout: "", stderr: "", code: 1 };
+      return { stdout: "x", stderr: "", code: 0 };
+    });
+    const t: Target = { ...base, options: { sudoPrefixes: ["docker"] } };
+    await sshConnector.snapshot!(ctxFor(t));
+    const dockerCall = calls.find((c) => c.cmd.startsWith("docker ps"));
+    expect(dockerCall).toBeDefined();
+    expect(dockerCall!.opts).toEqual({ sudoPrefixes: ["docker"] });
+  });
+
+  it("passes no sudoPrefixes when the option is unset", async () => {
+    const calls: { cmd: string; opts: any }[] = [];
+    vi.mocked(runSsh).mockImplementation(async (_t, _c, cmd: string, opts?: any) => {
+      calls.push({ cmd, opts });
+      return { stdout: cmd.includes("pihole") ? "" : "x", stderr: "", code: cmd.includes("pihole") ? 1 : 0 };
+    });
+    await sshConnector.snapshot!(ctxFor(base));
+    expect(calls.find((c) => c.cmd.startsWith("docker ps"))!.opts).toEqual({});
+  });
+});

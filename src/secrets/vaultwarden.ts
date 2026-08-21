@@ -37,6 +37,30 @@ interface BwItem {
   };
   fields?: { name: string; value: string }[];
   notes?: string;
+  /** Set when the item is in the trash (soft-deleted). A trashed item must never
+   *  satisfy a credentialRef — a stale duplicate name sitting in the trash once
+   *  served a wrong value during a migration. */
+  deletedDate?: string | null;
+}
+
+/** True for an item that is NOT in the trash. */
+function isLive(item: { deletedDate?: string | null }): boolean {
+  return item.deletedDate == null;
+}
+
+/** Upper bound on a `fresh` sync before falling back to the offline cache. */
+export const FRESH_SYNC_TIMEOUT_MS = 10_000;
+
+/** Options for a credential read. */
+export interface GetCredentialOptions {
+  /** Sync from the server first (best-effort, bounded by FRESH_SYNC_TIMEOUT_MS)
+   *  so the value can't come from a stale offline cache — for secrets that are
+   *  about to be injected into a deploy. An unreachable server degrades to the
+   *  cache instead of failing. */
+  fresh?: boolean;
+  /** `ref` is a pinned item id: fetch it directly and only by id (no name
+   *  matching), so a renamed/recreated item can't be confused with it. */
+  byId?: boolean;
 }
 
 /**
@@ -160,6 +184,26 @@ export class VaultwardenClient {
     await this.run(["sync"]);
   }
 
+  /**
+   * Best-effort, time-bounded sync: resolves after the sync completes, fails, or
+   * `timeoutMs` elapses — never throws. Used by `fresh` reads so a Vaultwarden
+   * outage degrades to the offline cache instead of hanging a deploy.
+   */
+  async syncBestEffort(timeoutMs: number = FRESH_SYNC_TIMEOUT_MS): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([this.sync().then(() => true), timeout]);
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   lock(): void {
     this.session = null;
   }
@@ -239,7 +283,25 @@ export class VaultwardenClient {
     // materialize in memory) instead of serializing the whole collection.
     const args = search ? ["list", "items", "--search", search] : ["list", "items"];
     const out = await this.run(args);
-    return JSON.parse(out) as BwItem[];
+    // Trashed items are excluded from EVERY candidate set: they can't satisfy a
+    // ref, can't block a name from being reused, and can't shadow a live item.
+    return (JSON.parse(out) as BwItem[]).filter(isLive);
+  }
+
+  /**
+   * Fetch one item by its immutable id with a single bounded `bw get item`.
+   * Returns null when the id is unknown OR the item is trashed — a soft-deleted
+   * item is "gone" for every resolution purpose.
+   */
+  private async getItemById(id: string): Promise<BwItem | null> {
+    this.assertUnlocked();
+    if (!UUID_RE.test(id)) return null;
+    try {
+      const item = JSON.parse(await this.run(["get", "item", id])) as BwItem;
+      return item?.id === id && isLive(item) ? item : null;
+    } catch {
+      return null; // not an id we hold
+    }
   }
 
   async listItemNames(): Promise<string[]> {
@@ -267,15 +329,24 @@ export class VaultwardenClient {
     // Not found by name: if the ref is a Bitwarden item id (UUID), fetch it
     // directly — `--search` can't match by id, and a single `bw get item` stays
     // bounded to one item.
-    if (UUID_RE.test(ref)) {
-      try {
-        const byId = JSON.parse(await this.run(["get", "item", ref])) as BwItem;
-        if (byId?.id === ref) return byId;
-      } catch {
-        /* not an id we hold */
-      }
-    }
+    const byId = await this.getItemById(ref);
+    if (byId) return byId;
     throw new Error(`No vault item named "${ref}" in the scoped collection.`);
+  }
+
+  /**
+   * Resolve a ref to its item, honoring `opts`: `byId` pins the lookup to the
+   * immutable item id (no name matching at all); `fresh` syncs first (bounded,
+   * best-effort) so the read can't be served from a stale cache.
+   */
+  private async resolveForRead(ref: string, opts: GetCredentialOptions = {}): Promise<BwItem> {
+    if (opts.fresh) await this.syncBestEffort();
+    if (opts.byId) {
+      const item = await this.getItemById(ref);
+      if (!item) throw new Error(`No vault item with id "${ref}" in the scoped collection (deleted, trashed, or recreated).`);
+      return item;
+    }
+    return this.findItem(ref);
   }
 
   /** Resolve a credentialRef to its canonical {id, name} without decrypting the
@@ -294,8 +365,8 @@ export class VaultwardenClient {
     return { name: item.name };
   }
 
-  async getCredential(ref: string): Promise<Credential> {
-    const item = await this.findItem(ref);
+  async getCredential(ref: string, opts: GetCredentialOptions = {}): Promise<Credential> {
+    const item = await this.resolveForRead(ref, opts);
     const fields: Record<string, string> = {};
     for (const f of item.fields ?? []) fields[f.name] = f.value;
     return {
@@ -313,6 +384,52 @@ export class VaultwardenClient {
       uris: (item.login?.uris ?? []).map((u) => u.uri),
     };
   }
+
+  /**
+   * Re-fill an EXISTING Login item in place (credential hand-off with
+   * `overwrite: true`). The item keeps its id, name, collections, notes and
+   * every field not named in the patch — only the listed login username /
+   * password / custom fields are replaced (by name). Like `createLoginItem`
+   * the payload is fed on stdin so secrets never appear in argv; the local
+   * cache is refreshed best-effort afterwards.
+   */
+  async updateLoginItem(
+    ref: string,
+    patch: { username?: string; password?: string; fields?: { name: string; value: string; hidden?: boolean }[] },
+  ): Promise<{ id: string; name: string }> {
+    this.assertUnlocked();
+    const { id } = await this.resolveRef(ref);
+    // Fetch the FULL item (not the list projection) so unrelated properties
+    // survive the round-trip through `bw edit item`.
+    const current = JSON.parse(await this.run(["get", "item", id])) as BwItem & Record<string, unknown>;
+    const merged = mergeLoginItem(current, patch);
+    const encoded = Buffer.from(JSON.stringify(merged)).toString("base64");
+    await this.runWithStdin(["edit", "item", id], encoded);
+    await this.sync().catch(() => {});
+    return { id: current.id, name: current.name };
+  }
+}
+
+/**
+ * Pure merge for `updateLoginItem` (exported for testing): replace the listed
+ * login username/password and custom fields BY NAME, keep everything else
+ * (id, name, collections, notes, unlisted fields, uris) exactly as it was.
+ */
+export function mergeLoginItem<T extends BwItem & Record<string, unknown>>(
+  item: T,
+  patch: { username?: string; password?: string; fields?: { name: string; value: string; hidden?: boolean }[] },
+): T {
+  const login = { ...(item.login ?? {}) } as NonNullable<BwItem["login"]> & Record<string, unknown>;
+  if (patch.username !== undefined) login.username = patch.username;
+  if (patch.password !== undefined) login.password = patch.password;
+  const existing = ((item.fields ?? []) as { name: string; value: string; type?: number }[]).map((f) => ({ ...f }));
+  for (const f of patch.fields ?? []) {
+    const idx = existing.findIndex((e) => e.name === f.name);
+    const next = { ...(idx >= 0 ? existing[idx] : {}), name: f.name, value: f.value, type: f.hidden ? 1 : 0 };
+    if (idx >= 0) existing[idx] = next;
+    else existing.push(next);
+  }
+  return { ...item, login, fields: existing };
 }
 
 /**
@@ -322,7 +439,11 @@ export class VaultwardenClient {
  * throws only on a genuinely ambiguous match so a ref never silently resolves to
  * the wrong secret.
  */
-export function resolveItem<T extends { id: string; name: string }>(candidates: T[], ref: string): T | null {
+export function resolveItem<T extends { id: string; name: string; deletedDate?: string | null }>(all: T[], ref: string): T | null {
+  // Defensive: the live-set filter also happens at fetch time, but a trashed
+  // item must never win here either (this is how a stale duplicate name once
+  // produced a wrong value).
+  const candidates = all.filter(isLive);
   const exact = candidates.filter((i) => i.name === ref);
   if (exact.length === 1) return exact[0]!;
   if (exact.length > 1) {
