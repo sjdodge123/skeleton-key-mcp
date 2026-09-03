@@ -197,6 +197,8 @@ interface Server {
   uuid?: string;
   identifier?: string;
   name?: string;
+  /** Owner's user id — decides whether the CLIENT key can act on this server. */
+  user?: number;
   description?: string;
   status?: string | null;
   suspended?: boolean;
@@ -267,14 +269,35 @@ export function summarizeUsers(users: PanelUser[]): string {
     .join("\n");
 }
 
-export function summarizeServers(servers: Server[]): string {
+/**
+ * `reachable` is the set of identifiers the CLIENT key can actually act on (from
+ * GET /api/client). Annotating here is what stops the two-API split from being a
+ * trap: the Application key lists every server on the panel, but power, startup
+ * and schedule tools all go through the Client key and silently 404 on anything
+ * its user doesn't own. Pass null when that lookup failed, so the line says
+ * "unknown" rather than falsely claiming no access.
+ */
+export function summarizeServers(servers: Server[], reachable?: Set<string> | null): string {
   if (!servers.length) return "No servers.";
-  return servers
-    .map((s) => {
-      const flags = [s.suspended ? "SUSPENDED" : null, s.status ? String(s.status) : null].filter(Boolean).join(" ");
-      return `- [${s.id}] ${s.name ?? "(unnamed)"} identifier=${s.identifier ?? "?"} uuid=${s.uuid ?? "?"} node=${s.node ?? "?"} egg=${s.egg ?? "?"}${flags ? `  ${flags}` : ""}`;
-    })
-    .join("\n");
+  const lines = servers.map((s) => {
+    const flags = [s.suspended ? "SUSPENDED" : null, s.status ? String(s.status) : null].filter(Boolean).join(" ");
+    let access = "";
+    if (reachable === null) access = "  client=unknown";
+    else if (reachable) {
+      const ok = (s.identifier && reachable.has(s.identifier)) || (s.uuid && reachable.has(s.uuid));
+      access = ok ? "  client=YES" : `  client=NO (owned by user ${s.user ?? "?"})`;
+    }
+    return `- [${s.id}] ${s.name ?? "(unnamed)"} identifier=${s.identifier ?? "?"} uuid=${s.uuid ?? "?"} node=${s.node ?? "?"} egg=${s.egg ?? "?"}${flags ? `  ${flags}` : ""}${access}`;
+  });
+  if (reachable && ![...servers].some((s) => (s.identifier && reachable.has(s.identifier)) || (s.uuid && reachable.has(s.uuid)))) {
+    lines.push(
+      "",
+      "NOTE: client=NO on every server — the client key's user owns none of them, so power_action, update_startup_variables,",
+      "server_resources and all schedule tools will 404. That is a panel permission, not a fault: make that user the owner, or",
+      "add them as a subuser. Servers created by create_server are owned by the target's ownerUserId and will be reachable.",
+    );
+  }
+  return lines.join("\n");
 }
 
 /** Render a schedule's cron in the familiar 5-field order. */
@@ -369,11 +392,20 @@ class Pelican {
 
   /** Throw on an HTTP error, surfacing Pelican's `{errors:[{detail}]}` envelope
    *  (scrubbed) rather than a bare status. */
-  private ensureOk(res: { ok: boolean; status: number; json?: unknown; text: string }, path: string): void {
+  private ensureOk(res: { ok: boolean; status: number; json?: unknown; text: string }, path: string, api?: PelicanApi): void {
     if (res.ok) return;
     const errs = (res.json as { errors?: { detail?: string; code?: string }[] })?.errors;
     const detail = errs?.map((e) => e.detail ?? e.code).filter(Boolean).join("; ");
-    throw new Error(`Pelican HTTP ${res.status} on ${path}: ${scrubSecrets(detail || res.text).slice(0, 400)}`);
+    // A Client-API 404 on a server path almost never means "no such server" — it
+    // means the client key's user neither owns it nor is a subuser on it, so the
+    // panel hides it entirely. Without this hint the failure looks like a bad id,
+    // and list_servers (Application API) cheerfully shows the server, which makes
+    // it look like a bug in Skeleton Key rather than a panel permission.
+    const hint =
+      api === "client" && res.status === 404 && path.startsWith("/servers/")
+        ? ` — the Client API only sees servers its key's user OWNS or is a subuser on. Run list_servers: it marks which servers this key can act on, and names each owner. Fix by making that user the server's owner or adding them as a subuser in the panel.`
+        : "";
+    throw new Error(`Pelican HTTP ${res.status} on ${path}: ${scrubSecrets(detail || res.text).slice(0, 400)}${hint}`);
   }
 
   /** Unwrap a Fractal list, following pagination so a long allocation list is
@@ -383,7 +415,7 @@ class Pelican {
     let page = 1;
     for (;;) {
       const res = await this.request(api, path, { query: { ...query, page, per_page: 100 } });
-      this.ensureOk(res, path);
+      this.ensureOk(res, path, api);
       const body = res.json as {
         data?: { attributes?: T }[];
         meta?: { pagination?: { current_page?: number; total_pages?: number } };
@@ -398,7 +430,7 @@ class Pelican {
 
   private async item<T>(api: PelicanApi, path: string, query: Record<string, string | number> = {}): Promise<T> {
     const res = await this.request(api, path, { query });
-    this.ensureOk(res, path);
+    this.ensureOk(res, path, api);
     return ((res.json as { attributes?: T })?.attributes ?? {}) as T;
   }
 
@@ -421,7 +453,17 @@ class Pelican {
   }
 
   async listServers(): Promise<string> {
-    return summarizeServers(await this.list<Server>("application", "/servers"));
+    const servers = await this.list<Server>("application", "/servers");
+    // Best-effort: a missing/invalid client key must not break the application-side
+    // inventory, so a failure here degrades to "unknown" rather than throwing.
+    let reachable: Set<string> | null = null;
+    try {
+      const mine = await this.list<Server>("client", "");
+      reachable = new Set(mine.flatMap((m) => [m.identifier, m.uuid].filter((x): x is string => !!x)));
+    } catch {
+      /* no client key, or it can't list — annotate as unknown */
+    }
+    return summarizeServers(servers, reachable);
   }
 
   /** Full detail for one server, by numeric APPLICATION id. Redacted — the
@@ -825,7 +867,9 @@ function buildTools(target: Target): ConnectorTool[] {
       name: "list_servers",
       description:
         `List Pelican servers on ${target.name}. Prints all three identities per server: the numeric id (for server_details), and the ` +
-        `short identifier + uuid (for every power/startup/schedule tool, which use the Client API).`,
+        `short identifier + uuid (for every power/startup/schedule tool, which use the Client API). Each server is also marked ` +
+        `client=YES/NO — the Client API only sees servers its key's user owns or is a subuser on, so a client=NO server will 404 ` +
+        `on power, startup, resources and schedules even though it is listed here.`,
       tier: "read",
       inputSchema: z.object({}),
       run: run((p) => p.listServers()),

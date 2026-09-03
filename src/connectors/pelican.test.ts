@@ -170,6 +170,30 @@ describe("summarizers", () => {
     expect(out).toContain("uuid=u-1");
   });
 
+  it("summarizeServers marks which servers the CLIENT key can act on", () => {
+    const servers = [
+      { id: 1, uuid: "u-1", identifier: "aaa", name: "mine", user: 3 },
+      { id: 2, uuid: "u-2", identifier: "bbb", name: "theirs", user: 1 },
+    ];
+    const out = summarizeServers(servers, new Set(["aaa"]));
+    expect(out).toContain("mine identifier=aaa uuid=u-1 node=? egg=?  client=YES");
+    expect(out).toContain("client=NO (owned by user 1)");
+    expect(out).not.toContain("NOTE: client=NO on every server"); // at least one reachable
+  });
+
+  it("summarizeServers warns loudly when the client key reaches NOTHING", () => {
+    const out = summarizeServers([{ id: 2, uuid: "u-2", identifier: "bbb", name: "theirs", user: 1 }], new Set());
+    expect(out).toContain("client=NO (owned by user 1)");
+    expect(out).toContain("NOTE: client=NO on every server");
+    expect(out).toContain("will 404");
+  });
+
+  it("summarizeServers says 'unknown' rather than falsely claiming no access", () => {
+    const out = summarizeServers([{ id: 2, identifier: "bbb", name: "x", user: 1 }], null);
+    expect(out).toContain("client=unknown");
+    expect(out).not.toContain("client=NO");
+  });
+
   it("summarizeSchedules renders cron and calls out a task-less schedule", () => {
     const withTask = summarizeSchedules([
       {
@@ -252,6 +276,44 @@ describe("list_users", () => {
     const res = await tool("list_users").run({}, ctx());
     expect(res.text).toContain("[7] skeleton-key");
     expect(res.text).toContain("[1] jake <j@x>  ADMIN");
+  });
+});
+
+describe("client-API access visibility", () => {
+  it("list_servers cross-references the client key and annotates each server", async () => {
+    mockFetch([
+      { match: (u) => u.includes("/api/application/servers"), reply: { json: list([{ id: 1, identifier: "aaa", uuid: "u-1", name: "mine", user: 3 }, { id: 2, identifier: "bbb", uuid: "u-2", name: "theirs", user: 1 }]) } },
+      { match: (u) => u.includes("/api/client"), reply: { json: list([{ id: 1, identifier: "aaa", uuid: "u-1" }]) } },
+    ]);
+    const res = await tool("list_servers").run({}, ctx());
+    expect(res.text).toContain("mine identifier=aaa");
+    expect(res.text).toContain("client=YES");
+    expect(res.text).toContain("client=NO (owned by user 1)");
+  });
+
+  it("degrades to client=unknown when the client key can't list, without failing the read", async () => {
+    mockFetch([
+      { match: (u) => u.includes("/api/application/servers"), reply: { json: list([{ id: 1, identifier: "aaa", name: "x", user: 1 }]) } },
+      { match: (u) => u.includes("/api/client"), reply: { status: 401, json: { errors: [{ detail: "Unauthenticated." }] } } },
+    ]);
+    const res = await tool("list_servers").run({}, ctx());
+    expect(res.isError).toBeFalsy(); // application inventory still returned
+    expect(res.text).toContain("client=unknown");
+  });
+
+  it("a client 404 on a server path explains the ownership requirement", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/client/servers/"), reply: { status: 404, json: { errors: [{ detail: "The requested resource does not exist on this server." }] } } }]);
+    const res = await tool("server_resources").run({ server: "f83cc148" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("only sees servers its key's user OWNS or is a subuser on");
+    expect(res.text).toContain("subuser");
+  });
+
+  it("does NOT add the ownership hint to an application-side 404", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/application/servers/"), reply: { status: 404, json: { errors: [{ detail: "Not found" }] } } }]);
+    const res = await tool("server_details").run({ id: 999 }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).not.toContain("subuser");
   });
 });
 
