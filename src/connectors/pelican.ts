@@ -185,6 +185,13 @@ interface Allocation {
   assigned?: boolean;
   [k: string]: unknown;
 }
+interface PanelUser {
+  id: number;
+  username?: string;
+  email?: string;
+  root_admin?: boolean;
+  [k: string]: unknown;
+}
 interface Server {
   id: number;
   uuid?: string;
@@ -249,6 +256,15 @@ export function summarizeAllocations(allocs: Allocation[]): string {
   const parts = [`FREE (${free.length}):`, ...free.map(line)];
   if (used.length) parts.push(`ASSIGNED (${used.length}):`, ...used.map(line));
   return parts.join("\n");
+}
+
+/** Minimal user view — enough to identify the dedicated panel user whose id
+ *  becomes the target's `ownerUserId`, and nothing more. */
+export function summarizeUsers(users: PanelUser[]): string {
+  if (!users.length) return "No users.";
+  return users
+    .map((u) => `- [${u.id}] ${u.username ?? "(unnamed)"} <${u.email ?? "?"}>${u.root_admin ? "  ADMIN" : ""}`)
+    .join("\n");
 }
 
 export function summarizeServers(servers: Server[]): string {
@@ -398,6 +414,10 @@ class Pelican {
 
   async listAllocations(nodeId: number): Promise<string> {
     return summarizeAllocations(await this.list<Allocation>("application", `/nodes/${nodeId}/allocations`));
+  }
+
+  async listUsers(): Promise<string> {
+    return summarizeUsers(await this.list<PanelUser>("application", "/users"));
   }
 
   async listServers(): Promise<string> {
@@ -791,6 +811,15 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "read",
       inputSchema: z.object({ node: z.number().int().positive().describe("Node id from list_nodes.") }),
       run: run((p, i) => p.listAllocations(i.node)),
+    },
+    {
+      name: "list_users",
+      description:
+        `List Pelican panel users on ${target.name} (id, username, email, admin flag). Use this to find the id of the dedicated ` +
+        `non-admin user that owns Claude's servers — that id is the target's 'ownerUserId' option, which create_server requires.`,
+      tier: "read",
+      inputSchema: z.object({}),
+      run: run((p) => p.listUsers()),
     },
     {
       name: "list_servers",

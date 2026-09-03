@@ -132,7 +132,7 @@ the data volume.
 | **proxmox** | Proxmox VE REST API (token auth) | node/VM/LXC status, task logs, resource usage | start/stop/reboot VM & LXC, snapshot |
 | **home-assistant** | HA REST + WebSocket (long-lived token) | states, error log, logbook, config check, automation traces | call services, reload configs, restart HA |
 | **unifi** | UniFi OS API (cookie/CSRF) | clients, devices, networks, settings (secret-scrubbed), WAN status, firewall/port-forward rules, events | toggle gateway feature (DPI/UPnP/hardware offload/GeoIP), per-network IPv6, remote logging (syslog + netconsole), WAN port-forward CRUD (create/update/delete, guardrailed), force-provision |
-| **pelican** | Pelican Panel REST — Application API (`papp_` key) + Client API (`pacc_` key) | eggs, nodes, allocations (free IP:ports), servers, server details (env vars redacted), live resources, schedules | create server, power (start/stop/restart/kill), startup variables, schedule CRUD ("server hours"), assign allocation |
+| **pelican** | Pelican Panel REST — Application API (`papp_` key) + Client API (`pacc_` key) | eggs, nodes, allocations (free IP:ports), servers, users, server details (env vars redacted), live resources, schedules | create server, power (start/stop/restart/kill), startup variables, schedule CRUD ("server hours"), assign allocation |
 | **synology** | DSM Web API (multi-host) | system health, storage/SMART, package status, shares | packages/shares (careful tier, later) |
 | **pihole** | Pi-hole API | query stats, blocklist status, top domains, DNS logs | enable/disable blocking, flush cache |
 | **network** | local exec inside container | ping, traceroute, DNS lookup, port check, mtr | — (diagnostics only) |

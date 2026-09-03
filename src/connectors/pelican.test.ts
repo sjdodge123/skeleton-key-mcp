@@ -246,6 +246,15 @@ describe("reads use the right API half and follow pagination", () => {
   });
 });
 
+describe("list_users", () => {
+  it("surfaces the ids needed to pick ownerUserId, flagging admins", async () => {
+    mockFetch([{ match: (u) => u.includes("/api/application/users"), reply: { json: list([{ id: 1, username: "jake", email: "j@x", root_admin: true }, { id: 7, username: "skeleton-key", email: "sk@x" }]) } }]);
+    const res = await tool("list_users").run({}, ctx());
+    expect(res.text).toContain("[7] skeleton-key");
+    expect(res.text).toContain("[1] jake <j@x>  ADMIN");
+  });
+});
+
 describe("create_server", () => {
   const eggs = list([{ id: 5, name: "Valheim" }]);
   const nodes = list([{ id: 1, name: "n1" }]);
@@ -470,7 +479,7 @@ describe("connector wiring", () => {
     const tools = pelicanConnector.buildTools(target({ ownerUserId: 7 }));
     const reads = tools.filter((t) => t.tier === "read").map((t) => t.name).sort();
     const execs = tools.filter((t) => t.tier === "execute").map((t) => t.name).sort();
-    expect(reads).toEqual(["list_allocations", "list_eggs", "list_nodes", "list_schedules", "list_servers", "server_details", "server_resources"]);
+    expect(reads).toEqual(["list_allocations", "list_eggs", "list_nodes", "list_schedules", "list_servers", "list_users", "server_details", "server_resources"]);
     expect(execs).toEqual(["assign_allocation", "create_schedule", "create_server", "delete_schedule", "power_action", "update_schedule", "update_startup_variables"]);
     // Every execute tool must carry confirm text — the approval gate keys off it.
     expect(tools.filter((t) => t.tier === "execute").every((t) => typeof t.confirm === "function")).toBe(true);
