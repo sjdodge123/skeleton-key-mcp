@@ -1050,6 +1050,12 @@ function requireProtectedHosts(ctx: ToolContext): ProtectedHost[] {
 
 /** Shared bits of the three port-forward tool schemas. */
 const PROTO = z.enum(["tcp", "udp", "tcp_udp"]);
+/** Which WAN a rule listens on. `all` and `both` are BOTH live values — a
+ *  gateway with one WAN stores rules as 'wan' or 'all', and the UI's "Both"
+ *  writes 'both'. Enumerated from rules observed on a real Cloud Gateway Ultra;
+ *  an unknown value on an existing rule survives an update untouched, since
+ *  updatePortForward only writes the fields the caller passed. */
+const WAN_INTERFACE = z.enum(["wan", "wan2", "both", "all"]);
 /** Soft guidance repeated on every write tool: once the `pelican` connector
  *  lands, a game server's destination should come from `pelican.list_allocations`
  *  rather than being typed by hand. Guidance only — there is no runtime check
@@ -1185,7 +1191,7 @@ function buildTools(target: Target): ConnectorTool[] {
         destination: z.string().describe("Destination LAN IPv4, e.g. '192.168.0.48'. Must be RFC1918."),
         destinationPort: z.string().optional().describe("Destination port or range. Defaults to wanPort."),
         source: z.string().optional().describe("Source restriction — 'any' (default) or a CIDR."),
-        wanInterface: z.enum(["wan", "wan2", "both"]).optional().describe("Which WAN the rule listens on. Default 'wan'."),
+        wanInterface: WAN_INTERFACE.optional().describe("Which WAN the rule listens on. Default 'wan'."),
         enabled: z.boolean().optional().describe("Create the rule disabled with false. Default true."),
         log: z.boolean().optional().describe("Log matches on the gateway. Default false."),
       }),
@@ -1219,7 +1225,7 @@ function buildTools(target: Target): ConnectorTool[] {
         destination: z.string().optional().describe("New destination LAN IPv4 (RFC1918)."),
         destinationPort: z.string().optional().describe("New destination port or range."),
         source: z.string().optional().describe("Source restriction — 'any' or a CIDR."),
-        wanInterface: z.enum(["wan", "wan2", "both"]).optional().describe("Which WAN the rule listens on."),
+        wanInterface: WAN_INTERFACE.optional().describe("Which WAN the rule listens on."),
         enabled: z.boolean().optional().describe("Enable/disable the rule without deleting it."),
         log: z.boolean().optional().describe("Log matches on the gateway."),
       }),

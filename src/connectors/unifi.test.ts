@@ -1256,6 +1256,27 @@ describe("create_port_forward", () => {
     expect(res.text).toContain("api.err.InvalidPayload");
   });
 
+  it("accepts every wanInterface a real gateway stores, including 'all'", async () => {
+    // Observed live on a Cloud Gateway Ultra: rules carry 'wan', 'all' and
+    // 'both'. An enum missing one of these makes those rules unmanageable.
+    const schema = tool("create_port_forward").inputSchema;
+    for (const wanInterface of ["wan", "wan2", "both", "all"]) {
+      expect(
+        schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.0.48", wanInterface }).success,
+      ).toBe(true);
+    }
+    expect(
+      schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.0.48", wanInterface: "wan9" }).success,
+    ).toBe(false);
+
+    const { calls } = mockPf();
+    await tool("create_port_forward").run(
+      { name: "steamish", proto: "udp", wanPort: "27016", destination: "192.168.0.48", wanInterface: "all" },
+      pfCtx(),
+    );
+    expect(JSON.parse(writes(calls).find((c) => c.init.method === "POST")!.init.body).pfwd_interface).toBe("all");
+  });
+
   it("confirm text matches the plan's canonical format exactly", () => {
     const c = tool("create_port_forward").confirm!;
     expect(c({ name: "valheim", proto: "udp", wanPort: "2456-2458", destination: "192.168.0.48", destinationPort: "2456" }, target())).toBe(
