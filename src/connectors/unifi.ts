@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
+import type { Connector, ConnectorTool, Credential, ProtectedHost, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 
 /**
@@ -210,6 +210,163 @@ export function summarizeNetworks(ns: UniFiNetwork[]): string {
     .join("\n");
 }
 
+/** One `/rest/portforward` document. Each forwarding rule is its own object
+ *  (unlike the settings groups), so a write touches only that rule. `dst_port`
+ *  is the WAN-side port/range, `fwd`/`fwd_port` the LAN destination. */
+interface UniFiPortForward {
+  _id: string;
+  name?: string;
+  enabled?: boolean;
+  /** 'wan' | 'wan2' | 'both' — which WAN the rule listens on. */
+  pfwd_interface?: string;
+  /** Destination (LAN) IPv4. */
+  fwd?: string;
+  /** Destination port or range, e.g. '2456' or '2456-2458'. */
+  fwd_port?: string;
+  /** WAN-side port or range. */
+  dst_port?: string;
+  /** Source restriction — 'any' or a CIDR. */
+  src?: string;
+  /** 'tcp' | 'udp' | 'tcp_udp'. */
+  proto?: string;
+  log?: boolean;
+  [k: string]: unknown;
+}
+
+/** Uppercase protocol for human output ('tcp_udp' → 'TCP/UDP'). */
+export function protoLabel(proto?: string): string {
+  return (proto ?? "tcp_udp") === "tcp_udp" ? "TCP/UDP" : (proto ?? "?").toUpperCase();
+}
+
+/** The one-line identity of a port-forward rule, shared by the read summary and
+ *  every execute confirmation so an approval prompt reads exactly like the rule
+ *  it will touch. Format is fixed: `WAN UDP 2456-2458 → 192.168.0.48:2456
+ *  ('valheim')`. */
+export function describePortForward(r: Partial<UniFiPortForward>): string {
+  const wan = r.dst_port ?? "?";
+  const dst = `${r.fwd ?? "?"}:${r.fwd_port ?? wan}`;
+  return `WAN ${protoLabel(r.proto)} ${wan} → ${dst} ('${r.name ?? "(unnamed)"}')`;
+}
+
+/** Whitelisted fields only, matching summarizeNetworks — a portforward doc
+ *  carries no key material today, but the whitelist keeps that true if the
+ *  schema grows. */
+export function summarizePortForwards(rs: UniFiPortForward[]): string {
+  if (!rs.length) return "No port-forward rules.";
+  return rs
+    .map((r) => {
+      const off = r.enabled === false ? " (disabled)" : "";
+      const src = r.src && r.src !== "any" ? ` src=${r.src}` : "";
+      const iface = r.pfwd_interface && r.pfwd_interface !== "wan" ? ` iface=${r.pfwd_interface}` : "";
+      return `- ${describePortForward(r)} [${r._id}]${off}${src}${iface}`;
+    })
+    .join("\n");
+}
+
+/** Ports that must never appear on either side of a forward, whatever the host —
+ *  the remote-admin and control-plane surfaces. A DENYLIST, so it fails open on
+ *  a port nobody listed; it is defense-in-depth behind the RFC1918 check, the
+ *  protected-host check and the approval gate, not a sole barrier. Adding an
+ *  entry is cheap — do it rather than relying on the confirm prompt being read. */
+const DENIED_PORTS: Record<number, string> = {
+  22: "SSH",
+  23: "telnet",
+  53: "DNS",
+  443: "HTTPS admin / reverse proxy",
+  445: "SMB",
+  3389: "RDP",
+  5000: "Synology DSM (http)",
+  5001: "Synology DSM (https)",
+  8006: "Proxmox VE",
+  8080: "HTTP admin",
+  8443: "HTTPS admin",
+  8787: "Skeleton Key",
+  9000: "Portainer",
+  9443: "Portainer (https)",
+};
+
+/** Parse a UniFi port spec — a single port ('2456') or an inclusive range
+ *  ('2456-2458') — into [lo, hi]. Comma lists are refused rather than partially
+ *  understood: a spec we can't fully model is a spec we can't safely screen.
+ *  Exported for testing. */
+export function parsePortSpec(spec: string): { lo: number; hi: number } {
+  const m = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(String(spec ?? "").trim());
+  if (!m) throw new Error(`Invalid port spec '${spec}' — expected '2456' or a range '2456-2458'.`);
+  const lo = Number(m[1]);
+  const hi = m[2] === undefined ? lo : Number(m[2]);
+  if (lo < 1 || hi > 65535 || lo > hi) throw new Error(`Invalid port spec '${spec}' — ports must be 1..65535 and low..high.`);
+  return { lo, hi };
+}
+
+/** Do two protocol selectors overlap? 'tcp_udp' covers both, so it collides
+ *  with everything. */
+export function protoOverlaps(a: string, b: string): boolean {
+  return a === b || a === "tcp_udp" || b === "tcp_udp";
+}
+
+/** The shape a guardrail screens — the subset of a portforward doc that decides
+ *  whether the rule is safe, whether it came from a create or a merged update. */
+export interface ForwardIntent {
+  name?: string;
+  proto?: string;
+  /** WAN-side port or range. */
+  dst_port?: string;
+  /** Destination (LAN) IPv4. */
+  fwd?: string;
+  /** Destination port or range. */
+  fwd_port?: string;
+}
+
+/**
+ * HARD guardrail — throws before any network call, so a refused forward never
+ * reaches the controller. Three independent checks:
+ *
+ *  1. the destination must be an RFC1918 IPv4 (same rule as `set_remote_logging`)
+ *     — a forward is an inbound hole from the internet, so it may only ever land
+ *     on the LAN, never on a routable address this box doesn't own;
+ *  2. the destination must not be a control-plane host (`protectedHosts`) —
+ *     opening the gateway, Portainer, Vaultwarden or Skeleton Key itself to the
+ *     WAN would hand an attacker the keys to the city in one rule;
+ *  3. neither the WAN-side nor the destination port range may touch a denied
+ *     admin port, regardless of host.
+ *
+ * `protected` is REQUIRED (not optional) so a caller that has no protected-host
+ * list cannot reach this function at all — the fail-closed decision lives at the
+ * call site, where it can produce a clear error. Exported for testing.
+ */
+export function assertForwardAllowed(rule: ForwardIntent, protectedList: ProtectedHost[]): void {
+  const dest = (rule.fwd ?? "").trim();
+  if (!dest) throw new Error("A port-forward needs a destination IP ('destination').");
+  if (!isPrivateIPv4(dest)) {
+    throw new Error(
+      `Refusing to forward to '${dest}' — the destination must be a private LAN IPv4 (RFC1918, e.g. 192.168.0.48). ` +
+        `A port-forward is an inbound hole from the internet; it may only ever land on the LAN.`,
+    );
+  }
+  const hit = protectedList.find((p) => p.host.toLowerCase() === dest.toLowerCase());
+  if (hit) {
+    throw new Error(
+      `Refusing to forward to '${dest}' — that host is ${hit.why}. Exposing Skeleton Key's own control plane to the WAN is never a supported change.`,
+    );
+  }
+  const wan = parsePortSpec(rule.dst_port ?? "");
+  const lan = parsePortSpec(rule.fwd_port ?? rule.dst_port ?? "");
+  for (const [side, range] of [
+    ["WAN", wan],
+    ["destination", lan],
+  ] as const) {
+    for (const [portStr, label] of Object.entries(DENIED_PORTS)) {
+      const port = Number(portStr);
+      if (port >= range.lo && port <= range.hi) {
+        throw new Error(
+          `Refusing to forward ${side} port ${port} (${label}) — it is on the infrastructure deny-list, whatever the host. ` +
+            `Requested ${side} range ${range.lo}-${range.hi}.`,
+        );
+      }
+    }
+  }
+}
+
 /** UniFi client bound to one target — resolves auth + API prefix lazily, once. */
 class UniFi {
   private cookie: string | null = null;
@@ -350,6 +507,14 @@ class UniFi {
   }
   async listNetworks(): Promise<string> {
     return summarizeNetworks(await this.getData<UniFiNetwork>("/rest/networkconf"));
+  }
+
+  /** List the gateway's port-forward rules (`/rest/portforward`). Redacted on
+   *  the way out for consistency with the rest of the connector, even though a
+   *  portforward doc holds no secrets. */
+  async listPortForwards(): Promise<string> {
+    const rules = await this.getData<UniFiPortForward>("/rest/portforward");
+    return summarizePortForwards(rules.map((r) => redactSecrets(r) as UniFiPortForward));
   }
 
   /** Read the site/gateway settings groups (`/rest/setting`) — each object has a
@@ -598,6 +763,189 @@ class UniFi {
     return `UniFi remote logging CONFIGURED on ${this.target.name} (${targets}) — persisted to the gateway; confirm the collector is receiving (delivery isn't verified by this write). Changed ${changed}. Revert with enabled=false.`;
   }
 
+  /** Resolve a rule by immutable `_id` or exact name. Refuses an ambiguous name
+   *  rather than guessing which of two same-named rules to touch (same contract
+   *  as forceProvision's device lookup). */
+  private async findPortForward(ref: string, rules: UniFiPortForward[]): Promise<UniFiPortForward> {
+    const byId = rules.find((r) => r._id === ref);
+    if (byId) return byId;
+    const q = ref.trim().toLowerCase();
+    const byName = rules.filter((r) => (r.name ?? "").toLowerCase() === q);
+    if (!byName.length) throw new Error(`No port-forward rule named or id'd '${ref}'. Use list_port_forwards to see them.`);
+    if (byName.length > 1) {
+      throw new Error(`'${ref}' matches ${byName.length} rules (${byName.map((r) => r._id).join(", ")}); pass the rule's id instead.`);
+    }
+    return byName[0]!;
+  }
+
+  /** The reminder every write carries: a `/rest/portforward` write only updates
+   *  the controller DB — the gateway keeps running its previously-generated
+   *  ruleset until it provisions, so the forward is NOT live yet. */
+  private static readonly PROVISION_NOTE =
+    "This updated the controller DB only — the gateway will not actually pass this traffic until it re-provisions. Run force_provision (then re-test from outside the LAN).";
+
+  /** Create one port-forward rule (`POST /rest/portforward`). Guardrails run
+   *  BEFORE the network call. Refuses a duplicate name or a rule that would
+   *  shadow an existing enabled rule on the same WAN port + protocol — an
+   *  overlapping forward silently wins or loses depending on rule order, which
+   *  is exactly the kind of thing nobody notices until a service breaks. */
+  async createPortForward(
+    input: {
+      name: string;
+      proto: string;
+      wanPort: string;
+      destination: string;
+      destinationPort?: string;
+      source?: string;
+      wanInterface?: string;
+      enabled?: boolean;
+      log?: boolean;
+    },
+    protectedList: ProtectedHost[],
+  ): Promise<string> {
+    const fwdPort = (input.destinationPort ?? input.wanPort).trim();
+    const intent: ForwardIntent = {
+      name: input.name,
+      proto: input.proto,
+      dst_port: input.wanPort.trim(),
+      fwd: input.destination.trim(),
+      fwd_port: fwdPort,
+    };
+    assertForwardAllowed(intent, protectedList);
+
+    const existing = await this.getData<UniFiPortForward>("/rest/portforward");
+    if (existing.some((r) => (r.name ?? "").toLowerCase() === input.name.trim().toLowerCase())) {
+      throw new Error(`A port-forward named '${input.name}' already exists — use update_port_forward, or pick another name.`);
+    }
+    const want = parsePortSpec(intent.dst_port!);
+    const clash = existing.find((r) => {
+      if (r.enabled === false) return false;
+      if (!protoOverlaps(r.proto ?? "tcp_udp", input.proto)) return false;
+      try {
+        const have = parsePortSpec(r.dst_port ?? "");
+        return want.lo <= have.hi && have.lo <= want.hi;
+      } catch {
+        return false; // an existing rule we can't parse can't be proven to clash
+      }
+    });
+    if (clash) {
+      throw new Error(
+        `WAN ${protoLabel(input.proto)} ${intent.dst_port} overlaps the existing enabled rule ${describePortForward(clash)} [${clash._id}]. ` +
+          `Delete or update that rule first — two rules on the same WAN port shadow each other.`,
+      );
+    }
+
+    // Mirror the field set the UniFi UI itself POSTs, so the controller stores a
+    // rule indistinguishable from a hand-made one (a doc missing
+    // destination_ip/destination_ips renders oddly in the UI).
+    const body: Record<string, unknown> = {
+      name: input.name.trim(),
+      enabled: input.enabled ?? true,
+      pfwd_interface: input.wanInterface ?? "wan",
+      fwd: intent.fwd,
+      fwd_port: fwdPort,
+      dst_port: intent.dst_port,
+      proto: input.proto,
+      src: input.source ?? "any",
+      log: input.log ?? false,
+      destination_ip: "any",
+      destination_ips: [],
+      src_limiting_enabled: false,
+    };
+    const path = "/rest/portforward";
+    const res = await this.api(path, { method: "POST", body });
+    this.ensureOk(res, path);
+    const created = ((res.json as { data?: UniFiPortForward[] })?.data ?? [])[0];
+    const id = created?._id ?? "(id not returned)";
+    return (
+      `Created UniFi port-forward ${describePortForward(redactSecrets(created ?? body) as UniFiPortForward)} [${id}] on ${this.target.name}. ` +
+      `${UniFi.PROVISION_NOTE} Revert with delete_port_forward.`
+    );
+  }
+
+  /** Update one rule (`PUT /rest/portforward/{_id}`) by reading the existing
+   *  document, merging ONLY the supplied fields, and writing it back — so
+   *  fields this tool doesn't model (src_limiting_enabled, destination_ips, …)
+   *  survive untouched. Guardrails run on the MERGED result, not on the patch,
+   *  so you can't slip past them by changing one half of a rule at a time.
+   *
+   *  No concurrency-abort / post-write-verify dance here (unlike
+   *  setGatewayFeature): each rule is its own document, so a sibling edit to a
+   *  different rule can't be clobbered by this write. */
+  async updatePortForward(
+    input: {
+      rule: string;
+      name?: string;
+      proto?: string;
+      wanPort?: string;
+      destination?: string;
+      destinationPort?: string;
+      source?: string;
+      wanInterface?: string;
+      enabled?: boolean;
+      log?: boolean;
+    },
+    protectedList: ProtectedHost[],
+  ): Promise<string> {
+    const rules = await this.getData<UniFiPortForward>("/rest/portforward");
+    const current = await this.findPortForward(input.rule, rules);
+
+    const patch: Record<string, unknown> = {};
+    if (input.name !== undefined) patch.name = input.name.trim();
+    if (input.proto !== undefined) patch.proto = input.proto;
+    if (input.wanPort !== undefined) patch.dst_port = input.wanPort.trim();
+    if (input.destination !== undefined) patch.fwd = input.destination.trim();
+    if (input.destinationPort !== undefined) patch.fwd_port = input.destinationPort.trim();
+    if (input.source !== undefined) patch.src = input.source;
+    if (input.wanInterface !== undefined) patch.pfwd_interface = input.wanInterface;
+    if (input.enabled !== undefined) patch.enabled = input.enabled;
+    if (input.log !== undefined) patch.log = input.log;
+    if (!Object.keys(patch).length) throw new Error("update_port_forward needs at least one field to change.");
+
+    const updated: UniFiPortForward = { ...current, ...patch };
+    assertForwardAllowed(updated, protectedList);
+
+    const path = `/rest/portforward/${current._id}`;
+    const res = await this.api(path, { method: "PUT", body: updated });
+    this.ensureOk(res, path);
+
+    const before = describePortForward(redactSecrets(current) as UniFiPortForward);
+    const after = describePortForward(redactSecrets(updated) as UniFiPortForward);
+    const fields = Object.keys(patch)
+      .map((f) => `${f}: ${JSON.stringify(current[f])} → ${JSON.stringify(patch[f])}`)
+      .join(", ");
+    return (
+      `Updated UniFi port-forward [${current._id}] on ${this.target.name}: ${before} → ${after}. Changed ${fields}. ` +
+      `${UniFi.PROVISION_NOTE} Revert by calling update_port_forward with the prior values above.`
+    );
+  }
+
+  /** Delete one rule (`DELETE /rest/portforward/{_id}`). `expectWanPort` and
+   *  `expectDestination` are a required echo of what the caller believes it is
+   *  deleting, verified against the resolved rule before the call: it makes the
+   *  approval prompt legible without a lookup AND turns a stale/ambiguous ref
+   *  into a refusal instead of a deleted-the-wrong-rule incident. */
+  async deletePortForward(input: { rule: string; expectWanPort: string; expectDestination: string }): Promise<string> {
+    const rules = await this.getData<UniFiPortForward>("/rest/portforward");
+    const current = await this.findPortForward(input.rule, rules);
+    const gotWan = (current.dst_port ?? "").trim();
+    const gotDest = (current.fwd ?? "").trim();
+    if (gotWan !== input.expectWanPort.trim() || gotDest !== input.expectDestination.trim()) {
+      throw new Error(
+        `Refusing to delete '${input.rule}' — it is ${describePortForward(current)} [${current._id}], ` +
+          `but you said WAN ${input.expectWanPort} → ${input.expectDestination}. Re-run list_port_forwards and confirm which rule you mean.`,
+      );
+    }
+    const desc = describePortForward(redactSecrets(current) as UniFiPortForward);
+    const path = `/rest/portforward/${current._id}`;
+    const res = await this.api(path, { method: "DELETE" });
+    this.ensureOk(res, path);
+    return (
+      `Deleted UniFi port-forward ${desc} [${current._id}] on ${this.target.name}. ${UniFi.PROVISION_NOTE} ` +
+      `Recreate with create_port_forward if this was wrong.`
+    );
+  }
+
   /** Force a device to re-provision (`POST /cmd/devmgr {cmd:'force-provision'}`).
    *  A `/rest/setting` PUT only updates the controller DB; the device keeps
    *  running its previously-generated config until it provisions — so a settings
@@ -677,15 +1025,43 @@ async function withClient<T>(ctx: ToolContext, fn: (u: UniFi) => Promise<T>): Pr
 
 const ok = (text: string): ToolResult => ({ text });
 
-function run(fn: (u: UniFi, input: any) => Promise<string>) {
+function run(fn: (u: UniFi, input: any, ctx: ToolContext) => Promise<string>) {
   return async (input: unknown, ctx: ToolContext): Promise<ToolResult> => {
     try {
-      return ok(await withClient(ctx, (u) => fn(u, input)));
+      return ok(await withClient(ctx, (u) => fn(u, input, ctx)));
     } catch (e) {
       return { text: `UniFi error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
     }
   };
 }
+
+/** Fail CLOSED on a context with no protected-host list. Every guardrailed write
+ *  goes through here, so a call site that forgot to wire `protectedHosts` gets a
+ *  refusal — never a silently empty deny-list. */
+function requireProtectedHosts(ctx: ToolContext): ProtectedHost[] {
+  const list = ctx.protectedHosts?.();
+  if (!list) {
+    throw new Error(
+      "Refusing to change port forwarding: this context supplies no protected-host list, so the control-plane deny-list can't be enforced.",
+    );
+  }
+  return list;
+}
+
+/** Shared bits of the three port-forward tool schemas. */
+const PROTO = z.enum(["tcp", "udp", "tcp_udp"]);
+/** Soft guidance repeated on every write tool: once the `pelican` connector
+ *  lands, a game server's destination should come from `pelican.list_allocations`
+ *  rather than being typed by hand. Guidance only — there is no runtime check
+ *  tying a forward to an allocation (that connector does not exist yet). */
+const ALLOCATION_HINT =
+  "Prefer a destination IP:port taken from `pelican.list_allocations` (once that connector exists) rather than one typed by hand.";
+/** The guardrails, stated in every write tool's description so a caller learns
+ *  them from tools/list instead of from a refusal. */
+const GUARDRAIL_HINT =
+  "Hard guardrails, enforced before the request is sent: the destination must be a private LAN IPv4, it may not be a Skeleton Key control-plane host " +
+  "(the gateway, Portainer/the container host, Vaultwarden, Skeleton Key itself), and neither the WAN nor the destination port range may touch an " +
+  "admin port (22, 443, 8006, 8787, 9000, ...).";
 
 function buildTools(target: Target): ConnectorTool[] {
   return [
@@ -709,6 +1085,16 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "read",
       inputSchema: z.object({}),
       run: run((u) => u.listNetworks()),
+    },
+    {
+      name: "list_port_forwards",
+      description:
+        `List the WAN port-forward rules on ${target.name} — protocol, WAN port(s), LAN destination, rule name and id, ` +
+        `plus whether each is enabled. Use this before creating or changing a forward: the ids it returns are what ` +
+        `update_port_forward / delete_port_forward take.`,
+      tier: "read",
+      inputSchema: z.object({}),
+      run: run((u) => u.listPortForwards()),
     },
     {
       name: "get_settings",
@@ -783,6 +1169,92 @@ function buildTools(target: Target): ConnectorTool[] {
           : `Disable UniFi remote logging (clear syslog + netconsole targets) on ${t.name} — rewrites the rsyslogd settings group`;
       },
       run: run((u, i) => u.setRemoteLogging(i)),
+    },
+    {
+      name: "create_port_forward",
+      description:
+        `Open a WAN port on ${target.name} and forward it to a LAN host — e.g. a game server. ` +
+        `${GUARDRAIL_HINT} ${ALLOCATION_HINT} ` +
+        `Refuses a duplicate rule name or a rule that would shadow an existing enabled rule on the same WAN port + protocol. ` +
+        `The rule is written to the controller DB; run force_provision afterwards or the gateway won't pass the traffic.`,
+      tier: "execute",
+      inputSchema: z.object({
+        name: z.string().min(1).describe("Rule name, e.g. 'valheim'. Must be unique."),
+        proto: PROTO.describe("tcp | udp | tcp_udp"),
+        wanPort: z.string().describe("WAN-side port or range, e.g. '2456' or '2456-2458'."),
+        destination: z.string().describe("Destination LAN IPv4, e.g. '192.168.0.48'. Must be RFC1918."),
+        destinationPort: z.string().optional().describe("Destination port or range. Defaults to wanPort."),
+        source: z.string().optional().describe("Source restriction — 'any' (default) or a CIDR."),
+        wanInterface: z.enum(["wan", "wan2", "both"]).optional().describe("Which WAN the rule listens on. Default 'wan'."),
+        enabled: z.boolean().optional().describe("Create the rule disabled with false. Default true."),
+        log: z.boolean().optional().describe("Log matches on the gateway. Default false."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { name: string; proto: string; wanPort: string; destination: string; destinationPort?: string };
+        const desc = describePortForward({
+          name: i.name,
+          proto: i.proto,
+          dst_port: i.wanPort,
+          fwd: i.destination,
+          fwd_port: i.destinationPort ?? i.wanPort,
+        });
+        return `Open ${desc} on ${t.name}`;
+      },
+      run: run((u, i, ctx) => u.createPortForward(i, requireProtectedHosts(ctx))),
+    },
+    {
+      name: "update_port_forward",
+      description:
+        `Change an existing WAN port-forward on ${target.name} — retarget it, change ports/protocol, or enable/disable it. ` +
+        `Identify the rule by the id from list_port_forwards (or its exact name). Only the fields you pass change; the rest of ` +
+        `the rule is preserved by a server-side read-modify-write, and the result reports prior → new state so you can revert. ` +
+        `${GUARDRAIL_HINT} The guardrails are checked against the MERGED rule, so a partial change can't sidestep them. ` +
+        `${ALLOCATION_HINT} Run force_provision afterwards.`,
+      tier: "execute",
+      inputSchema: z.object({
+        rule: z.string().describe("Rule id from list_port_forwards, or its exact name."),
+        name: z.string().min(1).optional().describe("New rule name."),
+        proto: PROTO.optional().describe("tcp | udp | tcp_udp"),
+        wanPort: z.string().optional().describe("New WAN-side port or range."),
+        destination: z.string().optional().describe("New destination LAN IPv4 (RFC1918)."),
+        destinationPort: z.string().optional().describe("New destination port or range."),
+        source: z.string().optional().describe("Source restriction — 'any' or a CIDR."),
+        wanInterface: z.enum(["wan", "wan2", "both"]).optional().describe("Which WAN the rule listens on."),
+        enabled: z.boolean().optional().describe("Enable/disable the rule without deleting it."),
+        log: z.boolean().optional().describe("Log matches on the gateway."),
+      }),
+      confirm: (input, t) => {
+        const i = input as Record<string, unknown>;
+        // confirm() is synchronous and has no network access, so it can't read
+        // the rule's prior state (same limitation as set_gateway_feature) — it
+        // names the rule and every field being changed; the RESULT reports the
+        // full prior → new transition.
+        const changes = ["name", "proto", "wanPort", "destination", "destinationPort", "source", "wanInterface", "enabled", "log"]
+          .filter((k) => i[k] !== undefined)
+          .map((k) => `${k} → ${JSON.stringify(i[k])}`)
+          .join(", ");
+        return `Update UniFi port-forward '${String(i.rule)}' on ${t.name} (${changes || "no change"})`;
+      },
+      run: run((u, i, ctx) => u.updatePortForward(i, requireProtectedHosts(ctx))),
+    },
+    {
+      name: "delete_port_forward",
+      description:
+        `Remove a WAN port-forward rule from ${target.name}, closing that inbound hole. ` +
+        `Identify the rule by the id from list_port_forwards (or its exact name), and echo back its WAN port and destination — ` +
+        `both are verified against the live rule before anything is deleted, so a stale id or a renamed rule is refused rather ` +
+        `than deleting the wrong forward. Run force_provision afterwards or the gateway keeps passing the traffic.`,
+      tier: "execute",
+      inputSchema: z.object({
+        rule: z.string().describe("Rule id from list_port_forwards, or its exact name."),
+        expectWanPort: z.string().describe("The rule's current WAN port/range, exactly as list_port_forwards shows it."),
+        expectDestination: z.string().describe("The rule's current destination IP, exactly as list_port_forwards shows it."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { rule: string; expectWanPort: string; expectDestination: string };
+        return `Delete UniFi port-forward '${i.rule}' (WAN ${i.expectWanPort} → ${i.expectDestination}) on ${t.name} — closes that inbound hole`;
+      },
+      run: run((u, i) => u.deletePortForward(i)),
     },
     {
       name: "force_provision",
