@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture in one breath
 
-Connector-per-integration behind a single MCP tool registry. Each connector (implemented: `ssh`, `http`, `portainer`, `unifi`, `home-assistant`, `proxmox`; planned: `synology`, dedicated `pihole`/`network` — Pi-hole is reached today as an `ssh` target and the LAN via `network_scan`) exposes tools split into two tiers:
+Connector-per-integration behind a single MCP tool registry. Each connector (implemented: `ssh`, `http`, `portainer`, `unifi`, `home-assistant`, `proxmox`, `pelican`; planned: `synology`, dedicated `pihole`/`network` — Pi-hole is reached today as an `ssh` target and the LAN via `network_scan`) exposes tools split into two tiers:
 
 - **`read` tools** — logs, status, config inspection, diagnostics. Safe to run freely.
 - **`execute` tools** — anything state-changing. Must route through the approval gate and write an audit-log entry. Their confirmation text must name the exact action and target so the permission prompt is meaningful.
