@@ -5,6 +5,7 @@ import { portainerConnector } from "./portainer.js";
 import { unifiConnector } from "./unifi.js";
 import { homeAssistantConnector } from "./home-assistant.js";
 import { proxmoxConnector } from "./proxmox.js";
+import { pelicanConnector } from "./pelican.js";
 
 /**
  * Registry of available connector *types*. Adding support for a new service
@@ -55,3 +56,4 @@ registerConnector(homeAssistantConnector);
 // too — both resolve to the same connector.
 connectors.set("homeassistant", homeAssistantConnector);
 registerConnector(proxmoxConnector);
+registerConnector(pelicanConnector);
