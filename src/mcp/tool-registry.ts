@@ -1,6 +1,6 @@
 import type { z } from "zod";
 import type { AppState } from "../app.js";
-import type { Credential, Target, ToolResult, ToolTier } from "../connectors/types.js";
+import type { Credential, ProtectedHost, Target, ToolResult, ToolTier } from "../connectors/types.js";
 import { getConnector } from "../connectors/index.js";
 import { buildGlobalTools, type GlobalTool } from "./builtin-tools.js";
 
@@ -80,12 +80,66 @@ export function resolveTools(app: AppState): ResolvedTool[] {
             // Same in-memory, lazy path as getCredential — nothing is cached here.
             resolveCredential: (ref: string, opts?: { fresh?: boolean }) => app.credentialFor(ref, opts),
             fingerprint: (value: string) => app.fingerprint(value),
+            // Control-plane hosts no network change may point at (see
+            // ToolContext.protectedHosts). Recomputed per call so a target
+            // registered a moment ago is already protected.
+            protectedHosts: () => protectedHosts(app),
           }),
       });
     }
   }
 
   return resolved;
+}
+
+/**
+ * The hosts that make up Skeleton Key's own control plane, which a connector's
+ * network change (today: a UniFi port-forward) must never expose or redirect.
+ *
+ * Derived, never hardcoded, from three live sources so a host move is picked up
+ * on the next call:
+ *  - every registered target whose type fronts the control plane (`portainer`
+ *    manages the containers, `unifi` is the gateway itself) — on a typical
+ *    deployment the Portainer host is also the Docker host running Skeleton Key
+ *    and Vaultwarden, which is why one entry covers all three;
+ *  - Skeleton Key's own advertised origin (`SKELETON_KEY_PUBLIC_URL` /
+ *    boot-detected LAN URL), for the case where it does NOT share that host;
+ *  - the Vaultwarden server the bootstrap store is pointed at.
+ *
+ * Comparison is a literal host match, so a target registered by hostname is not
+ * matched by its IP (and vice-versa). That is a documented limitation, not a
+ * safety claim: the deny-list is defense-in-depth on top of the RFC1918 check
+ * and the approval gate, never the only thing standing between a caller and a
+ * bad forward.
+ */
+export function protectedHosts(app: AppState): ProtectedHost[] {
+  const out: ProtectedHost[] = [];
+  for (const t of app.registry.list()) {
+    if (t.type === "portainer") out.push({ host: t.host, why: `Portainer / container host (target '${t.name}')` });
+    else if (t.type === "unifi") out.push({ host: t.host, why: `the UniFi gateway itself (target '${t.name}')` });
+  }
+  const hostOf = (url: string | null | undefined): string | null => {
+    if (!url) return null;
+    try {
+      return new URL(url).hostname || null;
+    } catch {
+      return null;
+    }
+  };
+  const self = hostOf(app.publicUrl());
+  if (self) out.push({ host: self, why: "the Skeleton Key server itself" });
+  // Best-effort: the store throws while locked, and an execute tool can't run
+  // then anyway — so a miss here can never widen a live deny-list.
+  let vault: string | null = null;
+  try {
+    vault = hostOf(app.store.get().bwServerUrl);
+  } catch {
+    /* locked or unset — the registry entries above still apply */
+  }
+  if (vault) out.push({ host: vault, why: "Vaultwarden (the credential store)" });
+
+  const seen = new Set<string>();
+  return out.filter((p) => p.host && !seen.has(p.host.toLowerCase()) && seen.add(p.host.toLowerCase()));
 }
 
 /**

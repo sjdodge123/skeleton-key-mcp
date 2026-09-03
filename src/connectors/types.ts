@@ -34,6 +34,18 @@ export interface Target {
   options?: Record<string, unknown>;
 }
 
+/**
+ * A host the control plane depends on, which a network change must never be
+ * pointed at. `why` is human text naming what it protects, so a refusal reads
+ * "…is Portainer (target 'nas229pt')" rather than a bare IP.
+ */
+export interface ProtectedHost {
+  /** Hostname or IP as registered/configured — compared literally. */
+  host: string;
+  /** What lives there, for the refusal message. */
+  why: string;
+}
+
 /** Runtime context handed to a tool when it executes. */
 export interface ToolContext {
   target: Target;
@@ -61,6 +73,19 @@ export interface ToolContext {
    * like `resolveCredential`; tools must degrade to no fingerprint when absent.
    */
   fingerprint?: (value: string) => Promise<string>;
+  /**
+   * Hosts that a network change must never be pointed at — Skeleton Key's own
+   * control plane. Assembled by the tool registry from the LIVE target registry
+   * (so moving a host is picked up automatically instead of being hardcoded),
+   * plus Skeleton Key's own public URL and its Vaultwarden server, neither of
+   * which is a registered target.
+   *
+   * Optional for the same reason as `resolveCredential` — non-MCP call sites
+   * (the snapshot service) build a minimal context. But unlike those, a tool
+   * that needs this must **fail closed** when it is absent: a deny-list that
+   * silently evaluates to empty is worse than no deny-list at all.
+   */
+  protectedHosts?: () => ProtectedHost[];
 }
 
 export interface ToolResult {
