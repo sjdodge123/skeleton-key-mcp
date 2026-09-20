@@ -8,6 +8,11 @@ import {
   isPrivateIPv4,
   assertTransportOk,
   assertCronField,
+  expandPorts,
+  assertAllocationIp,
+  assertEggSourceUrl,
+  parseEggContent,
+  MAX_PORTS_PER_CALL,
   summarizeEggs,
   summarizeNodes,
   summarizeAllocations,
@@ -536,13 +541,183 @@ describe("assign_allocation", () => {
   });
 });
 
+describe("port expansion (mirrors the panel's AssignmentService)", () => {
+  it("expands single ports and ranges, de-duplicated and sorted", () => {
+    expect(expandPorts(["2458", "2456-2457", "2456"])).toEqual([2456, 2457, 2458]);
+  });
+
+  it("refuses a range whose endpoints are not 4-5 digits, because the panel's regex does", () => {
+    // '999-2000' looks reasonable but PORT_RANGE_REGEX never matches it, so the
+    // panel would reject the whole call with an opaque error.
+    expect(() => expandPorts(["999-2000"])).toThrow(/4-5 digits/);
+  });
+
+  it("refuses a backwards range and ports outside 1024-65535", () => {
+    expect(() => expandPorts(["2458-2456"])).toThrow(/end port is below/);
+    expect(() => expandPorts(["80"])).toThrow(/outside Pelican's allowed range/);
+    expect(() => expandPorts(["1024-70000"])).toThrow(/outside Pelican's allowed range/);
+  });
+
+  it("caps a single call so a fat-fingered range can't insert tens of thousands of rows", () => {
+    expect(() => expandPorts(["2000-65535"])).toThrow(new RegExp(`caps a single call at ${MAX_PORTS_PER_CALL}`));
+  });
+
+  it("refuses CIDR, which the panel would expand across every port", () => {
+    expect(() => assertAllocationIp("192.168.0.0/24")).toThrow(/refuses CIDR/);
+    expect(() => assertAllocationIp("192.168.0.999")).toThrow(/one literal IPv4/);
+    expect(assertAllocationIp(" 192.168.0.48 ")).toBe("192.168.0.48");
+  });
+});
+
+describe("create_allocations", () => {
+  const existing = [{ id: 11, ip: "192.168.0.48", port: 2500, assigned: true }];
+
+  it("sends ports as strings and reports the ids it had to re-read (204 returns nothing)", async () => {
+    // The POST answers 204 with an empty body, so the allocation list must differ
+    // before and after — a static mock would not prove the re-read happens.
+    let posted = false;
+    const calls: { url: string; init: any }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: any) => {
+        calls.push({ url, init });
+        const isPost = init?.method === "POST";
+        if (isPost) {
+          posted = true;
+          return { ok: true, status: 204, statusText: "", headers: { get: () => null }, text: async () => "" } as any;
+        }
+        const rows = posted
+          ? [...existing, { id: 21, ip: "192.168.0.48", port: 2456 }, { id: 22, ip: "192.168.0.48", port: 2457 }]
+          : existing;
+        return { ok: true, status: 200, statusText: "", headers: { get: () => null }, text: async () => JSON.stringify(list(rows)) } as any;
+      }),
+    );
+
+    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.0.48", ports: ["2456-2457"], alias: "valheim" }, ctx());
+    expect(res.isError).toBeFalsy();
+    const post = writes(calls)[0]!;
+    expect(authOn(post)).toBe(`Bearer ${APP}`);
+    expect(JSON.parse(post.init.body)).toEqual({ ip: "192.168.0.48", ports: ["2456", "2457"], alias: "valheim" });
+    expect(res.text).toContain("192.168.0.48:2456 [21]");
+    expect(res.text).toContain("192.168.0.48:2457 [22]");
+    expect(res.text).toMatch(/port-forward/i);
+  });
+
+  it("refuses a port the node already has, WITHOUT posting (the unique index makes it a 500)", async () => {
+    const calls = mockFetch([{ match: (u) => u.includes("/allocations"), reply: { json: list(existing) } }]);
+    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.0.48", ports: ["2500"] }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("192.168.0.48:2500 [11]");
+    expect(res.text).toMatch(/unique index/);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("confirm text names the node, address, ports and expanded count", () => {
+    expect(tool("create_allocations").confirm!({ node: 1, ip: "192.168.0.48", ports: ["2456-2458"] }, target({ ownerUserId: 7 }))).toBe(
+      "Create allocations on Pelican node 1 on pelican-panel: 192.168.0.48 ports 2456-2458 (3 port(s))",
+    );
+  });
+});
+
+describe("import_egg", () => {
+  const UUID = "11111111-1111-1111-1111-111111111111";
+  const eggJson = (uuid = UUID) =>
+    JSON.stringify({ meta: { version: "PLCN_v3" }, uuid, name: "Valheim", author: "dev@example.com", variables: [{ env_variable: "SERVER_NAME" }] });
+
+  it("rejects content that isn't a recognised egg export, before any request", async () => {
+    expect(() => parseEggContent("<!doctype html><html>404</html>")).toThrow(/parse the egg|not an egg object/);
+    expect(() => parseEggContent(JSON.stringify({ meta: { version: "NOPE" }, variables: [] }))).toThrow(/meta.version/);
+    expect(() => parseEggContent(JSON.stringify({ meta: { version: "PLCN_v3" } }))).toThrow(/no 'variables' array/);
+  });
+
+  it("accepts YAML as well as JSON, since the panel parses the body as YAML", () => {
+    const parsed = parseEggContent("meta:\n  version: PLCN_v3\nuuid: abc\nname: Valheim\nvariables:\n  - env_variable: A\n");
+    expect(parsed).toMatchObject({ uuid: "abc", name: "Valheim", version: "PLCN_v3", variableCount: 1 });
+  });
+
+  it("only fetches eggs from public https (this fetch originates inside the LAN)", () => {
+    expect(() => assertEggSourceUrl("http://raw.githubusercontent.com/x.json")).toThrow(/use https/);
+    expect(() => assertEggSourceUrl("https://192.168.0.48/secret")).toThrow(/private\/LAN address/);
+    expect(() => assertEggSourceUrl("https://localhost/x")).toThrow(/private\/LAN address/);
+    expect(assertEggSourceUrl("https://raw.githubusercontent.com/x.json").host).toBe("raw.githubusercontent.com");
+  });
+
+  it("sends the egg document as the RAW body (not a JSON envelope) and reports the new egg", async () => {
+    const body = eggJson("22222222-2222-2222-2222-222222222222");
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/eggs/import") && i?.method === "POST", reply: { status: 201, json: item({ id: 22, name: "Valheim", uuid: "22222222-2222-2222-2222-222222222222" }) } },
+      { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Paper", uuid: UUID }]) } },
+    ]);
+    const res = await tool("import_egg").run({ content: body }, ctx());
+    expect(res.isError).toBeFalsy();
+    const post = writes(calls)[0]!;
+    expect(post.init.body).toBe(body); // verbatim — $request->getContent() is the egg
+    expect(authOn(post)).toBe(`Bearer ${APP}`);
+    expect(res.text).toContain("Imported new");
+    expect(res.text).toContain("[id 22]");
+  });
+
+  it("REFUSES a uuid already on the panel, names the servers that would be affected, and posts nothing", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/eggs/import"), reply: { status: 201, json: item({ id: 5 }) } },
+      { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim (old)", uuid: UUID }]) } },
+      { match: (u) => u.includes("/servers"), reply: { json: list([{ id: 9, name: "valheim-live", egg: 5 }]) } },
+    ]);
+    const res = await tool("import_egg").run({ content: eggJson() }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("'Valheim (old)' [id 5]");
+    expect(res.text).toContain("'valheim-live' [9]");
+    expect(res.text).toMatch(/OVERWRITE/);
+    expect(res.text).toMatch(/overwrite: true/);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("proceeds on the same uuid with overwrite:true, and says it overwrote", async () => {
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/eggs/import") && i?.method === "POST", reply: { status: 201, json: item({ id: 5, name: "Valheim", uuid: UUID }) } },
+      { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim (old)", uuid: UUID }]) } },
+      { match: (u) => u.includes("/servers"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("import_egg").run({ content: eggJson(), overwrite: true }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("OVERWROTE existing");
+    expect(res.text).toMatch(/Variables not present in the imported file were removed/);
+    expect(writes(calls)).toHaveLength(1);
+  });
+
+  it("requires exactly one of url/content", async () => {
+    mockFetch([{ match: () => true, reply: { json: list([]) } }]);
+    const both = await tool("import_egg").run({ url: "https://x/y.json", content: "{}" }, ctx());
+    expect(both.isError).toBe(true);
+    const neither = await tool("import_egg").run({}, ctx());
+    expect(neither.isError).toBe(true);
+    expect(neither.text).toContain("exactly one");
+  });
+
+  it("confirm text distinguishes a create from a destructive overwrite", () => {
+    const t = target({ ownerUserId: 7 });
+    expect(tool("import_egg").confirm!({ url: "https://x/valheim.json" }, t)).toBe("Import a new egg from https://x/valheim.json into pelican-panel");
+    expect(tool("import_egg").confirm!({ content: "{}", overwrite: true }, t)).toMatch(/OVERWRITING any existing egg with the same uuid/);
+  });
+});
+
 describe("connector wiring", () => {
   it("registers every planned tool at the right tier", () => {
     const tools = pelicanConnector.buildTools(target({ ownerUserId: 7 }));
     const reads = tools.filter((t) => t.tier === "read").map((t) => t.name).sort();
     const execs = tools.filter((t) => t.tier === "execute").map((t) => t.name).sort();
     expect(reads).toEqual(["list_allocations", "list_eggs", "list_nodes", "list_schedules", "list_servers", "list_users", "server_details", "server_resources"]);
-    expect(execs).toEqual(["assign_allocation", "create_schedule", "create_server", "delete_schedule", "power_action", "update_schedule", "update_startup_variables"]);
+    expect(execs).toEqual([
+      "assign_allocation",
+      "create_allocations",
+      "create_schedule",
+      "create_server",
+      "delete_schedule",
+      "import_egg",
+      "power_action",
+      "update_schedule",
+      "update_startup_variables",
+    ]);
     // Every execute tool must carry confirm text — the approval gate keys off it.
     expect(tools.filter((t) => t.tier === "execute").every((t) => typeof t.confirm === "function")).toBe(true);
     expect(pelicanConnector.requiresCredential).toBe(true);

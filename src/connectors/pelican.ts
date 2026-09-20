@@ -1,4 +1,5 @@
 import { z } from "zod";
+import yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 
@@ -155,10 +156,216 @@ export function assertTransportOk(base: string): void {
   }
 }
 
+// --- Allocation port parsing -------------------------------------------------
+
+/** Pelican's own bounds, from AssignmentService (PORT_FLOOR / PORT_CEIL). */
+export const PORT_FLOOR = 1024;
+export const PORT_CEIL = 65535;
+
+/**
+ * Skeleton Key's cap on ONE create_allocations call. The panel's own limit is
+ * 1000 ports *per range* and it will happily expand a CIDR across that range, so
+ * a slip like ports '1024-65535' would insert tens of thousands of rows in a
+ * single transaction. Nothing a game server needs comes close to this, and the
+ * error tells you to split the call, so the cap costs nothing and removes the
+ * only way this tool could make a mess that is tedious to undo.
+ */
+export const MAX_PORTS_PER_CALL = 256;
+
+/** Pelican's range syntax, mirrored exactly: BOTH endpoints must be 4-5 digits,
+ *  which is why '999-2000' is not a valid range to the panel. */
+const PORT_RANGE_RE = /^(\d{4,5})-(\d{4,5})$/;
+
+/**
+ * Validate and expand port specs ('2456', '2456-2458') into concrete ports.
+ *
+ * The rules mirror the panel's AssignmentService so a bad spec fails here with a
+ * legible message instead of coming back as an opaque 500 — and, more
+ * importantly, expanding locally is what lets the caller pre-check for ports
+ * that already exist. Exported for testing.
+ */
+export function expandPorts(ports: string[]): number[] {
+  if (!ports.length) throw new Error("create_allocations needs at least one port.");
+  const out: number[] = [];
+  for (const raw of ports) {
+    const spec = String(raw).trim();
+    const range = PORT_RANGE_RE.exec(spec);
+    if (range) {
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      if (end < start) throw new Error(`Invalid port range '${spec}' — the end port is below the start port.`);
+      if (start < PORT_FLOOR || end > PORT_CEIL) {
+        throw new Error(`Port range '${spec}' is outside Pelican's allowed range ${PORT_FLOOR}-${PORT_CEIL}.`);
+      }
+      for (let p = start; p <= end; p += 1) out.push(p);
+      continue;
+    }
+    if (!/^\d+$/.test(spec)) {
+      throw new Error(
+        `Invalid port '${spec}' — use a single port like '2456', or a range like '2456-2458'. ` +
+          `Pelican requires BOTH endpoints of a range to be 4-5 digits, so '999-2000' is not a valid range to it.`,
+      );
+    }
+    const port = Number(spec);
+    if (port < PORT_FLOOR || port > PORT_CEIL) {
+      throw new Error(`Port ${port} is outside Pelican's allowed range ${PORT_FLOOR}-${PORT_CEIL}.`);
+    }
+    out.push(port);
+  }
+  const unique = [...new Set(out)].sort((a, b) => a - b);
+  if (unique.length > MAX_PORTS_PER_CALL) {
+    throw new Error(
+      `That asks for ${unique.length} allocations in one call; this tool caps a single call at ${MAX_PORTS_PER_CALL}. ` +
+        `Split it into smaller calls — and double-check the range, because a game server normally needs a handful of ports, not hundreds.`,
+    );
+  }
+  return unique;
+}
+
+/** A single literal IPv4 — CIDR is deliberately refused, see the tool description. */
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/** Validate the allocation IP. Exported for testing. */
+export function assertAllocationIp(ip: string): string {
+  const trimmed = ip.trim();
+  const m = IPV4_RE.exec(trimmed);
+  if (!m || [m[1], m[2], m[3], m[4]].some((n) => Number(n) > 255)) {
+    throw new Error(
+      `create_allocations takes one literal IPv4 address (e.g. '192.168.0.48'), not '${ip}'. ` +
+        `Pelican also accepts a CIDR block here and expands it across every port, which multiplies into thousands of ` +
+        `allocations from a single call — so this tool refuses CIDR. Use the node's own IP, exactly as list_allocations prints it.`,
+    );
+  }
+  return trimmed;
+}
+
+// --- Egg import parsing ------------------------------------------------------
+
+/** `meta.version` values Pelican's importer recognises (EggImporterService::parse
+ *  plus Egg::EXPORT_VERSION). Anything else is rejected as "not recognized". */
+export const EGG_FORMAT_VERSIONS = ["PTDL_v1", "PTDL_v2", "PLCN_v1", "PLCN_v2", "PLCN_v3"] as const;
+
+/** Only the fields the import guardrail needs — never the whole egg. */
+export interface ParsedEgg {
+  uuid?: string;
+  name?: string;
+  author?: string;
+  version: string;
+  variableCount: number;
+}
+
+/**
+ * Parse an egg export locally, purely so the import can be checked BEFORE it is
+ * sent. Three things are worth catching here rather than at the panel:
+ *
+ *  - **The uuid**, because Pelican's importer treats a known uuid as "update this
+ *    egg in place" — it overwrites the egg and deletes every variable the import
+ *    doesn't mention. That is invisible in the request and irreversible, so the
+ *    uuid has to be read before the POST, not after.
+ *  - **meta.version**, which the panel rejects with a flat "file format is not
+ *    recognized" that doesn't say what it got.
+ *  - **variables**, which the importer dereferences with `count()` and no guard —
+ *    an egg without it produces a 500 rather than a validation error.
+ *
+ * Accepts JSON or YAML: the panel parses the raw body as YAML (JSON being valid
+ * YAML), and eggs are published in both. Exported for testing.
+ */
+export function parseEggContent(content: string): ParsedEgg {
+  const text = content.trim();
+  if (!text) throw new Error("The egg content is empty.");
+  let parsed: unknown;
+  try {
+    // JSON first — it is the common case and gives far better errors than the
+    // YAML parser does on a malformed JSON document.
+    parsed = JSON.parse(text);
+  } catch {
+    try {
+      parsed = yaml.load(text);
+    } catch (e) {
+      throw new Error(`Could not parse the egg as JSON or YAML: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("That content is not an egg object. An egg export is a JSON/YAML object with 'meta', 'name' and 'variables'.");
+  }
+  const obj = parsed as Record<string, unknown>;
+  const meta = (obj.meta ?? {}) as Record<string, unknown>;
+  const version = typeof meta.version === "string" ? meta.version : "";
+  if (!(EGG_FORMAT_VERSIONS as readonly string[]).includes(version)) {
+    throw new Error(
+      `The egg's meta.version is '${version || "(missing)"}', which Pelican's importer does not accept — it takes ${EGG_FORMAT_VERSIONS.join(", ")}. ` +
+        `This usually means the file isn't a Pelican/Pterodactyl egg export (a GitHub HTML page or a README will land here too).`,
+    );
+  }
+  if (!Array.isArray(obj.variables)) {
+    throw new Error(
+      "The egg has no 'variables' array. Pelican's importer reads it without a guard, so this would fail as a server error rather than a validation message. Re-export the egg from a panel.",
+    );
+  }
+  return {
+    uuid: typeof obj.uuid === "string" ? obj.uuid : undefined,
+    name: typeof obj.name === "string" ? obj.name : undefined,
+    author: typeof obj.author === "string" ? obj.author : undefined,
+    version,
+    variableCount: obj.variables.length,
+  };
+}
+
+/** Largest egg body accepted from a URL — real eggs are a few KiB; the install
+ *  script is the only large part. Keeps a wrong URL from streaming a huge file. */
+export const MAX_EGG_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Guard the egg source URL. Skeleton Key does the fetch, so an attacker-supplied
+ * URL would be a request made from INSIDE the LAN — the classic SSRF shape. The
+ * rule is the mirror image of `assertTransportOk`: that one allows plain http
+ * only to a private address, this one allows only https to a PUBLIC one.
+ * Exported for testing.
+ */
+export function assertEggSourceUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`Invalid egg URL '${raw}'.`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`Refusing to fetch an egg over '${url.protocol}' — use https so the egg can't be swapped in transit.`);
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (isPrivateIPv4(host) || host === "localhost" || host === "::1" || host.endsWith(".local") || host.endsWith(".internal")) {
+    throw new Error(
+      `Refusing to fetch an egg from '${url.hostname}' — that is a private/LAN address. This tool fetches from inside your network, ` +
+        `so it is restricted to public https sources (e.g. raw.githubusercontent.com). Paste the egg via 'content' instead.`,
+    );
+  }
+  return url;
+}
+
+/** Fetch an egg export from a public https URL, size- and time-bounded. */
+export async function fetchEggFromUrl(raw: string): Promise<string> {
+  const url = assertEggSourceUrl(raw);
+  let res: Response;
+  try {
+    res = await fetch(url.href, { headers: { Accept: "application/json, application/yaml, text/plain, */*" }, signal: AbortSignal.timeout(15_000) });
+  } catch (e) {
+    throw new Error(`Could not fetch the egg from ${url.href}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!res.ok) throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status}.`);
+  const text = await res.text();
+  if (text.length > MAX_EGG_BYTES) {
+    throw new Error(`The file at ${url.href} is ${text.length} bytes, larger than the ${MAX_EGG_BYTES}-byte limit for an egg. Check the URL points at an egg export.`);
+  }
+  return text;
+}
+
 // --- Response shapes (Fractal envelopes: {object, data:[{attributes}]}) -------
 
 interface Egg {
   id: number;
+  /** Stable identity across panels — what `import_egg` matches to detect that an
+   *  import would OVERWRITE an existing egg rather than create a new one. */
+  uuid?: string;
   name?: string;
   author?: string;
   description?: string;
@@ -357,7 +564,7 @@ class Pelican {
   private async request(
     api: PelicanApi,
     path: string,
-    opts: { method?: string; body?: unknown; query?: Record<string, string | number> } = {},
+    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number> } = {},
   ): Promise<{ ok: boolean; status: number; json?: unknown; text: string }> {
     assertTransportOk(this.base);
     const key = keyFor(this.cred, api);
@@ -374,10 +581,14 @@ class Pelican {
       Accept: "application/json",
       Authorization: `Bearer ${key}`,
     };
-    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    // `rawBody` goes over the wire verbatim. The egg import route reads
+    // `$request->getContent()` — the egg document IS the body, not a field in a
+    // JSON envelope — so it must not be re-serialized.
+    const payload = opts.rawBody !== undefined ? opts.rawBody : opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+    if (payload !== undefined) headers["Content-Type"] = "application/json";
     const res = await tlsFetch(
       `${this.base}/api/${api}${path}${qs}`,
-      { method: opts.method ?? "GET", headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined },
+      { method: opts.method ?? "GET", headers, body: payload },
       this.insecure,
     );
     const text = await res.text();
@@ -531,6 +742,109 @@ class Pelican {
   }
 
   // --- executes ------------------------------------------------------------
+
+  /**
+   * Create allocations (IP:port rows) on a node, so a new server has a port to
+   * bind. This is the step that unblocks provisioning a game the panel has never
+   * hosted: `create_server` can only take an allocation that already exists.
+   *
+   * Two things shape the implementation:
+   *  - The route answers **204 with an empty body**, so it tells you nothing
+   *    about what it made. The ids are re-read afterwards, otherwise the result
+   *    could not name the allocations the caller now needs for `create_server`.
+   *  - The table has a unique index on (node, ip, port) and the service does a
+   *    plain insert, so re-creating an existing allocation is a 500, not a
+   *    friendly conflict. The clash is checked first and reported by port.
+   */
+  async createAllocations(input: { node: number; ip: string; ports: string[]; alias?: string }): Promise<string> {
+    const ip = assertAllocationIp(input.ip);
+    const ports = expandPorts(input.ports);
+    const path = `/nodes/${input.node}/allocations`;
+
+    const before = await this.list<Allocation>("application", path);
+    const clash = before.filter((a) => a.ip === ip && ports.includes(Number(a.port)));
+    if (clash.length) {
+      throw new Error(
+        `Node ${input.node} already has ${clash.length} of those allocations: ${clash.map((a) => `${a.ip}:${a.port} [${a.id}]${a.assigned ? " (assigned)" : " (free)"}`).join(", ")}. ` +
+          `Pelican has a unique index on (node, ip, port) and inserts without checking, so sending these again fails as a server error. ` +
+          `Drop those ports from the call, or just use the existing allocations — a FREE one is already usable by create_server.`,
+      );
+    }
+
+    const res = await this.request("application", path, {
+      method: "POST",
+      // Ports are sent as strings: the panel validates `ports.*` as `string` and
+      // parses ranges out of them itself.
+      body: { ip, ports: ports.map(String), ...(input.alias ? { alias: input.alias } : {}) },
+    });
+    this.ensureOk(res, path);
+
+    const after = await this.list<Allocation>("application", path);
+    const created = after.filter((a) => a.ip === ip && ports.includes(Number(a.port)));
+    const missing = ports.filter((p) => !created.some((a) => Number(a.port) === p));
+    return (
+      `Created ${created.length} allocation(s) on Pelican node ${input.node}: ${created.map((a) => `${a.ip}:${a.port} [${a.id}]`).join(", ") || "(none reported)"}` +
+      `${input.alias ? ` with alias '${input.alias}'` : ""}. ` +
+      `${missing.length ? `WARNING: ${missing.length} requested port(s) are still missing after the call (${missing.join(", ")}) — re-run list_allocations. ` : ""}` +
+      `Pass one of these ids (or its 'ip:port') to create_server, and remember a UDP game also needs a UniFi port-forward to the same address.`
+    );
+  }
+
+  /**
+   * Import an egg (a game's server template) so a game the panel has never
+   * hosted can be provisioned.
+   *
+   * **The overwrite trap.** Pelican's importer keys on the egg's uuid:
+   * `Egg::where('uuid',$uuid)->first() ?? new Egg()`. A uuid that already exists
+   * is not a conflict — the existing egg is rewritten in place, and every
+   * variable the import doesn't mention is DELETED. Nothing in the request says
+   * "update", and a server built on that egg keeps running against a template
+   * that silently changed underneath it. So the uuid is read from the content
+   * first and a match is refused unless the caller explicitly asked to
+   * overwrite, with the affected servers named in the refusal.
+   */
+  async importEgg(input: { url?: string; content?: string; overwrite?: boolean }): Promise<string> {
+    if ((input.url ? 1 : 0) + (input.content ? 1 : 0) !== 1) {
+      throw new Error("import_egg takes exactly one of 'url' (a public https egg export) or 'content' (the egg JSON/YAML itself).");
+    }
+    const content = input.content ?? (await fetchEggFromUrl(input.url!));
+    const parsed = parseEggContent(content);
+
+    const eggs = await this.list<Egg>("application", "/eggs");
+    const existing = parsed.uuid
+      ? eggs.find((e) => typeof e.uuid === "string" && e.uuid.toLowerCase() === parsed.uuid!.toLowerCase())
+      : undefined;
+
+    if (existing && !input.overwrite) {
+      // Name the blast radius: which servers are built on the egg about to be
+      // rewritten. Best-effort — a listing failure must not mask the refusal.
+      let inUse = "";
+      try {
+        const servers = await this.list<Server>("application", "/servers");
+        const users = servers.filter((s) => s.egg === existing.id);
+        if (users.length) inUse = ` ${users.length} server(s) are built on it: ${users.map((s) => `'${s.name}' [${s.id}]`).join(", ")}.`;
+      } catch {
+        inUse = " (could not check which servers use it)";
+      }
+      throw new Error(
+        `Refusing to import: this egg's uuid (${parsed.uuid}) already exists on the panel as '${existing.name ?? "(unnamed)"}' [id ${existing.id}]. ` +
+          `Pelican would OVERWRITE that egg in place and DELETE any variable this file doesn't contain — there is no undo.${inUse} ` +
+          `If replacing it is genuinely what you want, call import_egg again with overwrite: true. To add it alongside the existing egg instead, edit the file's 'uuid' to a new one first.`,
+      );
+    }
+
+    const path = "/eggs/import";
+    const res = await this.request("application", path, { method: "POST", rawBody: content });
+    this.ensureOk(res, path);
+    const egg: Partial<Egg> = (res.json as { attributes?: Egg })?.attributes ?? {};
+    const verb = existing ? "OVERWROTE existing" : "Imported new";
+    return (
+      `${verb} Pelican egg '${egg.name ?? parsed.name ?? "(unnamed)"}' [id ${egg.id ?? existing?.id ?? "?"}] uuid=${egg.uuid ?? parsed.uuid ?? "(generated)"} ` +
+      `(format ${parsed.version}, ${parsed.variableCount} variable(s))${parsed.author ? ` by ${parsed.author}` : ""} on ${this.target.name}. ` +
+      `${existing ? "Variables not present in the imported file were removed; servers on this egg keep their own values but may need a reinstall to match the new template. " : ""}` +
+      `Use this egg id with create_server — run list_eggs to confirm, and check the egg's required variables before provisioning.`
+    );
+  }
 
   /** Create a server owned by the target's dedicated `ownerUserId`. */
   async createServer(input: {
@@ -896,6 +1210,62 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "read",
       inputSchema: z.object({ server: SERVER_REF }),
       run: run((p, i) => p.listSchedules(i.server)),
+    },
+    {
+      name: "create_allocations",
+      description:
+        `Create IP:port allocations on a Pelican node on ${target.name}. create_server can only use an allocation that already ` +
+        `exists, so this is the step that makes room for a game the panel has never hosted (e.g. Valheim's 2456-2458/udp). Takes ` +
+        `the node's own literal IPv4 and a list of ports — single ('2456') or ranges ('2456-2458', both endpoints 4-5 digits). ` +
+        `Ports already present on the node are refused up front, because Pelican inserts without checking and a duplicate is a ` +
+        `server error. The panel returns no content, so the new allocation ids are read back and reported.`,
+      tier: "execute",
+      inputSchema: z.object({
+        node: z.number().int().positive().describe("Node id from list_nodes."),
+        ip: z.string().describe("The node's literal IPv4, exactly as list_allocations prints it (e.g. '192.168.0.48'). CIDR is refused."),
+        ports: z
+          .array(z.string())
+          .min(1)
+          .describe(`Ports: '2456' or '2456-2458'. Range endpoints must be 4-5 digits. ${PORT_FLOOR}-${PORT_CEIL}, max ${MAX_PORTS_PER_CALL} per call.`),
+        alias: z.string().max(255).optional().describe("Optional display alias for these allocations, e.g. 'valheim'."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { node: number; ip: string; ports: string[]; alias?: string };
+        let count: string;
+        try {
+          count = `${expandPorts(i.ports).length} port(s)`;
+        } catch {
+          count = "an invalid port list";
+        }
+        return `Create allocations on Pelican node ${i.node} on ${t.name}: ${i.ip} ports ${i.ports.join(", ")} (${count})${i.alias ? ` alias '${i.alias}'` : ""}`;
+      },
+      run: run((p, i) => p.createAllocations(i)),
+    },
+    {
+      name: "import_egg",
+      description:
+        `Import an egg (a game's server template) onto ${target.name}, so create_server can provision a game the panel does not ` +
+        `yet have. Give either a public https 'url' to an egg export (e.g. a raw GitHub link — LAN/http URLs are refused) or the ` +
+        `egg JSON/YAML itself as 'content'. IMPORTANT: Pelican keys imports on the egg's uuid, and an existing uuid means it ` +
+        `REWRITES that egg in place and deletes any variable the file omits — so a uuid already on the panel is refused unless ` +
+        `you pass overwrite: true, and the refusal names the servers built on it. Run list_eggs afterwards to get the egg id.`,
+      tier: "execute",
+      inputSchema: z.object({
+        url: z.string().optional().describe("Public https URL of an egg export (JSON or YAML). Exactly one of url/content."),
+        content: z.string().optional().describe("The egg export itself, as JSON or YAML text. Exactly one of url/content."),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe("Allow replacing an existing egg with the same uuid (destructive: drops variables the file omits). Default false."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { url?: string; content?: string; overwrite?: boolean };
+        const src = i.url ? `from ${i.url}` : "from supplied content";
+        return i.overwrite
+          ? `Import egg ${src} into ${t.name}, OVERWRITING any existing egg with the same uuid (its variables not in the file are deleted)`
+          : `Import a new egg ${src} into ${t.name}`;
+      },
+      run: run((p, i) => p.importEgg(i)),
     },
     {
       name: "create_server",
