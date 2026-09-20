@@ -1124,6 +1124,136 @@ describe("panel_upgrade steps", () => {
   });
 });
 
+describe("vault-backed variables (no secret ever crosses the MCP channel)", () => {
+  const SECRET = "correct-horse-battery";
+  const eggVars = item({
+    id: 5,
+    relationships: {
+      variables: {
+        data: [
+          { attributes: { env_variable: "SERVER_NAME", default_value: "My Server", user_editable: true } },
+          { attributes: { env_variable: "PASSWORD", default_value: "secret", user_editable: true } },
+        ],
+      },
+    },
+  });
+
+  /** A context whose vault holds the secret, plus a stub fingerprinter. */
+  function vaultCtx(over: Partial<ToolContext> = {}): ToolContext {
+    return {
+      target: target({ ownerUserId: 7 }),
+      getCredential: async () => cred(),
+      resolveCredential: async (ref: string) => {
+        if (ref !== "valheim-password") throw new Error(`no such item '${ref}'`);
+        return { ref, password: SECRET, fields: {}, uris: [] };
+      },
+      fingerprint: async (v: string) => `len=${v.length} fp=deadbeef`,
+      ...over,
+    };
+  }
+
+  it("create_server sends the vault value in the request body but NEVER in the result", async () => {
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9, identifier: "abc123" }) } },
+      { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggVars } },
+      { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim" }]) } },
+      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.0.48", port: 2456, assigned: false }]) } },
+      { match: (u) => u.includes("/nodes"), reply: { json: list([{ id: 1 }]) } },
+    ]);
+    const res = await tool("create_server").run(
+      {
+        name: "valheim",
+        egg: "Valheim",
+        allocation: "192.168.0.48:2456",
+        environment: { SERVER_NAME: "Jake's server" },
+        secretEnvironment: [{ name: "PASSWORD", credentialRef: "valheim-password" }],
+      },
+      vaultCtx(),
+    );
+    expect(res.isError).toBeFalsy();
+    // It reaches the panel…
+    expect(JSON.parse(writes(calls)[0]!.init.body).environment.PASSWORD).toBe(SECRET);
+    // …and nowhere else.
+    expect(res.text).not.toContain(SECRET);
+    expect(res.text).toContain("PASSWORD");
+    expect(res.text).toContain("len=21 fp=deadbeef"); // fingerprint, not the value
+  });
+
+  it("a vault-backed variable beats a same-named plain one", async () => {
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9 }) } },
+      { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggVars } },
+      { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim" }]) } },
+      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.0.48", port: 2456, assigned: false }]) } },
+      { match: (u) => u.includes("/nodes"), reply: { json: list([{ id: 1 }]) } },
+    ]);
+    await tool("create_server").run(
+      {
+        name: "v",
+        egg: "Valheim",
+        allocation: "192.168.0.48:2456",
+        environment: { PASSWORD: "typed-in-chat" },
+        secretEnvironment: [{ name: "PASSWORD", credentialRef: "valheim-password" }],
+      },
+      vaultCtx(),
+    );
+    expect(JSON.parse(writes(calls)[0]!.init.body).environment.PASSWORD).toBe(SECRET);
+  });
+
+  it("update_startup_variables pulls from the vault and keeps the value out of the result", async () => {
+    const calls = mockFetch([{ match: (u) => u.includes("/startup/variable"), reply: { json: {} } }]);
+    const res = await tool("update_startup_variables").run(
+      { server: "abc123", secretVariables: [{ name: "PASSWORD", credentialRef: "valheim-password" }] },
+      vaultCtx(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(writes(calls)[0]!.init.body)).toEqual({ key: "PASSWORD", value: SECRET });
+    expect(res.text).not.toContain(SECRET);
+    expect(res.text).toContain("came from the vault");
+  });
+
+  it("names the item and field in the approval prompt, never the value", () => {
+    const t = target({ ownerUserId: 7 });
+    const confirm = pelicanConnector.buildTools(t).find((x) => x.name === "update_startup_variables")!.confirm!;
+    const text = confirm({ server: "abc123", secretVariables: [{ name: "PASSWORD", credentialRef: "valheim-password", field: "password" }] }, t);
+    expect(text).toContain("PASSWORD←vault:valheim-password.password");
+    expect(text).not.toContain(SECRET);
+  });
+
+  it("errors name the variable, item and field — and still no value — when the item is missing", async () => {
+    const calls = mockFetch([{ match: () => true, reply: { json: {} } }]);
+    const res = await tool("update_startup_variables").run(
+      { server: "abc123", secretVariables: [{ name: "PASSWORD", credentialRef: "typo-name" }] },
+      vaultCtx(),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("secretVariables 'PASSWORD'");
+    expect(res.text).toContain("typo-name");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("refuses when the vault item exists but the field is empty, rather than setting a blank password", async () => {
+    mockFetch([{ match: () => true, reply: { json: {} } }]);
+    const res = await tool("update_startup_variables").run(
+      { server: "abc123", secretVariables: [{ name: "PASSWORD", credentialRef: "valheim-password", field: "notes" }] },
+      vaultCtx(),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/no value for field 'notes'/);
+    expect(res.text).toMatch(/never paste the secret into chat/);
+  });
+
+  it("fails loudly at a call site with no vault access instead of silently skipping the variable", async () => {
+    mockFetch([{ match: () => true, reply: { json: {} } }]);
+    const res = await tool("update_startup_variables").run(
+      { server: "abc123", secretVariables: [{ name: "PASSWORD", credentialRef: "valheim-password" }] },
+      vaultCtx({ resolveCredential: undefined }),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/cannot resolve vault items/);
+  });
+});
+
 describe("connector wiring", () => {
   it("registers every planned tool at the right tier", () => {
     const tools = pelicanConnector.buildTools(target({ ownerUserId: 7 }));

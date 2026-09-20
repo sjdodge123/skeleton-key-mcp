@@ -1,6 +1,13 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
+// Vault-backed secret injection lives in one place now that Pelican needs it too.
+import { resolveSecretRefs, secretFingerprintBlock, type SecretRef, type Fingerprinter } from "./secret-refs.js";
+export { pickCredentialField, secretFingerprintBlock, type Fingerprinter } from "./secret-refs.js";
+/** A `secretEnv` request: put vault item `credentialRef`'s value into var `name`. */
+export type SecretEnvRef = SecretRef;
+/** Resolve `secretEnv` entries through the vault (see secret-refs.ts). */
+export const resolveSecretEnv = (ctx: import("./types.js").ToolContext, refs: SecretEnvRef[] | undefined) => resolveSecretRefs(ctx, refs, "secretEnv");
 import { checkCommand, type CommandPolicyOptions } from "./command-policy.js";
 
 /**
@@ -130,66 +137,6 @@ export function mergeEnv(...lists: (EnvEntry[] | undefined)[]): EnvEntry[] {
 }
 
 /**
- * Pick one value out of a vault item. Named parts (`username`/`password`/
- * `secret`/`notes`) read the corresponding property and fall back to a custom
- * field of the same name; anything else is a custom field. With no field given:
- * password, else secret, else the `token` custom field.
- */
-export function pickCredentialField(cred: Credential, field?: string): string | undefined {
-  if (!field) return cred.password ?? cred.secret ?? cred.fields["token"];
-  const named: Record<string, string | undefined> = {
-    username: cred.username,
-    password: cred.password,
-    secret: cred.secret,
-    notes: cred.notes,
-  };
-  return (field in named ? named[field] : undefined) ?? cred.fields[field];
-}
-
-/** A `secretEnv` request: put vault item `credentialRef`'s value into var `name`. */
-export interface SecretEnvRef {
-  name: string;
-  credentialRef: string;
-  field?: string;
-}
-
-/**
- * Resolve `secretEnv` entries into real env values through the vault.
- * INVARIANT: the returned values are for the Portainer request body only — the
- * caller must never put them in a ToolResult, an error, or the audit log.
- * Errors here name the variable, the item, and the field, never a value.
- */
-export async function resolveSecretEnv(ctx: ToolContext, refs: SecretEnvRef[] | undefined): Promise<EnvEntry[]> {
-  if (!refs?.length) return [];
-  if (!ctx.resolveCredential) throw new Error("This context cannot resolve vault items, so secretEnv is unavailable here.");
-  const out: EnvEntry[] = [];
-  for (const [idx, r] of refs.entries()) {
-    let cred: Credential;
-    try {
-      // `fresh`: a secret about to be injected into a deploy must never come
-      // from a stale offline cache (a renamed item once served its old value
-      // through a whole deploy cycle). Bounded — an outage degrades to cache.
-      // One sync (before the first lookup) refreshes the cache for all of them.
-      cred = await ctx.resolveCredential(r.credentialRef, { fresh: idx === 0 });
-    } catch (e) {
-      throw new Error(`secretEnv '${r.name}': cannot read vault item '${r.credentialRef}' — ${e instanceof Error ? e.message : String(e)}`);
-    }
-    const value = pickCredentialField(cred, r.field);
-    if (value === undefined || value === "") {
-      throw new Error(
-        `secretEnv '${r.name}': vault item '${r.credentialRef}' has no value for field '${r.field ?? "password/secret/token"}'. ` +
-          `Store it on that item (or name a different field) — never paste the secret into chat.`,
-      );
-    }
-    out.push({ name: r.name, value });
-  }
-  return out;
-}
-
-/** Keyed-fingerprint function, as handed to a tool via `ToolContext.fingerprint`. */
-export type Fingerprinter = (value: string) => Promise<string>;
-
-/**
  * Annotate env entries as `NAME=<redacted> (len=<n> fp=<hex>)` — the value is
  * fingerprinted here in-process and NEVER emitted. A fingerprint can be
  * compared with the vault's (credential_request_status) to tell whether a
@@ -211,24 +158,6 @@ export async function annotateEnv(env: EnvEntry[] | undefined, fp?: Fingerprinte
     out.push(`${e.name}=<redacted>${tag}`);
   }
   return out;
-}
-
-/**
- * Trailing block for a deploy result: one `NAME: len=<n> fp=<hex>` line per
- * injected secret, so what landed in the stack can be checked against the
- * vault in seconds. Empty (not a value echo!) when no fingerprinter is present.
- */
-export async function secretFingerprintBlock(secretEnv: EnvEntry[], fp?: Fingerprinter): Promise<string> {
-  if (!fp || !secretEnv.length) return "";
-  const lines: string[] = [];
-  for (const e of secretEnv) {
-    try {
-      lines.push(`  ${e.name}: ${await fp(e.value)}`);
-    } catch {
-      lines.push(`  ${e.name}: (fingerprint unavailable)`);
-    }
-  }
-  return `\nSecret fingerprints (compare with the vault's via credential_request_status):\n${lines.join("\n")}`;
 }
 
 /** Split Docker's `NAME=value` env strings into entries (a line with no '=' has an empty value). */
