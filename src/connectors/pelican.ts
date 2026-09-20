@@ -4,6 +4,7 @@ import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, To
 import { deriveBaseUrl, tlsFetch } from "./net.js";
 import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } from "./ssh-exec.js";
 import { checkCommand } from "./command-policy.js";
+import { resolveSecretRefs, secretFingerprintBlock, describeSecretRef, type SecretRef, type SecretValue } from "./secret-refs.js";
 
 /**
  * Pelican Panel connector — inventory, provisioning, power and schedules for a
@@ -963,7 +964,26 @@ class Pelican {
   constructor(
     private readonly target: Target,
     private readonly cred: Credential,
+    /** Present for MCP tool calls; absent for the snapshot service, which needs
+     *  no vault-backed injection. Guarded at each use, never assumed. */
+    private readonly ctx?: ToolContext,
   ) {}
+
+  /**
+   * Resolve vault-backed variable values. The VALUES returned here are for the
+   * outbound Pelican request body only — never a ToolResult, an error, or the
+   * audit log. See secret-refs.ts for the invariant.
+   */
+  private async secrets(refs: SecretRef[] | undefined, label: string): Promise<SecretValue[]> {
+    if (!refs?.length) return [];
+    if (!this.ctx) throw new Error(`Vault-backed '${label}' is unavailable at this call site.`);
+    return resolveSecretRefs(this.ctx, refs, label);
+  }
+
+  /** `NAME: len=… fp=…` lines for what was injected — never the values. */
+  private fingerprints(secrets: SecretValue[]): Promise<string> {
+    return secretFingerprintBlock(secrets, this.ctx?.fingerprint);
+  }
 
   private get base(): string {
     return baseUrl(this.target);
@@ -1297,6 +1317,7 @@ class Pelican {
     backups?: number;
     allocations?: number;
     environment?: Record<string, string | number | boolean>;
+    secretEnvironment?: SecretRef[];
     dockerImage?: string;
     startup?: string;
     description?: string;
@@ -1311,9 +1332,15 @@ class Pelican {
     const egg = await this.resolveEgg(input.egg);
     const { alloc } = await this.resolveAllocation(input.allocation);
 
+    // Secrets (a game's server/RCON password) come from the vault, never from
+    // the caller — resolved here, used in the body below, and never reported.
+    const secrets = await this.secrets(input.secretEnvironment, "secretEnvironment");
+    const supplied: Record<string, string | number | boolean> = { ...(input.environment ?? {}) };
+    for (const s of secrets) supplied[s.name] = s.value; // a secret wins a name collision
+
     // The egg's own variables decide the environment. Sending only what the
     // caller named would blank every other variable — see buildEnvironment.
-    const { environment, defaulted } = buildEnvironment(await this.eggVariables(egg.id), input.environment ?? {});
+    const { environment, defaulted } = buildEnvironment(await this.eggVariables(egg.id), supplied);
 
     // Extra ports (a game's query port, RCON, …). Pelican accepts these at
     // creation as `allocation.additional`; the alternative route takes no port
@@ -1368,8 +1395,10 @@ class Pelican {
       `on egg '${egg.name ?? egg.id}', allocation ${alloc.ip}:${alloc.port} [${alloc.id}]` +
       `${additional.length ? ` plus ${additional.length} additional allocation(s) [${additional.join(", ")}]` : ""}, owner user ${owner}. ` +
       `${defaulted.length ? `${defaulted.length} egg variable(s) took their default: ${defaulted.join(", ")} (values not echoed). ` : "Every egg variable was supplied explicitly. "}` +
+      `${secrets.length ? `${secrets.length} variable(s) were filled from the vault: ${secrets.map((s) => s.name).join(", ")}. ` : ""}` +
       `The panel installs it in the background — poll server_resources (or list_servers) until it leaves 'installing'. ` +
-      `Use the identifier/uuid (not the numeric id) for power, startup and schedule tools.`
+      `Use the identifier/uuid (not the numeric id) for power, startup and schedule tools.` +
+      (await this.fingerprints(secrets))
     );
   }
 
@@ -1391,6 +1420,7 @@ class Pelican {
   async updateServerStartup(input: {
     id: number;
     variables?: Record<string, string | number | boolean>;
+    secretVariables?: SecretRef[];
     startup?: string;
     dockerImage?: string;
     skipScripts?: boolean;
@@ -1403,7 +1433,9 @@ class Pelican {
     const variables = await this.eggVariables(eggId);
     const current = ((server.container as { environment?: Record<string, unknown> } | undefined)?.environment ?? {}) as Record<string, unknown>;
 
-    const supplied = input.variables ?? {};
+    const secrets = await this.secrets(input.secretVariables, "secretVariables");
+    const supplied: Record<string, string | number | boolean> = { ...(input.variables ?? {}) };
+    for (const s of secrets) supplied[s.name] = s.value; // a secret wins a name collision
     // Reuse buildEnvironment for the unknown-name check and the default fill…
     const { environment } = buildEnvironment(variables, supplied);
     // …then let any real current value win over the default, so this is a
@@ -1438,9 +1470,11 @@ class Pelican {
     return (
       `Updated startup on Pelican server '${server.name ?? input.id}' [${input.id}] via the admin API. ` +
       `${changed.length ? `Set: ${changed.join(", ")} (values not echoed). ` : "No variable values were changed. "}` +
+      `${secrets.length ? `${secrets.length} of those came from the vault: ${secrets.map((s) => s.name).join(", ")}. ` : ""}` +
       `${healed.length ? `Restored ${healed.length} blank variable(s) to the egg's default: ${healed.join(", ")}. ` : ""}` +
       `${input.startup ? "Startup command replaced. " : ""}${input.dockerImage ? `Docker image set to ${input.dockerImage}. ` : ""}` +
-      `Variables are read at boot, and a changed appid or library path only takes effect after a REINSTALL — restart alone is not enough.`
+      `Variables are read at boot, and a changed appid or library path only takes effect after a REINSTALL — restart alone is not enough.` +
+      (await this.fingerprints(secrets))
     );
   }
 
@@ -1459,13 +1493,20 @@ class Pelican {
    *  call (`PUT /startup/variable`), so a multi-variable change is a sequence of
    *  writes: they are applied in order and the result names exactly which ones
    *  landed, so a partial failure is recoverable rather than ambiguous. */
-  async updateStartupVariables(ref: string, variables: Record<string, string | number | boolean>): Promise<string> {
-    const keys = Object.keys(variables);
-    if (!keys.length) throw new Error("update_startup_variables needs at least one variable.");
+  async updateStartupVariables(
+    ref: string,
+    variables: Record<string, string | number | boolean> = {},
+    secretRefs?: SecretRef[],
+  ): Promise<string> {
+    const secrets = await this.secrets(secretRefs, "secretVariables");
+    const merged: Record<string, string | number | boolean> = { ...variables };
+    for (const s of secrets) merged[s.name] = s.value; // a secret wins a name collision
+    const keys = Object.keys(merged);
+    if (!keys.length) throw new Error("update_startup_variables needs at least one variable (or one secretVariables entry).");
     const done: string[] = [];
     for (const key of keys) {
       const path = `/servers/${encodeURIComponent(ref)}/startup/variable`;
-      const res = await this.request("client", path, { method: "PUT", body: { key, value: String(variables[key]) } });
+      const res = await this.request("client", path, { method: "PUT", body: { key, value: String(merged[key]) } });
       if (!res.ok) {
         const partial = done.length ? ` Already applied: ${done.join(", ")} — those are NOT rolled back.` : "";
         try {
@@ -1478,7 +1519,9 @@ class Pelican {
     }
     return (
       `Set ${done.length} startup variable(s) on Pelican server '${ref}': ${done.join(", ")} (values not echoed). ` +
-      `Most eggs only read startup variables at boot — restart the server for them to take effect.`
+      `${secrets.length ? `${secrets.length} of those came from the vault: ${secrets.map((s) => s.name).join(", ")}. ` : ""}` +
+      `Most eggs only read startup variables at boot — restart the server for them to take effect.` +
+      (await this.fingerprints(secrets))
     );
   }
 
@@ -1779,7 +1822,7 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
 
 async function withClient<T>(ctx: ToolContext, fn: (p: Pelican) => Promise<T>): Promise<T> {
   const cred = await ctx.getCredential();
-  return fn(new Pelican(ctx.target, cred));
+  return fn(new Pelican(ctx.target, cred, ctx));
 }
 
 const ok = (text: string): ToolResult => ({ text });
@@ -1793,6 +1836,25 @@ function run(fn: (p: Pelican, input: any) => Promise<string>) {
     }
   };
 }
+
+/**
+ * A vault-backed variable value. This is the ONLY way to set a game's password,
+ * RCON password or API token: the tools take no secret values, so nothing
+ * sensitive ever enters the chat/MCP channel or the model context. Mirrors
+ * Portainer's `secretEnv`.
+ */
+const secretVariableSchema = z.object({
+  name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "Egg variable name, e.g. PASSWORD."),
+  credentialRef: z.string().min(1).describe("Name of the Vaultwarden item holding the secret."),
+  field: z
+    .string()
+    .optional()
+    .describe("Which part of the item: username|password|secret|notes, or a custom field name. Default: password, else secret, else the 'token' field."),
+});
+const SECRET_VARS_DOC =
+  "Variables whose values are read from the vault at call time: [{name, credentialRef, field?}]. The value never appears in chat, " +
+  "results, audit logs or the model context — only a keyed fingerprint you can compare with the vault's. Wins over a same-named plain " +
+  "variable. NEVER put a password in the plain variables map; use request_credential to get it into the vault, then reference it here.";
 
 /** Client-API tools take this ref; application tools take the numeric id. */
 const SERVER_REF = z
@@ -2008,15 +2070,20 @@ function buildTools(target: Target): ConnectorTool[] {
           .record(z.union([z.string(), z.number(), z.boolean()]))
           .optional()
           .describe("Egg variables to override, e.g. {SERVER_NAME:'x'}. Anything you omit takes the EGG'S DEFAULT — you do not need to list them all, and an unknown name is refused."),
+        secretEnvironment: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),
         dockerImage: z.string().optional().describe("Override the egg's default docker image."),
         startup: z.string().optional().describe("Override the egg's startup command."),
         description: z.string().optional(),
         startOnCompletion: z.boolean().optional().describe("Start the server once installation finishes. Default false."),
       }),
       confirm: (input, t) => {
-        const i = input as { name: string; egg: string; allocation: string };
+        const i = input as { name: string; egg: string; allocation: string; secretEnvironment?: SecretRef[] };
         const o = options(t).ownerUserId;
-        return `Create Pelican server '${i.name}' (egg '${i.egg}', allocation ${i.allocation}, owner user ${o ?? "?"}) on ${t.name}`;
+        const fromVault = (i.secretEnvironment ?? []).map(describeSecretRef);
+        return (
+          `Create Pelican server '${i.name}' (egg '${i.egg}', allocation ${i.allocation}, owner user ${o ?? "?"}) on ${t.name}` +
+          (fromVault.length ? `, with ${fromVault.join(", ")}` : "")
+        );
       },
       run: run((p, i) => p.createServer(i)),
     },
@@ -2036,14 +2103,15 @@ function buildTools(target: Target): ConnectorTool[] {
           .record(z.union([z.string(), z.number(), z.boolean()]))
           .optional()
           .describe("Variable name → value. Unknown names are refused. Omitted variables keep their current value."),
+        secretVariables: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),
         startup: z.string().optional().describe("Replace the startup command. Omit to leave it alone."),
         dockerImage: z.string().optional().describe("Replace the docker image. Omit to leave it alone."),
         skipScripts: z.boolean().optional().describe("Skip the egg's install script on the next install. Default false."),
       }),
       confirm: (input, t) => {
-        const i = input as { id: number; variables?: Record<string, unknown>; startup?: string; dockerImage?: string };
+        const i = input as { id: number; variables?: Record<string, unknown>; secretVariables?: SecretRef[]; startup?: string; dockerImage?: string };
         // Names only — a startup variable's VALUE is frequently a password.
-        const names = Object.keys(i.variables ?? {});
+        const names = [...Object.keys(i.variables ?? {}), ...(i.secretVariables ?? []).map(describeSecretRef)];
         const parts = [
           names.length ? `variables [${names.join(", ")}]` : null,
           i.startup ? "a new startup command" : null,
@@ -2079,14 +2147,21 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "execute",
       inputSchema: z.object({
         server: SERVER_REF,
-        variables: z.record(z.union([z.string(), z.number(), z.boolean()])).describe("Variable name → value, e.g. {SERVER_NAME:'x', MAX_PLAYERS:10}."),
+        variables: z
+          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .optional()
+          .describe("Non-secret variable name → value, e.g. {SERVER_NAME:'x', MAX_PLAYERS:10}."),
+        secretVariables: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),
       }),
       confirm: (input, t) => {
-        const i = input as { server: string; variables: Record<string, unknown> };
-        // Names only — a startup variable's VALUE is frequently a password.
-        return `Set startup variables [${Object.keys(i.variables ?? {}).join(", ")}] on Pelican server '${i.server}' on ${t.name} (values not shown)`;
+        const i = input as { server: string; variables?: Record<string, unknown>; secretVariables?: SecretRef[] };
+        // Names only — a startup variable's VALUE is frequently a password. A
+        // vault-backed one names its ITEM too, so the approval says where the
+        // secret comes from without revealing it.
+        const names = [...Object.keys(i.variables ?? {}), ...(i.secretVariables ?? []).map(describeSecretRef)];
+        return `Set startup variables [${names.join(", ")}] on Pelican server '${i.server}' on ${t.name} (values not shown)`;
       },
-      run: run((p, i) => p.updateStartupVariables(i.server, i.variables)),
+      run: run((p, i) => p.updateStartupVariables(i.server, i.variables, i.secretVariables)),
     },
     {
       name: "create_schedule",
