@@ -186,7 +186,21 @@ const PORT_RANGE_RE = /^(\d{4,5})-(\d{4,5})$/;
  */
 export function expandPorts(ports: string[]): number[] {
   if (!ports.length) throw new Error("create_allocations needs at least one port.");
-  const out: number[] = [];
+  // Collected into a Set as we go, and the cap is checked on every insertion.
+  // Expanding everything first and checking afterwards would mean the guard runs
+  // only after the work it exists to prevent — the `ports` array itself has no
+  // length bound, so a few thousand wide ranges would exhaust the heap inside
+  // the expansion loop and never reach the check.
+  const seen = new Set<number>();
+  const add = (port: number): void => {
+    seen.add(port);
+    if (seen.size > MAX_PORTS_PER_CALL) {
+      throw new Error(
+        `That asks for more than ${MAX_PORTS_PER_CALL} distinct ports; this tool caps a single call at ${MAX_PORTS_PER_CALL}. ` +
+          `Split it into smaller calls — and double-check the range, because a game server normally needs a handful of ports, not hundreds.`,
+      );
+    }
+  };
   for (const raw of ports) {
     const spec = String(raw).trim();
     const range = PORT_RANGE_RE.exec(spec);
@@ -197,7 +211,7 @@ export function expandPorts(ports: string[]): number[] {
       if (start < PORT_FLOOR || end > PORT_CEIL) {
         throw new Error(`Port range '${spec}' is outside Pelican's allowed range ${PORT_FLOOR}-${PORT_CEIL}.`);
       }
-      for (let p = start; p <= end; p += 1) out.push(p);
+      for (let p = start; p <= end; p += 1) add(p);
       continue;
     }
     if (!/^\d+$/.test(spec)) {
@@ -210,16 +224,9 @@ export function expandPorts(ports: string[]): number[] {
     if (port < PORT_FLOOR || port > PORT_CEIL) {
       throw new Error(`Port ${port} is outside Pelican's allowed range ${PORT_FLOOR}-${PORT_CEIL}.`);
     }
-    out.push(port);
+    add(port);
   }
-  const unique = [...new Set(out)].sort((a, b) => a - b);
-  if (unique.length > MAX_PORTS_PER_CALL) {
-    throw new Error(
-      `That asks for ${unique.length} allocations in one call; this tool caps a single call at ${MAX_PORTS_PER_CALL}. ` +
-        `Split it into smaller calls — and double-check the range, because a game server normally needs a handful of ports, not hundreds.`,
-    );
-  }
-  return unique;
+  return [...seen].sort((a, b) => a - b);
 }
 
 /** A single literal IPv4 — CIDR is deliberately refused, see the tool description. */
@@ -312,8 +319,74 @@ export function parseEggContent(content: string): ParsedEgg {
 }
 
 /** Largest egg body accepted from a URL — real eggs are a few KiB; the install
- *  script is the only large part. Keeps a wrong URL from streaming a huge file. */
+ *  script is the only large part. Enforced WHILE reading, not after. */
 export const MAX_EGG_BYTES = 2 * 1024 * 1024;
+
+/** Redirect hops allowed when fetching an egg. Every hop is re-validated. */
+export const MAX_EGG_REDIRECTS = 5;
+
+/**
+ * IPv4 literals an outbound fetch must never reach. This is deliberately NOT
+ * `isPrivateIPv4`: that one answers "is this a LAN address I trust enough to send
+ * a bearer token to in clear", and RFC1918 is the right answer there. This one
+ * answers the opposite question — "could this address reach something inside the
+ * trust boundary" — and for that, RFC1918 alone is nowhere near enough: loopback,
+ * link-local (cloud metadata lives at 169.254.169.254), CGNAT and the
+ * multicast/reserved space are all local reach. Exported for testing.
+ */
+export function isBlockedFetchIPv4(ip: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return false;
+  const [a, b, c] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if ([a, b, c, Number(m[4])].some((n) => n > 255)) return false;
+  return (
+    a === 0 || // "this network" / 0.0.0.0
+    a === 127 || // loopback
+    a === 10 || // RFC1918
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) || // link-local, incl. 169.254.169.254 metadata
+    (a === 100 && b >= 64 && b <= 127) || // CGNAT
+    (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF protocol assignments / TEST-NET-1
+    (a === 198 && b >= 18 && b <= 19) || // benchmarking
+    (a === 198 && b === 51 && c === 100) || // TEST-NET-2
+    (a === 203 && b === 0 && c === 113) || // TEST-NET-3
+    a >= 224 // multicast, reserved (240/4), broadcast
+  );
+}
+
+/**
+ * IPv6 literals an outbound fetch must never reach: loopback/unspecified, the
+ * whole `::/96` special block (which is where IPv4-mapped and IPv4-compatible
+ * addresses live, and `::ffff:127.0.0.1` must not be a way around the v4 rules),
+ * unique-local, link-local, site-local and multicast. Exported for testing.
+ */
+export function isBlockedFetchIPv6(addr: string): boolean {
+  const a = addr.toLowerCase();
+  if (!a.includes(":")) return false;
+  if (a.startsWith("::")) {
+    // `::ffff:1.2.3.4` embeds a v4 address — decide it by the v4 rules so the
+    // mapped form can't smuggle loopback past this check.
+    const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(a);
+    if (mapped) return isBlockedFetchIPv4(mapped[1]!);
+    return true; // ::, ::1, and the rest of the special ::/96 block
+  }
+  const first = a.split(":")[0] ?? "";
+  if (!/^[0-9a-f]{1,4}$/.test(first)) return false;
+  const v = parseInt(first, 16);
+  const hi = v >> 8;
+  if (hi === 0xfc || hi === 0xfd) return true; // unique-local fc00::/7
+  if ((v & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((v & 0xffc0) === 0xfec0) return true; // site-local (deprecated) fec0::/10
+  if (hi === 0xff) return true; // multicast
+  return false;
+}
+
+/** Hostnames that resolve inside the network by convention rather than by literal
+ *  address. Name-based, so it is a backstop, not the whole guard. */
+function isLocalHostname(host: string): boolean {
+  return host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".home.arpa");
+}
 
 /**
  * Guard the egg source URL. Skeleton Key does the fetch, so an attacker-supplied
@@ -333,30 +406,102 @@ export function assertEggSourceUrl(raw: string): URL {
     throw new Error(`Refusing to fetch an egg over '${url.protocol}' — use https so the egg can't be swapped in transit.`);
   }
   const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (isPrivateIPv4(host) || host === "localhost" || host === "::1" || host.endsWith(".local") || host.endsWith(".internal")) {
+  if (isBlockedFetchIPv4(host) || isBlockedFetchIPv6(host) || isLocalHostname(host)) {
     throw new Error(
-      `Refusing to fetch an egg from '${url.hostname}' — that is a private/LAN address. This tool fetches from inside your network, ` +
-        `so it is restricted to public https sources (e.g. raw.githubusercontent.com). Paste the egg via 'content' instead.`,
+      `Refusing to fetch an egg from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ` +
+        `This tool fetches from inside your network, so it is restricted to public https sources (e.g. raw.githubusercontent.com). ` +
+        `Paste the egg via 'content' instead.`,
     );
   }
   return url;
 }
 
-/** Fetch an egg export from a public https URL, size- and time-bounded. */
+/**
+ * Read a response body, enforcing the size cap **while reading** rather than
+ * after. `await res.text()` would buffer the whole thing first, so a cap applied
+ * to the result bounds nothing: the memory has already been spent by the time it
+ * is consulted. The declared Content-Length is rejected up front when it is
+ * already over, and the stream is cancelled the moment the running total
+ * exceeds the cap.
+ */
+async function readCappedBody(res: Response, href: string): Promise<string> {
+  const tooBig = (n: number | string) =>
+    new Error(`The file at ${href} is ${n} bytes, larger than the ${MAX_EGG_BYTES}-byte limit for an egg. Check the URL points at an egg export.`);
+
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_EGG_BYTES) throw tooBig(declared);
+
+  const body = res.body as AsyncIterable<Uint8Array> | null | undefined;
+  // No streamable body (a test double, or a runtime without one) — fall back to
+  // buffering, but still measure BYTES: `string.length` counts UTF-16 code
+  // units, so a multibyte install script would undercount against a byte limit.
+  if (!body || typeof (body as any)[Symbol.asyncIterator] !== "function") {
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_EGG_BYTES) throw tooBig(Buffer.byteLength(text, "utf8"));
+    return text;
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of body) {
+    const buf = Buffer.from(chunk);
+    total += buf.byteLength;
+    if (total > MAX_EGG_BYTES) {
+      try {
+        await (res.body as ReadableStream | null)?.cancel();
+      } catch {
+        /* already closed */
+      }
+      throw tooBig(`over ${MAX_EGG_BYTES}`);
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Fetch an egg export from a public https URL, size- and time-bounded.
+ *
+ * Redirects are followed BY HAND (`redirect: "manual"`) so every hop passes
+ * `assertEggSourceUrl` again. The default `redirect: "follow"` would check only
+ * the URL the caller supplied and then quietly follow a 302 anywhere — including
+ * back to plain http, or to a LAN address the guard exists to refuse — which
+ * makes validating the first URL worth nothing.
+ */
 export async function fetchEggFromUrl(raw: string): Promise<string> {
-  const url = assertEggSourceUrl(raw);
-  let res: Response;
-  try {
-    res = await fetch(url.href, { headers: { Accept: "application/json, application/yaml, text/plain, */*" }, signal: AbortSignal.timeout(15_000) });
-  } catch (e) {
-    throw new Error(`Could not fetch the egg from ${url.href}: ${e instanceof Error ? e.message : String(e)}`);
+  let url = assertEggSourceUrl(raw);
+  for (let hop = 0; ; hop += 1) {
+    let res: Response;
+    try {
+      res = await fetch(url.href, {
+        headers: { Accept: "application/json, application/yaml, text/plain, */*" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (e) {
+      throw new Error(`Could not fetch the egg from ${url.href}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status} with no Location header.`);
+      if (hop >= MAX_EGG_REDIRECTS) {
+        throw new Error(`Could not fetch the egg from ${raw}: more than ${MAX_EGG_REDIRECTS} redirects.`);
+      }
+      let next: URL;
+      try {
+        next = new URL(location, url); // relative Location is legal
+      } catch {
+        throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status} with an unusable Location '${location}'.`);
+      }
+      // The whole point: re-run the guard on the hop we are about to take.
+      url = assertEggSourceUrl(next.href);
+      continue;
+    }
+
+    if (!res.ok) throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status}.`);
+    return readCappedBody(res, url.href);
   }
-  if (!res.ok) throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status}.`);
-  const text = await res.text();
-  if (text.length > MAX_EGG_BYTES) {
-    throw new Error(`The file at ${url.href} is ${text.length} bytes, larger than the ${MAX_EGG_BYTES}-byte limit for an egg. Check the URL points at an egg export.`);
-  }
-  return text;
 }
 
 // --- Response shapes (Fractal envelopes: {object, data:[{attributes}]}) -------
@@ -1226,6 +1371,10 @@ function buildTools(target: Target): ConnectorTool[] {
         ports: z
           .array(z.string())
           .min(1)
+          // Bounded here too: a spec yields at least one port, so more specs than
+          // the cap can never be valid, and the schema rejects it before any
+          // expansion runs at all.
+          .max(MAX_PORTS_PER_CALL)
           .describe(`Ports: '2456' or '2456-2458'. Range endpoints must be 4-5 digits. ${PORT_FLOOR}-${PORT_CEIL}, max ${MAX_PORTS_PER_CALL} per call.`),
         alias: z.string().max(255).optional().describe("Optional display alias for these allocations, e.g. 'valheim'."),
       }),

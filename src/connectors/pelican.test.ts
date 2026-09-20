@@ -11,8 +11,10 @@ import {
   expandPorts,
   assertAllocationIp,
   assertEggSourceUrl,
+  fetchEggFromUrl,
   parseEggContent,
   MAX_PORTS_PER_CALL,
+  MAX_EGG_BYTES,
   summarizeEggs,
   summarizeNodes,
   summarizeAllocations,
@@ -562,6 +564,19 @@ describe("port expansion (mirrors the panel's AssignmentService)", () => {
     expect(() => expandPorts(["2000-65535"])).toThrow(new RegExp(`caps a single call at ${MAX_PORTS_PER_CALL}`));
   });
 
+  it("trips the cap DURING expansion, so a pathological input can't exhaust the heap first", () => {
+    // Thousands of wide ranges: if the cap were applied after expanding, this
+    // would allocate ~129M entries before ever being checked.
+    const huge = Array.from({ length: 2000 }, () => "1024-65535");
+    const started = Date.now();
+    expect(() => expandPorts(huge)).toThrow(new RegExp(`caps a single call at ${MAX_PORTS_PER_CALL}`));
+    expect(Date.now() - started).toBeLessThan(1000); // bails immediately, not after 129M pushes
+  });
+
+  it("de-duplication does not falsely trip the cap", () => {
+    expect(expandPorts(Array.from({ length: 300 }, () => "2456"))).toEqual([2456]);
+  });
+
   it("refuses CIDR, which the panel would expand across every port", () => {
     expect(() => assertAllocationIp("192.168.0.0/24")).toThrow(/refuses CIDR/);
     expect(() => assertAllocationIp("192.168.0.999")).toThrow(/one literal IPv4/);
@@ -637,9 +652,111 @@ describe("import_egg", () => {
 
   it("only fetches eggs from public https (this fetch originates inside the LAN)", () => {
     expect(() => assertEggSourceUrl("http://raw.githubusercontent.com/x.json")).toThrow(/use https/);
-    expect(() => assertEggSourceUrl("https://192.168.0.48/secret")).toThrow(/private\/LAN address/);
-    expect(() => assertEggSourceUrl("https://localhost/x")).toThrow(/private\/LAN address/);
     expect(assertEggSourceUrl("https://raw.githubusercontent.com/x.json").host).toBe("raw.githubusercontent.com");
+  });
+
+  // RFC1918 alone is NOT the right rule for an outbound fetch: loopback,
+  // link-local (cloud metadata), CGNAT and IPv6 private space are all local
+  // reach, and `::ffff:127.0.0.1` must not smuggle loopback past the v4 check.
+  it.each([
+    ["https://192.168.0.48/x", "RFC1918"],
+    ["https://10.0.0.1/x", "RFC1918"],
+    ["https://172.16.5.5/x", "RFC1918"],
+    ["https://127.0.0.1/x", "loopback"],
+    ["https://127.0.0.1:8443/admin", "loopback with port"],
+    ["https://0.0.0.0/x", "unspecified"],
+    ["https://169.254.169.254/latest/meta-data/", "cloud metadata"],
+    ["https://100.64.0.1/x", "CGNAT"],
+    ["https://224.0.0.1/x", "multicast"],
+    ["https://255.255.255.255/x", "broadcast"],
+    ["https://[::1]/x", "IPv6 loopback"],
+    ["https://[fd00::1]/x", "IPv6 unique-local"],
+    ["https://[fe80::1]/x", "IPv6 link-local"],
+    ["https://[::ffff:127.0.0.1]/x", "IPv4-mapped loopback"],
+    ["https://localhost/x", "localhost"],
+    ["https://panel.local/x", ".local"],
+    ["https://svc.internal/x", ".internal"],
+  ])("refuses %s (%s)", (url) => {
+    expect(() => assertEggSourceUrl(url)).toThrow(/inside the network/);
+  });
+
+  it("re-validates EVERY redirect hop — a public URL must not be able to bounce into the LAN", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        seen.push(url);
+        return {
+          ok: false,
+          status: 302,
+          statusText: "",
+          headers: { get: (h: string) => (h.toLowerCase() === "location" ? "http://192.168.0.1/admin" : null) },
+          text: async () => "",
+        } as any;
+      }),
+    );
+    await expect(fetchEggFromUrl("https://raw.githubusercontent.com/valheim.json")).rejects.toThrow(/inside the network|use https/);
+    // The redirect target was never requested.
+    expect(seen).toEqual(["https://raw.githubusercontent.com/valheim.json"]);
+  });
+
+  it("follows a redirect that stays public, and stops after the hop limit", async () => {
+    let hops = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        hops += 1;
+        return {
+          ok: false,
+          status: 302,
+          statusText: "",
+          headers: { get: (h: string) => (h.toLowerCase() === "location" ? `https://cdn.example.com/${hops}.json` : null) },
+          text: async () => "",
+        } as any;
+      }),
+    );
+    await expect(fetchEggFromUrl("https://raw.githubusercontent.com/valheim.json")).rejects.toThrow(/more than 5 redirects/);
+    expect(hops).toBe(6); // initial + 5 allowed hops, then refused
+  });
+
+  it("rejects an oversized body from Content-Length without reading it", async () => {
+    let read = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "",
+        headers: { get: (h: string) => (h.toLowerCase() === "content-length" ? String(MAX_EGG_BYTES + 1) : null) },
+        text: async () => {
+          read = true;
+          return "x";
+        },
+      })) as any,
+    );
+    await expect(fetchEggFromUrl("https://raw.githubusercontent.com/huge.json")).rejects.toThrow(/larger than the/);
+    expect(read).toBe(false);
+  });
+
+  it("stops reading a streamed body once it passes the cap, instead of buffering it all", async () => {
+    let emitted = 0;
+    const chunk = Buffer.alloc(256 * 1024, 0x61);
+    const body = {
+      async *[Symbol.asyncIterator]() {
+        for (;;) {
+          emitted += 1;
+          yield chunk; // an endless body, with no Content-Length to catch it
+        }
+      },
+      cancel: async () => {},
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, statusText: "", headers: { get: () => null }, body, text: async () => "" })) as any,
+    );
+    await expect(fetchEggFromUrl("https://raw.githubusercontent.com/endless.json")).rejects.toThrow(/larger than the/);
+    // 2 MiB cap / 256 KiB chunks = 8 chunks, and the 9th trips it. Bounded, not endless.
+    expect(emitted).toBeLessThanOrEqual(9);
   });
 
   it("sends the egg document as the RAW body (not a JSON envelope) and reports the new egg", async () => {
