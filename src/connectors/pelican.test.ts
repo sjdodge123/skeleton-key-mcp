@@ -331,9 +331,28 @@ describe("create_server", () => {
     { id: 11, ip: "192.168.0.48", port: 2456, assigned: false },
     { id: 12, ip: "192.168.0.48", port: 2500, assigned: true },
   ]);
+  /** The egg's variables, with the defaults create_server must fill in. */
+  const eggWithVars = item({
+    id: 5,
+    name: "Valheim",
+    relationships: {
+      variables: {
+        data: [
+          { attributes: { env_variable: "SERVER_NAME", default_value: "My Server", user_editable: true } },
+          { attributes: { env_variable: "SRCDS_APPID", default_value: "896660", user_editable: false } },
+          { attributes: { env_variable: "LD_LIBRARY_PATH", default_value: "./linux64", user_editable: false } },
+          { attributes: { env_variable: "PASSWORD", default_value: "secret", user_editable: true } },
+          { attributes: { env_variable: "SRCDS_BETAID", default_value: null, user_editable: true } },
+        ],
+      },
+    },
+  });
+
   function mock(storeReply: { status?: number; json?: unknown } = { json: item({ id: 9, name: "valheim", identifier: "abc123", uuid: "u-9" }) }) {
     return mockFetch([
       { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: storeReply },
+      // Must come before the generic /eggs route — this is the variables lookup.
+      { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggWithVars } },
       { match: (u) => u.includes("/eggs"), reply: { json: eggs } },
       { match: (u) => u.includes("/allocations"), reply: { json: allocs } },
       { match: (u) => u.includes("/nodes"), reply: { json: nodes } },
@@ -350,9 +369,97 @@ describe("create_server", () => {
     expect(authOn(post)).toBe(`Bearer ${APP}`);
     const body = JSON.parse(post.init.body);
     expect(body).toMatchObject({ name: "valheim", user: 7, egg: 5, allocation: { default: 11 } });
-    expect(body.environment).toEqual({}); // 'present|array' — must be sent even when empty
     expect(body.limits).toMatchObject({ memory: 4096, disk: 10240, cpu: 0 });
     expect(body.feature_limits).toMatchObject({ databases: 0, allocations: 1, backups: 1 });
+  });
+
+  // The bug this guards: Pelican stores an empty string for every variable the
+  // request omits, and EnvironmentService resolves `server_value ?? default` —
+  // `??` does not catch "", so the blank wins over the egg's default forever. A
+  // real Valheim server provisioned this way ran `+app_update ""`, downloaded no
+  // game files and crash-looped.
+  it("sends EVERY egg variable, filling omitted ones from the egg's defaults", async () => {
+    const calls = mock();
+    const res = await tool("create_server").run(
+      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", environment: { SERVER_NAME: "Jake's server" } },
+      ctx(),
+    );
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(writes(calls)[0]!.init.body);
+    expect(body.environment).toEqual({
+      SERVER_NAME: "Jake's server", // caller's value wins
+      SRCDS_APPID: "896660", // read-only default — the one that broke the install
+      LD_LIBRARY_PATH: "./linux64",
+      PASSWORD: "secret",
+      SRCDS_BETAID: "", // a null default becomes an empty string, as the panel expects
+    });
+    // Names are reported so the operator can see what was assumed; values are not.
+    expect(res.text).toContain("SRCDS_APPID");
+    expect(res.text).not.toContain("secret");
+  });
+
+  it("refuses an unknown variable name rather than letting Pelican silently ignore it", async () => {
+    const calls = mock();
+    const res = await tool("create_server").run(
+      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", environment: { SREVER_NAME: "typo" } },
+      ctx(),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("'SREVER_NAME'");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED when the panel does not return the variables include", async () => {
+    // An empty variable list would produce an empty environment — i.e. blank out
+    // every variable — so this must refuse rather than guess.
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9 }) } },
+      { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: item({ id: 5, name: "Valheim" }) } }, // no relationships
+      { match: (u) => u.includes("/eggs"), reply: { json: eggs } },
+      { match: (u) => u.includes("/allocations"), reply: { json: allocs } },
+      { match: (u) => u.includes("/nodes"), reply: { json: nodes } },
+    ]);
+    const res = await tool("create_server").run({ name: "v", egg: "Valheim", allocation: "192.168.0.48:2456" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/variables.*include|stored EMPTY/);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("attaches additional allocations at creation and raises the allocation limit to fit", async () => {
+    const calls = mockFetch([
+      { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9, identifier: "abc123" }) } },
+      { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggWithVars } },
+      { match: (u) => u.includes("/eggs"), reply: { json: eggs } },
+      {
+        match: (u) => u.includes("/allocations"),
+        reply: {
+          json: list([
+            { id: 11, ip: "192.168.0.48", port: 2456, assigned: false },
+            { id: 12, ip: "192.168.0.48", port: 2457, assigned: false },
+          ]),
+        },
+      },
+      { match: (u) => u.includes("/nodes"), reply: { json: nodes } },
+    ]);
+    const res = await tool("create_server").run(
+      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", additionalAllocations: ["192.168.0.48:2457"] },
+      ctx(),
+    );
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(writes(calls)[0]!.init.body);
+    expect(body.allocation).toEqual({ default: 11, additional: [12] });
+    expect(body.feature_limits.allocations).toBe(2); // default + 1, without being asked
+  });
+
+  it("refuses an additional allocation that is also the default", async () => {
+    const calls = mock();
+    const res = await tool("create_server").run(
+      { name: "v", egg: "Valheim", allocation: "192.168.0.48:2456", additionalAllocations: ["192.168.0.48:2456"] },
+      ctx(),
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/already the default allocation/);
+    expect(writes(calls)).toHaveLength(0);
   });
 
   it("refuses an allocation that is already assigned", async () => {
@@ -447,6 +554,83 @@ describe("update_startup_variables", () => {
     expect(c).toContain("[SERVER_PASSWORD]");
     expect(c).toContain("values not shown");
     expect(c).not.toContain("hunter2");
+  });
+});
+
+describe("update_server_startup (the admin-API repair path)", () => {
+  const eggVars = item({
+    id: 5,
+    relationships: {
+      variables: {
+        data: [
+          { attributes: { env_variable: "SERVER_NAME", default_value: "My Server", user_editable: true } },
+          { attributes: { env_variable: "SRCDS_APPID", default_value: "896660", user_editable: false } },
+          { attributes: { env_variable: "LD_LIBRARY_PATH", default_value: "./linux64", user_editable: false } },
+          { attributes: { env_variable: "WORLD", default_value: "Dedicated", user_editable: true } },
+        ],
+      },
+    },
+  });
+  /** A server damaged by a partial write: the read-only vars are blank. */
+  const damaged = item({
+    id: 125,
+    name: "Valheim",
+    egg: 5,
+    container: { environment: { SERVER_NAME: "Valheim", WORLD: "Dedicated", SRCDS_APPID: "", LD_LIBRARY_PATH: "" } },
+  });
+  const routes = () => [
+    { match: (u: string, i: any) => u.includes("/startup") && i?.method === "PATCH", reply: { json: item({ id: 125 }) } },
+    { match: (u: string) => /\/eggs\/\d+/.test(u), reply: { json: eggVars } },
+    { match: (u: string) => /\/servers\/\d+/.test(u), reply: { json: damaged } },
+  ];
+
+  it("uses the APPLICATION key — the client key's per-variable route 400s on read-only vars", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_startup").run({ id: 125, variables: { SRCDS_APPID: "896660" } }, ctx());
+    expect(res.isError).toBeFalsy();
+    const patch = writes(calls)[0]!;
+    expect(patch.url).toContain("/api/application/servers/125/startup");
+    expect(authOn(patch)).toBe(`Bearer ${APP}`);
+    expect(patch.init.method).toBe("PATCH");
+  });
+
+  it("sends the COMPLETE environment and keeps current values for variables it wasn't given", async () => {
+    // The route replaces `environment` wholesale, so a partial send would blank
+    // everything else — the very bug this tool exists to repair.
+    const calls = mockFetch(routes());
+    await tool("update_server_startup").run({ id: 125, variables: { WORLD: "Midgard" } }, ctx());
+    const body = JSON.parse(writes(calls)[0]!.init.body);
+    expect(body.environment).toEqual({
+      WORLD: "Midgard", // the caller's change
+      SERVER_NAME: "Valheim", // current value preserved, not reset to the egg default
+      SRCDS_APPID: "896660", // was BLANK → healed from the egg default
+      LD_LIBRARY_PATH: "./linux64", // was BLANK → healed
+    });
+    expect(body.egg).toBe(5); // current egg — must never migrate the server
+    expect(body.skip_scripts).toBe(false);
+  });
+
+  it("reports which blank variables it healed, and never echoes values", async () => {
+    mockFetch(routes());
+    const res = await tool("update_server_startup").run({ id: 125, variables: { SERVER_NAME: "hunter2" } }, ctx());
+    expect(res.text).toContain("SRCDS_APPID");
+    expect(res.text).toContain("LD_LIBRARY_PATH");
+    expect(res.text).not.toContain("hunter2");
+    expect(res.text).toMatch(/REINSTALL/);
+  });
+
+  it("refuses an unknown variable name", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_startup").run({ id: 125, variables: { NOT_A_VAR: "x" } }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("'NOT_A_VAR'");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("confirm names the variables and flags that this path can write read-only ones", () => {
+    expect(tool("update_server_startup").confirm!({ id: 125, variables: { SRCDS_APPID: "896660" } }, target({ ownerUserId: 7 }))).toBe(
+      "Set variables [SRCDS_APPID] on Pelican server [125] on pelican-panel via the admin API (can write read-only variables; values not shown)",
+    );
   });
 });
 
@@ -833,6 +1017,7 @@ describe("connector wiring", () => {
       "import_egg",
       "power_action",
       "update_schedule",
+      "update_server_startup",
       "update_startup_variables",
     ]);
     // Every execute tool must carry confirm text — the approval gate keys off it.
