@@ -518,6 +518,18 @@ interface Egg {
   docker_images?: Record<string, string> | string[];
   [k: string]: unknown;
 }
+/** One egg variable, as the panel's EggVariableTransformer returns it (a raw
+ *  model `toArray()`). `default_value` is the value the panel uses when a server
+ *  does not override it — the thing `create_server` must not drop. */
+interface EggVariable {
+  env_variable: string;
+  name?: string;
+  default_value?: string | null;
+  user_editable?: boolean;
+  user_viewable?: boolean;
+  rules?: string | string[];
+  [k: string]: unknown;
+}
 interface Node {
   id: number;
   name?: string;
@@ -579,6 +591,52 @@ interface ScheduleTask {
   time_offset?: number;
   sequence_id?: number;
   continue_on_failure?: boolean;
+}
+
+/**
+ * Build the COMPLETE environment for a server from the egg's variables plus
+ * whatever the caller supplied.
+ *
+ * **Why this has to exist.** Pelican treats the `environment` map as the whole
+ * truth: any egg variable the request omits is stored as an empty string, and
+ * `EnvironmentService` resolves values with `server_value ?? default_value` —
+ * `??` catches null but NOT `""`, so a stored blank permanently beats the egg's
+ * default. Passing a partial environment therefore does not mean "use defaults
+ * for the rest", it means "blank the rest", and nothing in the API says so. A
+ * Valheim server provisioned that way installed with `+app_update ""`, fetched
+ * no game files, and crash-looped on boot.
+ *
+ * A name that is not one of the egg's variables is refused rather than passed
+ * through, because Pelican would accept and ignore it — a typo'd variable would
+ * silently do nothing while looking like it had been set.
+ *
+ * Returns the full map plus the names that fell back to defaults, so the caller
+ * can say what it filled in. Values are never echoed (they include passwords).
+ * Exported for testing.
+ */
+export function buildEnvironment(
+  variables: EggVariable[],
+  supplied: Record<string, string | number | boolean> = {},
+): { environment: Record<string, string>; defaulted: string[] } {
+  const known = new Map(variables.map((v) => [v.env_variable, v]));
+  const unknown = Object.keys(supplied).filter((k) => !known.has(k));
+  if (unknown.length) {
+    throw new Error(
+      `This egg has no variable named ${unknown.map((u) => `'${u}'`).join(", ")}. Its variables are: ${[...known.keys()].join(", ")}. ` +
+        `Pelican would accept an unknown name and ignore it, so a typo would look like it worked — hence the refusal.`,
+    );
+  }
+  const environment: Record<string, string> = {};
+  const defaulted: string[] = [];
+  for (const [name, variable] of known) {
+    if (Object.prototype.hasOwnProperty.call(supplied, name)) {
+      environment[name] = String(supplied[name]);
+    } else {
+      environment[name] = variable.default_value == null ? "" : String(variable.default_value);
+      defaulted.push(name);
+    }
+  }
+  return { environment, defaulted };
 }
 
 // --- Summarizers (whitelisted fields; exported for testing) ------------------
@@ -865,6 +923,29 @@ class Pelican {
     return matches[0]!;
   }
 
+  /**
+   * An egg's variables, with their defaults. **Fails closed**: if the API does
+   * not return the `variables` include at all, this throws rather than yielding
+   * an empty list — an empty list would make `buildEnvironment` produce an empty
+   * environment, which is exactly the blank-out bug it exists to prevent. An egg
+   * that genuinely has no variables returns an empty `data` array, which is fine
+   * and distinguishable.
+   */
+  private async eggVariables(eggId: number): Promise<EggVariable[]> {
+    const path = `/eggs/${eggId}`;
+    const res = await this.request("application", path, { query: { include: "variables" } });
+    this.ensureOk(res, path);
+    const attrs = (res.json as { attributes?: { relationships?: { variables?: { data?: { attributes?: EggVariable }[] } } } })?.attributes;
+    const rel = attrs?.relationships?.variables;
+    if (!rel || !Array.isArray(rel.data)) {
+      throw new Error(
+        `Could not read egg ${eggId}'s variables — the panel did not return the 'variables' include. Refusing to continue: without the ` +
+          `defaults, every variable not named explicitly would be stored EMPTY, which silently breaks the install (blank appid, blank library path).`,
+      );
+    }
+    return rel.data.map((r) => r.attributes).filter((v): v is EggVariable => !!v && typeof v.env_variable === "string");
+  }
+
   /** Resolve an allocation by id or "ip:port", scanning every node. Refuses one
    *  that is already assigned — reusing it would move another server's port. */
   private async resolveAllocation(ref: string): Promise<{ alloc: Allocation; nodeId: number }> {
@@ -996,6 +1077,7 @@ class Pelican {
     name: string;
     egg: string;
     allocation: string;
+    additionalAllocations?: string[];
     memory?: number;
     disk?: number;
     cpu?: number;
@@ -1019,6 +1101,29 @@ class Pelican {
     const egg = await this.resolveEgg(input.egg);
     const { alloc } = await this.resolveAllocation(input.allocation);
 
+    // The egg's own variables decide the environment. Sending only what the
+    // caller named would blank every other variable — see buildEnvironment.
+    const { environment, defaulted } = buildEnvironment(await this.eggVariables(egg.id), input.environment ?? {});
+
+    // Extra ports (a game's query port, RCON, …). Pelican accepts these at
+    // creation as `allocation.additional`; the alternative route takes no port
+    // argument and picks from the free pool at random, which is no good when a
+    // specific port is what the game needs.
+    const additional: number[] = [];
+    for (const ref of input.additionalAllocations ?? []) {
+      const { alloc: extra } = await this.resolveAllocation(ref);
+      if (extra.id === alloc.id) throw new Error(`Allocation '${ref}' is already the default allocation; list it only once.`);
+      if (additional.includes(extra.id)) throw new Error(`Allocation '${ref}' is listed twice in additionalAllocations.`);
+      additional.push(extra.id);
+    }
+    const allocationLimit = input.allocations ?? 1 + additional.length;
+    if (allocationLimit < 1 + additional.length) {
+      throw new Error(
+        `allocations is ${allocationLimit} but this server needs ${1 + additional.length} (the default plus ${additional.length} additional). ` +
+          `Raise it, or pass fewer additionalAllocations.`,
+      );
+    }
+
     const body = {
       name: input.name.trim(),
       description: input.description ?? "",
@@ -1026,7 +1131,7 @@ class Pelican {
       egg: egg.id,
       // `environment` is `present|array` — always send it, even empty, or the
       // request fails validation before it reaches the egg's own variable rules.
-      environment: input.environment ?? {},
+      environment,
       ...(input.dockerImage ? { docker_image: input.dockerImage } : {}),
       ...(input.startup ? { startup: input.startup } : {}),
       limits: {
@@ -1038,10 +1143,10 @@ class Pelican {
       },
       feature_limits: {
         databases: input.databases ?? 0,
-        allocations: input.allocations ?? 1,
+        allocations: allocationLimit,
         backups: input.backups ?? 1,
       },
-      allocation: { default: alloc.id },
+      allocation: { default: alloc.id, ...(additional.length ? { additional } : {}) },
       start_on_completion: input.startOnCompletion ?? false,
     };
     const path = "/servers";
@@ -1050,9 +1155,82 @@ class Pelican {
     const created: Partial<Server> = (res.json as { attributes?: Server })?.attributes ?? {};
     return (
       `Created Pelican server '${created.name ?? input.name}' [id ${created.id ?? "?"}] identifier=${created.identifier ?? "?"} uuid=${created.uuid ?? "?"} ` +
-      `on egg '${egg.name ?? egg.id}', allocation ${alloc.ip}:${alloc.port} [${alloc.id}], owner user ${owner}. ` +
+      `on egg '${egg.name ?? egg.id}', allocation ${alloc.ip}:${alloc.port} [${alloc.id}]` +
+      `${additional.length ? ` plus ${additional.length} additional allocation(s) [${additional.join(", ")}]` : ""}, owner user ${owner}. ` +
+      `${defaulted.length ? `${defaulted.length} egg variable(s) took their default: ${defaulted.join(", ")} (values not echoed). ` : "Every egg variable was supplied explicitly. "}` +
       `The panel installs it in the background — poll server_resources (or list_servers) until it leaves 'installing'. ` +
       `Use the identifier/uuid (not the numeric id) for power, startup and schedule tools.`
+    );
+  }
+
+  /**
+   * Update a server's startup settings through the APPLICATION API, which the
+   * panel runs at admin level — the only route that can write a variable the egg
+   * marks `user_editable: false` (a game's appid, library path, console filter).
+   * The Client API's per-variable route answers HTTP 400 "read-only" for those,
+   * so this is the repair path when such a variable is wrong or blank.
+   *
+   * The route takes `environment` as the WHOLE map and replaces it, which is the
+   * same shape that blanks variables on create. So this reads the server's
+   * current environment and the egg's defaults and sends a complete, merged set:
+   *  - a variable the caller names takes the caller's value;
+   *  - one currently holding a real value keeps it;
+   *  - one currently BLANK falls back to the egg's default, which repairs a
+   *    server damaged by an earlier partial write. Those are reported by name.
+   */
+  async updateServerStartup(input: {
+    id: number;
+    variables?: Record<string, string | number | boolean>;
+    startup?: string;
+    dockerImage?: string;
+    skipScripts?: boolean;
+  }): Promise<string> {
+    const server = await this.item<Server>("application", `/servers/${input.id}`);
+    if (!server?.id) throw new Error(`No Pelican server with id ${input.id}. Use list_servers — this tool takes the NUMERIC id, not the identifier.`);
+    const eggId = Number(server.egg);
+    if (!Number.isFinite(eggId)) throw new Error(`Pelican server ${input.id} has no egg id; cannot resolve its variables.`);
+
+    const variables = await this.eggVariables(eggId);
+    const current = ((server.container as { environment?: Record<string, unknown> } | undefined)?.environment ?? {}) as Record<string, unknown>;
+
+    const supplied = input.variables ?? {};
+    // Reuse buildEnvironment for the unknown-name check and the default fill…
+    const { environment } = buildEnvironment(variables, supplied);
+    // …then let any real current value win over the default, so this is a
+    // partial update rather than a reset. A BLANK current value deliberately
+    // does not win — that is the damage being repaired.
+    const healed: string[] = [];
+    for (const variable of variables) {
+      const name = variable.env_variable;
+      if (Object.prototype.hasOwnProperty.call(supplied, name)) continue;
+      const live = current[name];
+      if (typeof live === "string" && live !== "") {
+        environment[name] = live;
+      } else if (environment[name] !== "") {
+        healed.push(name); // was blank, now restored to the egg's default
+      }
+    }
+
+    const path = `/servers/${input.id}/startup`;
+    const res = await this.request("application", path, {
+      method: "PATCH",
+      body: {
+        egg: eggId, // required by the route; send the CURRENT egg so this never migrates the server
+        environment,
+        skip_scripts: input.skipScripts ?? false,
+        ...(input.startup ? { startup: input.startup } : {}),
+        ...(input.dockerImage ? { image: input.dockerImage } : {}),
+      },
+    });
+    this.ensureOk(res, path);
+
+    const changed = Object.keys(supplied);
+    return (
+      `Updated startup on Pelican server '${server.name ?? input.id}' [${input.id}] via the admin API. ` +
+      `${changed.length ? `Set: ${changed.join(", ")} (values not echoed). ` : "No variable values were changed. "}` +
+      `${healed.length ? `Restored ${healed.length} blank variable(s) to the egg's default: ${healed.join(", ")}. ` : ""}` +
+      `${input.startup ? "Startup command replaced. " : ""}${input.dockerImage ? `Docker image set to ${input.dockerImage}. ` : ""}` +
+      `Variables are read at boot, and a changed appid or library path only takes effect after a REINSTALL — restart alone is not enough.`
     );
   }
 
@@ -1428,6 +1606,12 @@ function buildTools(target: Target): ConnectorTool[] {
         name: z.string().min(1).describe("Server name, e.g. 'valheim'."),
         egg: z.string().describe("Egg id or exact name from list_eggs."),
         allocation: z.string().describe("Allocation id, or 'ip:port' from list_allocations. Must be FREE."),
+        additionalAllocations: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Extra FREE allocations to attach at creation (ids or 'ip:port'), e.g. a game's query port. Use this rather than assign_allocation, which takes no port argument and picks from the free pool at random.",
+          ),
         memory: z.number().int().min(0).optional().describe("Memory limit MiB (default 4096; 0 = unlimited)."),
         disk: z.number().int().min(0).optional().describe("Disk limit MiB (default 10240; 0 = unlimited)."),
         cpu: z.number().int().min(0).optional().describe("CPU limit % (default 0 = unlimited)."),
@@ -1435,8 +1619,11 @@ function buildTools(target: Target): ConnectorTool[] {
         io: z.number().int().optional().describe("Block IO weight (default 500)."),
         databases: z.number().int().min(0).optional().describe("Database limit (default 0)."),
         backups: z.number().int().min(0).optional().describe("Backup limit (default 1)."),
-        allocations: z.number().int().min(1).optional().describe("Max allocations this server may hold (default 1)."),
-        environment: z.record(z.union([z.string(), z.number(), z.boolean()])).optional().describe("Egg variables, e.g. {SERVER_NAME:'x'}. Required ones come from the egg."),
+        allocations: z.number().int().min(1).optional().describe("Max allocations this server may hold (default: 1 + additionalAllocations)."),
+        environment: z
+          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .optional()
+          .describe("Egg variables to override, e.g. {SERVER_NAME:'x'}. Anything you omit takes the EGG'S DEFAULT — you do not need to list them all, and an unknown name is refused."),
         dockerImage: z.string().optional().describe("Override the egg's default docker image."),
         startup: z.string().optional().describe("Override the egg's startup command."),
         description: z.string().optional(),
@@ -1448,6 +1635,39 @@ function buildTools(target: Target): ConnectorTool[] {
         return `Create Pelican server '${i.name}' (egg '${i.egg}', allocation ${i.allocation}, owner user ${o ?? "?"}) on ${t.name}`;
       },
       run: run((p, i) => p.createServer(i)),
+    },
+    {
+      name: "update_server_startup",
+      description:
+        `Set a Pelican server's startup variables on ${target.name} through the ADMIN (application) API, by NUMERIC server id. ` +
+        `Unlike update_startup_variables — which goes through the Client API and answers HTTP 400 'read-only' for variables the egg ` +
+        `marks user_editable:false (a game's appid, library path, console filter) — this route runs at admin level and can write them. ` +
+        `It is a partial update: variables you don't name keep their current value, EXCEPT ones currently blank, which are restored to ` +
+        `the egg's default and reported (that repairs a server damaged by an earlier partial write). Can also replace the startup ` +
+        `command or docker image. A changed appid or library path needs a REINSTALL, not just a restart.`,
+      tier: "execute",
+      inputSchema: z.object({
+        id: z.number().int().positive().describe("Numeric application server id from list_servers (NOT the short identifier)."),
+        variables: z
+          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .optional()
+          .describe("Variable name → value. Unknown names are refused. Omitted variables keep their current value."),
+        startup: z.string().optional().describe("Replace the startup command. Omit to leave it alone."),
+        dockerImage: z.string().optional().describe("Replace the docker image. Omit to leave it alone."),
+        skipScripts: z.boolean().optional().describe("Skip the egg's install script on the next install. Default false."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { id: number; variables?: Record<string, unknown>; startup?: string; dockerImage?: string };
+        // Names only — a startup variable's VALUE is frequently a password.
+        const names = Object.keys(i.variables ?? {});
+        const parts = [
+          names.length ? `variables [${names.join(", ")}]` : null,
+          i.startup ? "a new startup command" : null,
+          i.dockerImage ? `image ${i.dockerImage}` : null,
+        ].filter(Boolean);
+        return `Set ${parts.join(" + ") || "nothing"} on Pelican server [${i.id}] on ${t.name} via the admin API (can write read-only variables; values not shown)`;
+      },
+      run: run((p, i) => p.updateServerStartup(i)),
     },
     {
       name: "power_action",
