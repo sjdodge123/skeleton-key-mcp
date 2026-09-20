@@ -2,6 +2,8 @@ import { z } from "zod";
 import yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
+import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } from "./ssh-exec.js";
+import { checkCommand } from "./command-policy.js";
 
 /**
  * Pelican Panel connector — inventory, provisioning, power and schedules for a
@@ -45,6 +47,21 @@ const optionsSchema = z
      * client key can never reach the admin's own servers.
      */
     ownerUserId: z.number().int().positive().optional(),
+    /**
+     * Name of the registered **ssh** target for the machine the panel is
+     * installed on. Required by `panel_version` and `panel_upgrade`: Pelican
+     * exposes no version or upgrade endpoint on ANY of its API surfaces
+     * (application, client, web, remote) — it reads its own version from
+     * `config/app.php` and checks GitHub in the browser — so those two are
+     * necessarily host-level work rather than API calls.
+     */
+    sshTarget: z.string().optional(),
+    /** Where the panel is installed on that host. Must be an absolute path with
+     *  no shell metacharacters — it is interpolated into fixed commands. */
+    panelPath: z.string().default("/var/www/pelican"),
+    /** Unix user that owns the panel files; artisan/composer run as this user so
+     *  the upgrade cannot leave root-owned files the webserver can't write. */
+    panelUser: z.string().default("www-data"),
     /** Skip TLS verification for THIS target only (self-signed LAN panel). */
     insecureTLS: z.boolean().default(false),
   })
@@ -502,6 +519,199 @@ export async function fetchEggFromUrl(raw: string): Promise<string> {
     if (!res.ok) throw new Error(`Could not fetch the egg from ${url.href}: HTTP ${res.status}.`);
     return readCappedBody(res, url.href);
   }
+}
+
+// --- Panel host (SSH) --------------------------------------------------------
+
+/**
+ * A path safe to interpolate into a fixed shell command: absolute, and made only
+ * of characters that cannot end a word or start a new one. This is what lets the
+ * upgrade steps claim "no caller input is interpolated" — `panelPath` comes from
+ * the target's options (operator-set, via register/update_target), and even then
+ * it has to survive this. Exported for testing.
+ */
+export function assertSafePath(path: string, field: string): string {
+  const trimmed = path.trim();
+  if (!/^\/[A-Za-z0-9._\-/]*$/.test(trimmed) || trimmed.includes("..")) {
+    throw new Error(
+      `The Pelican target's '${field}' must be an absolute path made of letters, digits, dot, dash, underscore and '/' (got '${path}'). ` +
+        `It is interpolated into shell commands run on the panel host, so anything else is refused.`,
+    );
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+/** Same idea for the unix user the panel runs as. Exported for testing. */
+export function assertSafeUser(user: string, field: string): string {
+  const trimmed = user.trim();
+  if (!/^[A-Za-z_][A-Za-z0-9._-]*$/.test(trimmed)) {
+    throw new Error(`The Pelican target's '${field}' must be a plain unix username (got '${user}').`);
+  }
+  return trimmed;
+}
+
+/** The panel's host, resolved from the target's `sshTarget` option. */
+interface PanelHost {
+  target: Target;
+  cred: Credential;
+  path: string;
+  user: string;
+}
+
+/**
+ * Resolve the SSH target that hosts the panel.
+ *
+ * This is the one place a connector reaches another target, so the checks are
+ * deliberately strict and each failure says exactly what to fix: the option must
+ * be set, the name must resolve, and the resolved target must actually be of
+ * type `ssh`. That last check matters — without it, a typo'd name pointing at,
+ * say, the UniFi target would have this connector trying to open a shell on the
+ * gateway.
+ */
+async function panelHost(ctx: ToolContext): Promise<PanelHost> {
+  const opts = options(ctx.target);
+  const name = opts.sshTarget;
+  if (!name) {
+    throw new Error(
+      `This Pelican target has no 'sshTarget' option, so there is no host to run this on. Pelican has no version or upgrade endpoint on ` +
+        `any API half, so both are host-level operations. Fix with update_target: set sshTarget to the name of the registered ssh target ` +
+        `for the machine the panel is installed on (see list_targets).`,
+    );
+  }
+  if (!ctx.resolveTarget || !ctx.resolveCredential) {
+    throw new Error("This call site cannot resolve other targets, so panel host operations are unavailable here.");
+  }
+  const host = ctx.resolveTarget(name);
+  if (!host) throw new Error(`This Pelican target's sshTarget is '${name}', but no target by that name is registered. Check list_targets.`);
+  if (host.type !== "ssh") {
+    throw new Error(
+      `This Pelican target's sshTarget is '${name}', which is a '${host.type}' target, not 'ssh'. Refusing to run shell commands against it — ` +
+        `point sshTarget at the ssh target for the panel's host.`,
+    );
+  }
+  if (!host.credentialRef) throw new Error(`The ssh target '${name}' has no credential attached, so it cannot be used to reach the panel host.`);
+  const cred = await ctx.resolveCredential(host.credentialRef);
+  return { target: host, cred, path: assertSafePath(opts.panelPath, "panelPath"), user: assertSafeUser(opts.panelUser, "panelUser") };
+}
+
+/**
+ * Run one FIXED command on the panel host.
+ *
+ * **On the guardrail this does and does not honor.** The SSH target's own
+ * command ALLOWLIST is not applied: the upgrade is inherently a sequence of
+ * compound root commands (`cd … && sudo -u www-data php artisan …`) that a
+ * read-only allowlist refuses by design, and routing it through `run_command`
+ * would just be the same commands with less review. What it keeps is
+ * `DEFAULT_DENY` — the destructive patterns (`rm -rf`, `mkfs`, `dd of=/dev/…`,
+ * reboot) are still refused here, so a mistake in a step cannot turn into one of
+ * those. Everything executed comes from the fixed constants below; no caller
+ * input reaches a command, and the two interpolated option values are validated
+ * by `assertSafePath` / `assertSafeUser` first.
+ */
+async function runOnPanelHost(host: PanelHost, command: string, timeoutMs?: number): Promise<SshExecResult> {
+  const verdict = checkCommand(command);
+  if (!verdict.allowed) throw new Error(`Refusing to run this panel-host command — ${verdict.reason}`);
+  return runSsh(host.target, host.cred, command, timeoutMs ? { timeoutMs } : {});
+}
+
+/** Parse `'version' => '1.0.0-beta35',` out of the panel's config/app.php. */
+export function parsePanelVersion(configLine: string): string | undefined {
+  const m = /['"]version['"]\s*=>\s*['"]([^'"]+)['"]/.exec(configLine);
+  return m?.[1];
+}
+
+/**
+ * Compare two Pelican versions well enough to say "behind / same / ahead".
+ * Pelican tags look like `v1.0.0-beta38`; compare numeric components left to
+ * right, then the prerelease number. Returns -1/0/1, or undefined when the shape
+ * is unrecognised — in which case the caller must say "could not compare"
+ * rather than guess, because claiming "up to date" wrongly is the bad failure.
+ * Exported for testing.
+ */
+export function compareVersions(a: string, b: string): number | undefined {
+  const parse = (v: string) => {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d+))?$/.exec(v.trim());
+    if (!m) return undefined;
+    return {
+      nums: [Number(m[1]), Number(m[2]), Number(m[3])],
+      // No prerelease outranks any prerelease: 1.0.0 > 1.0.0-beta38.
+      pre: m[4] ? { tag: m[4].toLowerCase(), num: Number(m[5]) } : undefined,
+    };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return undefined;
+  for (let i = 0; i < 3; i += 1) {
+    if (pa.nums[i]! !== pb.nums[i]!) return pa.nums[i]! < pb.nums[i]! ? -1 : 1;
+  }
+  if (!pa.pre && !pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+  if (pa.pre.tag !== pb.pre.tag) return undefined; // alpha vs beta — don't guess
+  if (pa.pre.num === pb.pre.num) return 0;
+  return pa.pre.num < pb.pre.num ? -1 : 1;
+}
+
+/** Latest released panel version, from the same source the panel's own banner
+ *  uses. Best-effort: a failure here must not break the installed-version read. */
+export async function latestPanelRelease(): Promise<{ tag?: string; error?: string }> {
+  try {
+    const res = await fetch("https://api.github.com/repos/pelican-dev/panel/releases/latest", {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return { error: `GitHub answered HTTP ${res.status}` };
+    const body = (await res.json()) as { tag_name?: string };
+    return body?.tag_name ? { tag: body.tag_name } : { error: "GitHub returned no tag_name" };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** One step of the upgrade. `command` is a template over the validated
+ *  `{path}` / `{user}` only — never over caller input. */
+interface UpgradeStep {
+  name: string;
+  command: string;
+  timeoutMs?: number;
+  /** Output worth quoting back in the result (version checks, migration tail). */
+  capture?: boolean;
+}
+
+/**
+ * The upgrade, as Pelican documents it for a bare-metal install, as an explicit
+ * reviewable list rather than one opaque blob. Each step runs on its own so a
+ * failure names the step it died on, and the panel is left in maintenance mode
+ * with the reason rather than half-upgraded and serving.
+ *
+ * `artisan` and `composer` run as the panel user, never root, so the upgrade
+ * cannot leave root-owned files the webserver then can't write — the classic way
+ * a "successful" upgrade bricks the panel afterwards.
+ */
+export const PANEL_UPGRADE_STEPS: UpgradeStep[] = [
+  { name: "maintenance-mode", command: 'cd {path} && sudo -n -u {user} php artisan down' },
+  {
+    name: "download-release",
+    command: 'cd {path} && sudo -n -u {user} curl -sSL -o /tmp/pelican-panel.tar.gz https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz',
+    timeoutMs: 300_000,
+  },
+  { name: "extract", command: 'cd {path} && sudo -n -u {user} tar -xzf /tmp/pelican-panel.tar.gz', timeoutMs: 180_000 },
+  { name: "fix-permissions", command: 'cd {path} && sudo -n chmod -R 755 storage bootstrap/cache' },
+  {
+    name: "composer-install",
+    command: 'cd {path} && sudo -n -u {user} composer install --no-dev --optimize-autoloader --no-interaction',
+    timeoutMs: 600_000,
+    capture: true,
+  },
+  { name: "migrate", command: 'cd {path} && sudo -n -u {user} php artisan migrate --seed --force', timeoutMs: 600_000, capture: true },
+  { name: "clear-caches", command: 'cd {path} && sudo -n -u {user} php artisan optimize:clear' },
+  { name: "restart-queue", command: 'cd {path} && sudo -n -u {user} php artisan queue:restart' },
+  { name: "exit-maintenance", command: 'cd {path} && sudo -n -u {user} php artisan up' },
+];
+
+/** Fill a step template with the already-validated path/user. */
+function renderStep(command: string, host: PanelHost): string {
+  return command.replaceAll("{path}", host.path).replaceAll("{user}", host.user);
 }
 
 // --- Response shapes (Fractal envelopes: {object, data:[{attributes}]}) -------
@@ -1443,6 +1653,130 @@ class Pelican {
   }
 }
 
+/** Installed version + latest release, for the panel's own host. */
+async function panelVersion(ctx: ToolContext): Promise<string> {
+  const host = await panelHost(ctx);
+  const cmd = `grep -m1 "'version'" ${host.path}/config/app.php`;
+  const res = await runOnPanelHost(host, cmd);
+  if (res.code !== 0) {
+    throw new Error(
+      `Could not read ${host.path}/config/app.php on '${host.target.name}' (exit ${res.code}): ${res.stderr.trim().slice(0, 200)}. ` +
+        `Check the target's 'panelPath' option points at the panel install.`,
+    );
+  }
+  const installed = parsePanelVersion(res.stdout);
+  if (!installed) {
+    throw new Error(`Read ${host.path}/config/app.php but found no version line in it. The install may be laid out differently than expected.`);
+  }
+
+  const latest = await latestPanelRelease();
+  if (!latest.tag) {
+    return (
+      `Pelican panel ${host.target.name === ctx.target.name ? "" : `(host '${host.target.name}') `}is running **${installed}**. ` +
+      `Could not reach GitHub for the latest release (${latest.error}), so I can't say whether that is current.`
+    );
+  }
+  const cmp = compareVersions(installed, latest.tag);
+  const verdict =
+    cmp === undefined
+      ? `Could not compare '${installed}' with '${latest.tag}' — the version shapes differ, so check by hand rather than trusting a guess.`
+      : cmp < 0
+        ? `An upgrade is available. Run panel_upgrade (it takes the current version as confirmation).`
+        : cmp === 0
+          ? `That is the latest release.`
+          : `Installed is NEWER than the latest release — likely a pre-release or a local build.`;
+  return `Pelican panel on host '${host.target.name}': installed **${installed}**, latest released **${latest.tag}**. ${verdict}`;
+}
+
+/**
+ * Back up the panel database before an upgrade, because `migrate` is the step
+ * with no undo. The engine is read from `.env`'s DB_CONNECTION — only that one
+ * line, never the whole file, which holds the app key and DB password.
+ *
+ * For MySQL/MariaDB the dump sources `.env` **on the panel host** inside the
+ * remote shell, so the password is expanded there and never crosses the wire,
+ * the audit log, or the model context — the command text contains variable
+ * names only.
+ */
+async function backupPanelDatabase(host: PanelHost): Promise<string> {
+  const detect = await runOnPanelHost(host, `grep -m1 '^DB_CONNECTION=' ${host.path}/.env`);
+  const engine = (detect.stdout.split("=")[1] ?? "").trim().toLowerCase().replace(/["']/g, "");
+  const stamp = "$(date +%Y%m%d-%H%M%S)";
+
+  let command: string;
+  let where: string;
+  if (engine === "sqlite") {
+    where = `${host.path}/storage/pelican-db-backup-<timestamp>.sqlite`;
+    command = `cd ${host.path} && sudo -n -u ${host.user} cp database/database.sqlite storage/pelican-db-backup-${stamp}.sqlite`;
+  } else if (engine === "mysql" || engine === "mariadb") {
+    where = `${host.path}/storage/pelican-db-backup-<timestamp>.sql`;
+    command =
+      `cd ${host.path} && sudo -n -u ${host.user} bash -c 'set -a; . ./.env; set +a; ` +
+      `mysqldump --no-tablespaces -h "$DB_HOST" -P "\${DB_PORT:-3306}" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" ` +
+      `> storage/pelican-db-backup-${stamp}.sql'`;
+  } else {
+    throw new Error(
+      `Refusing to upgrade: could not determine the panel's database engine from ${host.path}/.env (DB_CONNECTION='${engine || "unset"}'). ` +
+        `Only sqlite, mysql and mariadb are handled here, and 'migrate' has no undo — take a backup yourself before upgrading.`,
+    );
+  }
+
+  const res = await runOnPanelHost(host, command, 600_000);
+  if (res.code !== 0) {
+    const hint = looksLikeSudoPasswordFailure(res.stderr) ? ` ${sudoHint("php", host.cred.username ?? "<ssh-user>")}` : "";
+    throw new Error(`Refusing to upgrade: the ${engine} database backup FAILED (exit ${res.code}): ${res.stderr.trim().slice(0, 300)}.${hint}`);
+  }
+  return where;
+}
+
+/** Run the documented upgrade, stopping at the first failing step. */
+async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; skipBackup?: boolean }): Promise<string> {
+  const host = await panelHost(ctx);
+
+  // Stale-id guard, same shape as delete_schedule: the caller says which version
+  // it believes is installed, and a mismatch means its picture is out of date.
+  const before = await runOnPanelHost(host, `grep -m1 "'version'" ${host.path}/config/app.php`);
+  const installed = parsePanelVersion(before.stdout);
+  if (!installed) throw new Error(`Could not read the installed version from ${host.path}/config/app.php; refusing to upgrade blind.`);
+  if (installed !== input.expectVersion.trim()) {
+    throw new Error(
+      `Refusing to upgrade: you said the panel is on '${input.expectVersion}', but it is actually on '${installed}'. ` +
+        `Run panel_version and re-confirm — a stale picture is exactly when an upgrade goes wrong.`,
+    );
+  }
+
+  const backupAt = input.skipBackup ? null : await backupPanelDatabase(host);
+
+  const done: string[] = [];
+  const notes: string[] = [];
+  for (const step of PANEL_UPGRADE_STEPS) {
+    const res = await runOnPanelHost(host, renderStep(step.command, host), step.timeoutMs);
+    if (res.code !== 0) {
+      const hint = looksLikeSudoPasswordFailure(res.stderr) ? ` ${sudoHint("php", host.cred.username ?? "<ssh-user>")}` : "";
+      throw new Error(
+        `Panel upgrade FAILED at step '${step.name}' (exit ${res.code}): ${res.stderr.trim().slice(0, 400)}.${hint} ` +
+          `Steps completed: ${done.join(", ") || "none"}. ` +
+          `${done.includes("maintenance-mode") && !done.includes("exit-maintenance") ? `The panel is still in MAINTENANCE MODE — it will not serve until 'php artisan up' runs in ${host.path}. ` : ""}` +
+          `${backupAt ? `The pre-upgrade database backup is at ${backupAt}. ` : "No database backup was taken (skipBackup was set). "}` +
+          `Fix the cause on the host, then re-run panel_upgrade.`,
+      );
+    }
+    if (step.capture && res.stdout.trim()) notes.push(`${step.name}: ${res.stdout.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    done.push(step.name);
+  }
+
+  const after = await runOnPanelHost(host, `grep -m1 "'version'" ${host.path}/config/app.php`);
+  const now = parsePanelVersion(after.stdout) ?? "(unreadable)";
+  return (
+    `Upgraded the Pelican panel on host '${host.target.name}': **${installed} → ${now}**. ` +
+    `${now === installed ? "WARNING: the version did not change — the release may already have been installed, or the extract step did not replace the files. " : ""}` +
+    `All ${done.length} steps completed (${done.join(", ")}), and the panel is out of maintenance mode. ` +
+    `${backupAt ? `Pre-upgrade database backup: ${backupAt}. ` : "No database backup was taken. "}` +
+    `${notes.length ? `Notes — ${notes.join("; ")}. ` : ""}` +
+    `Verify with panel_version and by loading the panel; if anything looks wrong, the backup above is the rollback point.`
+  );
+}
+
 async function withClient<T>(ctx: ToolContext, fn: (p: Pelican) => Promise<T>): Promise<T> {
   const cred = await ctx.getCredential();
   return fn(new Pelican(ctx.target, cred));
@@ -1533,6 +1867,56 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "read",
       inputSchema: z.object({ server: SERVER_REF }),
       run: run((p, i) => p.listSchedules(i.server)),
+    },
+    {
+      name: "panel_version",
+      description:
+        `Report the Pelican panel's installed version on ${target.name} and the latest released version. Pelican has NO version endpoint ` +
+        `on any API half, so the installed version is read from config/app.php over SSH — this needs the target's 'sshTarget' option ` +
+        `pointing at the registered ssh target for the panel's host. The latest release comes from the same GitHub endpoint the panel's ` +
+        `own "update available" banner uses.`,
+      tier: "read",
+      inputSchema: z.object({}),
+      run: async (_input, ctx) => {
+        try {
+          return ok(await panelVersion(ctx));
+        } catch (e) {
+          return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+        }
+      },
+    },
+    {
+      name: "panel_upgrade",
+      description:
+        `Upgrade the Pelican panel itself on ${target.name} to the latest release. This is HOST-LEVEL work over SSH (the panel has no ` +
+        `upgrade endpoint), so it needs the target's 'sshTarget' option. Run panel_version first and pass its installed version as ` +
+        `expectVersion — a mismatch is refused. It takes a database backup, then runs Pelican's documented sequence: maintenance mode, ` +
+        `download, extract, composer install, migrate, clear caches, restart queue, up. artisan/composer run as the panel user, never ` +
+        `root. On any failure it STOPS, names the step, and leaves the panel in maintenance mode rather than half-upgraded and serving.`,
+      tier: "execute",
+      inputSchema: z.object({
+        expectVersion: z.string().min(1).describe("The currently installed version, exactly as panel_version reports it. A mismatch aborts."),
+        skipBackup: z
+          .boolean()
+          .optional()
+          .describe("Skip the pre-upgrade database backup. Default false. 'migrate' has no undo, so only set this if you have your own backup."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { expectVersion: string; skipBackup?: boolean };
+        const o = options(t);
+        return (
+          `UPGRADE the Pelican panel itself on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to the latest release ` +
+          `(${o.panelPath}) — runs database migrations, takes the panel down during the upgrade` +
+          `${i.skipBackup ? ", and SKIPS the database backup" : ""}`
+        );
+      },
+      run: async (input, ctx) => {
+        try {
+          return ok(await panelUpgrade(ctx, input as { expectVersion: string; skipBackup?: boolean }));
+        } catch (e) {
+          return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+        }
+      },
     },
     {
       name: "create_allocations",
