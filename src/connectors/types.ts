@@ -74,6 +74,25 @@ export interface ToolContext {
    */
   fingerprint?: (value: string) => Promise<string>;
   /**
+   * Look up ANOTHER registered target by name — for the case where a service's
+   * management API cannot do something its own host can. The Pelican panel is
+   * the motivating example: it exposes no upgrade or version endpoint at all, so
+   * `panel_version` / `panel_upgrade` have to reach the machine it runs on,
+   * which the user has already registered as an `ssh` target.
+   *
+   * Deliberately narrow: it resolves the ONE name asked for and returns
+   * undefined otherwise. It does not enumerate the registry, and it hands back
+   * only the Target record — the credential still goes through
+   * `resolveCredential`, so this grants no new access to secrets. A connector
+   * using it must also check the resolved target's `type` before acting on it;
+   * SSHing at whatever a name happens to point to is not acceptable.
+   *
+   * Optional like the rest: non-MCP call sites (the snapshot service) build a
+   * minimal context, and a tool that needs this must fail with a clear error
+   * when it is absent rather than silently skipping the step.
+   */
+  resolveTarget?: (name: string) => Target | undefined;
+  /**
    * Hosts that a network change must never be pointed at — Skeleton Key's own
    * control plane. Assembled by the tool registry from the LIVE target registry
    * (so moving a host is picked up automatically instead of being hardcoded),

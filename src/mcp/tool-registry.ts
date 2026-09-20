@@ -79,6 +79,10 @@ export function resolveTools(app: AppState): ResolvedTool[] {
             // secret than the target's own (see ToolContext.resolveCredential).
             // Same in-memory, lazy path as getCredential — nothing is cached here.
             resolveCredential: (ref: string, opts?: { fresh?: boolean }) => app.credentialFor(ref, opts),
+            // One named target, for a connector whose service cannot do
+            // something its own host can (see ToolContext.resolveTarget). Looked
+            // up live, and never the whole list.
+            resolveTarget: (name: string) => app.registry.list().find((t) => t.name === name),
             fingerprint: (value: string) => app.fingerprint(value),
             // Control-plane hosts no network change may point at (see
             // ToolContext.protectedHosts). Recomputed per call so a target

@@ -11,6 +11,11 @@ import {
   expandPorts,
   assertAllocationIp,
   assertEggSourceUrl,
+  assertSafePath,
+  assertSafeUser,
+  compareVersions,
+  parsePanelVersion,
+  PANEL_UPGRADE_STEPS,
   fetchEggFromUrl,
   parseEggContent,
   MAX_PORTS_PER_CALL,
@@ -23,6 +28,7 @@ import {
   cronOf,
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
+import { checkCommand } from "./command-policy.js";
 
 const APP = "papp_ApplicationKeySecret123";
 const CLI = "pacc_ClientKeySecret456";
@@ -1002,12 +1008,138 @@ describe("import_egg", () => {
   });
 });
 
+describe("panel host resolution (the one place a connector reaches another target)", () => {
+  const sshTarget: Target = { name: "pelican48", type: "ssh", host: "192.168.0.48", credentialRef: "pelican48-ssh" };
+  const panelTarget = (o: Record<string, unknown> = {}) => target({ ownerUserId: 7, sshTarget: "pelican48", ...o });
+
+  function hostCtx(over: Partial<ToolContext> = {}, t: Target = panelTarget()): ToolContext {
+    return {
+      target: t,
+      getCredential: async () => cred(),
+      resolveTarget: (name: string) => (name === "pelican48" ? sshTarget : undefined),
+      resolveCredential: async () => ({ ref: "pelican48-ssh", username: "jake", password: "pw", fields: {}, uris: [] }),
+      ...over,
+    };
+  }
+  const panelTool = (name: string, t: Target = panelTarget()) => pelicanConnector.buildTools(t).find((x) => x.name === name)!;
+
+  it("tells you exactly what to set when sshTarget is missing", async () => {
+    const t = target({ ownerUserId: 7 }); // no sshTarget
+    const res = await panelTool("panel_version", t).run({}, hostCtx({}, t));
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("sshTarget");
+    expect(res.text).toMatch(/update_target/);
+  });
+
+  it("refuses when the named target is not an ssh target", async () => {
+    // Without this check a typo'd name pointing at the gateway would have this
+    // connector opening a shell on the UniFi box.
+    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.0.1", credentialRef: "u" };
+    const t = panelTarget({ sshTarget: "unifi" });
+    const res = await panelTool("panel_version", t).run({}, hostCtx({ resolveTarget: () => unifi }, t));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/is a 'unifi' target, not 'ssh'/);
+  });
+
+  it("refuses when the named target isn't registered at all", async () => {
+    const res = await panelTool("panel_version").run({}, hostCtx({ resolveTarget: () => undefined }));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/no target by that name is registered/);
+  });
+
+  it("refuses a call site that cannot resolve other targets, rather than skipping the step", async () => {
+    const res = await panelTool("panel_version").run({}, hostCtx({ resolveTarget: undefined }));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/cannot resolve other targets/);
+  });
+
+  it("refuses a panelPath that could break out of the fixed command", () => {
+    // panelPath is interpolated into shell commands, so it has to be inert.
+    for (const bad of ["/var/www/pelican; rm -rf /", "/var/www/$(whoami)", "relative/path", "/var/../etc", "/var/www/pelican'"]) {
+      expect(() => assertSafePath(bad, "panelPath")).toThrow(/absolute path/);
+    }
+    expect(assertSafePath("/var/www/pelican/", "panelPath")).toBe("/var/www/pelican");
+    expect(() => assertSafeUser("www-data; id", "panelUser")).toThrow(/plain unix username/);
+    expect(assertSafeUser("www-data", "panelUser")).toBe("www-data");
+  });
+});
+
+describe("panel version comparison", () => {
+  it("orders releases and prereleases the way Pelican tags them", () => {
+    expect(compareVersions("1.0.0-beta35", "v1.0.0-beta38")).toBe(-1);
+    expect(compareVersions("1.0.0-beta38", "v1.0.0-beta38")).toBe(0);
+    expect(compareVersions("1.0.1", "v1.0.0-beta38")).toBe(1);
+    expect(compareVersions("1.0.0-beta38", "v1.0.0")).toBe(-1); // a release outranks its prereleases
+  });
+
+  it("returns undefined rather than guessing when the shapes don't match", () => {
+    // Claiming "up to date" wrongly is the dangerous failure, so refuse instead.
+    expect(compareVersions("1.0.0-alpha2", "1.0.0-beta38")).toBeUndefined();
+    expect(compareVersions("weird", "1.0.0")).toBeUndefined();
+  });
+
+  it("parses the version out of config/app.php", () => {
+    expect(parsePanelVersion("    'version' => '1.0.0-beta35',")).toBe("1.0.0-beta35");
+    expect(parsePanelVersion("no version here")).toBeUndefined();
+  });
+});
+
+describe("panel_upgrade steps", () => {
+  it("runs artisan and composer as the panel user, never as root", () => {
+    for (const step of PANEL_UPGRADE_STEPS) {
+      if (/artisan|composer/.test(step.command)) {
+        expect(step.command).toContain("sudo -n -u {user}");
+      }
+    }
+  });
+
+  it("interpolates only the validated path and user — no other placeholders exist", () => {
+    for (const step of PANEL_UPGRADE_STEPS) {
+      const placeholders = [...step.command.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+      expect(placeholders.every((p) => p === "path" || p === "user")).toBe(true);
+    }
+  });
+
+  it("every step survives the destructive-command deny list", () => {
+    // The target's ALLOWLIST is deliberately not applied here, but DEFAULT_DENY
+    // still is — so a step must never contain rm -rf, mkfs, dd of=/dev/, reboot.
+    for (const step of PANEL_UPGRADE_STEPS) {
+      const rendered = step.command.replaceAll("{path}", "/var/www/pelican").replaceAll("{user}", "www-data");
+      expect(checkCommand(rendered).allowed).toBe(true);
+    }
+  });
+
+  it("takes the panel down first and brings it back up last", () => {
+    expect(PANEL_UPGRADE_STEPS[0]!.name).toBe("maintenance-mode");
+    expect(PANEL_UPGRADE_STEPS[PANEL_UPGRADE_STEPS.length - 1]!.name).toBe("exit-maintenance");
+    expect(PANEL_UPGRADE_STEPS.map((s) => s.name)).toContain("migrate");
+  });
+
+  it("confirm names the host, the version and whether the backup is being skipped", () => {
+    const t = target({ ownerUserId: 7, sshTarget: "pelican48" });
+    const confirm = pelicanConnector.buildTools(t).find((x) => x.name === "panel_upgrade")!.confirm!;
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself on host 'pelican48'");
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("from 1.0.0-beta35");
+    expect(confirm({ expectVersion: "1.0.0-beta35", skipBackup: true }, t)).toMatch(/SKIPS the database backup/);
+  });
+});
+
 describe("connector wiring", () => {
   it("registers every planned tool at the right tier", () => {
     const tools = pelicanConnector.buildTools(target({ ownerUserId: 7 }));
     const reads = tools.filter((t) => t.tier === "read").map((t) => t.name).sort();
     const execs = tools.filter((t) => t.tier === "execute").map((t) => t.name).sort();
-    expect(reads).toEqual(["list_allocations", "list_eggs", "list_nodes", "list_schedules", "list_servers", "list_users", "server_details", "server_resources"]);
+    expect(reads).toEqual([
+      "list_allocations",
+      "list_eggs",
+      "list_nodes",
+      "list_schedules",
+      "list_servers",
+      "list_users",
+      "panel_version",
+      "server_details",
+      "server_resources",
+    ]);
     expect(execs).toEqual([
       "assign_allocation",
       "create_allocations",
@@ -1015,6 +1147,7 @@ describe("connector wiring", () => {
       "create_server",
       "delete_schedule",
       "import_egg",
+      "panel_upgrade",
       "power_action",
       "update_schedule",
       "update_server_startup",
