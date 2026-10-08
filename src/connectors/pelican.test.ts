@@ -26,6 +26,14 @@ import {
   summarizeServers,
   summarizeSchedules,
   cronOf,
+  assertVolumePath,
+  assertExactName,
+  assertPullUrl,
+  redactFileLines,
+  summarizeFiles,
+  FILE_PULL_POLL,
+  FILE_READ_MAX_BYTES,
+  FILE_WRITE_MAX_BYTES,
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 import { checkCommand } from "./command-policy.js";
@@ -55,19 +63,21 @@ const list = (attrs: unknown[], page = 1, totalPages = 1) => ({
 });
 const item = (attrs: unknown) => ({ object: "x", attributes: attrs });
 
-function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: { status?: number; json?: unknown } }[]) {
+type MockReply = { status?: number; json?: unknown; text?: string };
+function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: MockReply | (() => MockReply) }[]) {
   const calls: { url: string; init: any }[] = [];
   const fn = vi.fn(async (url: string, init: any) => {
     calls.push({ url, init });
     const route = routes.find((r) => r.match(url, init));
     if (!route) throw new Error(`no mock route for ${init?.method ?? "GET"} ${url}`);
-    const status = route.reply.status ?? 200;
+    const reply = typeof route.reply === "function" ? route.reply() : route.reply;
+    const status = reply.status ?? 200;
     return {
       ok: status >= 200 && status < 300,
       status,
       statusText: "",
       headers: { get: () => null, getSetCookie: () => [] },
-      text: async () => (route.reply.json !== undefined ? JSON.stringify(route.reply.json) : ""),
+      text: async () => reply.text ?? (reply.json !== undefined ? JSON.stringify(reply.json) : ""),
     } as any;
   });
   vi.stubGlobal("fetch", fn);
@@ -1262,26 +1272,34 @@ describe("connector wiring", () => {
     expect(reads).toEqual([
       "list_allocations",
       "list_eggs",
+      "list_files",
       "list_nodes",
       "list_schedules",
       "list_servers",
       "list_users",
       "panel_version",
+      "read_file",
       "server_details",
       "server_resources",
     ]);
     expect(execs).toEqual([
       "assign_allocation",
       "create_allocations",
+      "create_folder",
       "create_schedule",
       "create_server",
+      "decompress_file",
+      "delete_files",
       "delete_schedule",
       "import_egg",
       "panel_upgrade",
       "power_action",
+      "pull_file",
+      "rename_files",
       "update_schedule",
       "update_server_startup",
       "update_startup_variables",
+      "write_file",
     ]);
     // Every execute tool must carry confirm text — the approval gate keys off it.
     expect(tools.filter((t) => t.tier === "execute").every((t) => typeof t.confirm === "function")).toBe(true);
@@ -1302,5 +1320,304 @@ describe("connector wiring", () => {
     const all = arts.map((a) => a.data.toString()).join("");
     expect(all).not.toContain(RCON);
     expect(all).not.toContain("TOK");
+  });
+});
+
+// --- files (client API) --------------------------------------------------------
+
+const fileObj = (name: string, size: number, isFile = true) => ({
+  name,
+  mode: isFile ? "-rw-r--r--" : "drwxr-xr-x",
+  size,
+  is_file: isFile,
+  is_symlink: false,
+  mimetype: isFile ? "application/octet-stream" : "inode/directory",
+  modified_at: "2026-10-08T17:00:00+00:00",
+});
+const REF = "f5eb47ac";
+const POLL_DEFAULTS = { ...FILE_PULL_POLL };
+afterEach(() => Object.assign(FILE_PULL_POLL, POLL_DEFAULTS));
+
+describe("files — guards", () => {
+  it("assertVolumePath refuses escapes, dot/empty segments and control chars, allows backslashes and root-when-asked", () => {
+    expect(() => assertVolumePath("../etc", "file")).toThrow("'..' is refused");
+    expect(() => assertVolumePath("BepInEx/../../x", "file")).toThrow("'..'");
+    expect(() => assertVolumePath("a/./b", "file")).toThrow("'.'");
+    expect(() => assertVolumePath("a//b", "file")).toThrow("empty");
+    expect(() => assertVolumePath("a\u0000b", "file")).toThrow("control");
+    expect(() => assertVolumePath("/", "file")).toThrow("volume root");
+    expect(() => assertVolumePath("  ", "file")).toThrow("volume root");
+    expect(assertVolumePath("/", "root", { allowRoot: true })).toBe("/");
+    expect(assertVolumePath("", "root", { allowRoot: true })).toBe("/");
+    // A Windows-built Thunderstore zip extracts to a file literally named this.
+    expect(assertVolumePath("plugins\\Jotunn.dll", "from")).toBe("plugins\\Jotunn.dll");
+    expect(assertVolumePath(" /BepInEx/plugins ", "directory")).toBe("/BepInEx/plugins");
+    expect(() => assertExactName("*.zip", "files[0]")).toThrow("exact name");
+    expect(assertExactName("x.zip", "f")).toBe("x.zip");
+  });
+
+  it("assertPullUrl allows only public https — the daemon fetches from inside the LAN", () => {
+    expect(assertPullUrl("https://thunderstore.io/package/download/denikson/BepInExPack_Valheim/5.4.2351/").hostname).toBe("thunderstore.io");
+    expect(() => assertPullUrl("http://thunderstore.io/x.zip")).toThrow("https");
+    expect(() => assertPullUrl("https://192.168.0.229:8787/x.zip")).toThrow("inside the network");
+    expect(() => assertPullUrl("https://127.0.0.1/x.zip")).toThrow("inside the network");
+    expect(() => assertPullUrl("https://localhost/x.zip")).toThrow("inside the network");
+    expect(() => assertPullUrl("not a url")).toThrow("Invalid");
+  });
+
+  it("redactFileLines masks secret-named keys and password flags and leaves everything else alone", () => {
+    const input = [
+      "ServerPassword = hunter2",
+      'rcon_password: "abc"',
+      'DISCORD_TOKEN=xoxb-123',
+      'exec ./valheim_server.x86_64 -name "My server" -password "secret" -port 2456',
+      "[Info   :   BepInEx] Loading [Jotunn 2.30.2]",
+      "LogLevels = Fatal, Error, Warning",
+      '"author": "denikson"',
+      "SteamAppId=892970",
+    ].join("\n");
+    const out = redactFileLines(input);
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain('"abc"');
+    expect(out).not.toContain("xoxb-123");
+    expect(out).not.toContain('"secret"');
+    expect(out).toContain("ServerPassword = [redacted]");
+    expect(out).toContain("DISCORD_TOKEN=[redacted]");
+    expect(out).toContain('-name "My server" -password [redacted] -port 2456');
+    expect(out).toContain("Loading [Jotunn 2.30.2]");
+    expect(out).toContain("LogLevels = Fatal, Error, Warning");
+    expect(out).toContain('"author": "denikson"');
+    expect(out).toContain("SteamAppId=892970");
+  });
+
+  it("summarizeFiles puts folders first and prints sizes", () => {
+    const text = summarizeFiles("/BepInEx", [fileObj("LogOutput.log", 4321), fileObj("plugins", 4096, false), fileObj("core", 4096, false)]);
+    expect(text.indexOf("core/")).toBeLessThan(text.indexOf("plugins/"));
+    expect(text.indexOf("plugins/")).toBeLessThan(text.indexOf("LogOutput.log"));
+    expect(text).toContain("4321");
+    expect(summarizeFiles("/x", [])).toContain("(empty)");
+  });
+});
+
+describe("files — client API tools", () => {
+  it("list_files GETs the listing with the CLIENT key and renders folders first", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes(`/api/client/servers/${REF}/files/list`), reply: { json: list([fileObj("Jotunn.dll", 1234), fileObj("core", 4096, false)]) } },
+    ]);
+    const res = await tool("list_files").run({ server: REF, directory: "/BepInEx/plugins" }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(calls[0]!.url).toContain("directory=%2FBepInEx%2Fplugins");
+    expect(authOn(calls[0]!)).toBe(`Bearer ${CLI}`);
+    expect(res.text.indexOf("core/")).toBeGreaterThan(-1);
+    expect(res.text.indexOf("core/")).toBeLessThan(res.text.indexOf("Jotunn.dll"));
+    expect(res.text).toContain("1234");
+  });
+
+  it("list_files refuses a path escape before any call", async () => {
+    const calls = mockFetch([{ match: () => true, reply: { json: list([]) } }]);
+    const res = await tool("list_files").run({ server: REF, directory: "/../../etc" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(calls.length).toBe(0);
+  });
+
+  it("read_file returns the text, tails it, and redacts secret lines", async () => {
+    const body = Array.from({ length: 50 }, (_, i) => `line ${i}`).concat(["password = hunter2"]).join("\n");
+    const calls = mockFetch([{ match: (u) => u.includes("/files/contents"), reply: { text: body } }]);
+    const res = await tool("read_file").run({ server: REF, file: "/BepInEx/LogOutput.log", tail: 3 }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(calls[0]!.url).toContain("file=%2FBepInEx%2FLogOutput.log");
+    expect(authOn(calls[0]!)).toBe(`Bearer ${CLI}`);
+    expect(res.text).toContain("last 3 of 51 lines");
+    expect(res.text).toContain("line 49");
+    expect(res.text).not.toContain("line 47");
+    expect(res.text).not.toContain("hunter2");
+    expect(res.text).toContain("password = [redacted]");
+  });
+
+  it("read_file caps the bytes it returns and says so", async () => {
+    mockFetch([{ match: () => true, reply: { text: "x".repeat(FILE_READ_MAX_BYTES + 5000) } }]);
+    const res = await tool("read_file").run({ server: REF, file: "/big.log", maxBytes: 10_000_000 }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain(`truncated to ${FILE_READ_MAX_BYTES}`);
+    expect(res.text.length).toBeLessThan(FILE_READ_MAX_BYTES + 500);
+  });
+
+  it("read_file refuses binary content instead of dumping it", async () => {
+    mockFetch([{ match: () => true, reply: { text: "MZ\u0000\u0000garbage" } }]);
+    const res = await tool("read_file").run({ server: REF, file: "/x.dll" }, ctx());
+    expect(res.text).toContain("binary");
+    expect(res.text).not.toContain("garbage");
+  });
+
+  it("read_file: a 404 reads as a missing path, not only an ownership problem", async () => {
+    mockFetch([{ match: () => true, reply: { status: 404, json: { errors: [{ code: "NotFoundHttpException", detail: "The requested resource could not be found." }] } } }]);
+    const res = await tool("read_file").run({ server: REF, file: "/nope.txt" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("no such file");
+  });
+
+  it("write_file sends the content as a raw text/plain body and never echoes it", async () => {
+    const calls = mockFetch([{ match: (u, init) => u.includes("/files/write") && init.method === "POST", reply: { status: 204 } }]);
+    const t = tool("write_file");
+    const input = { server: REF, file: "/BepInEx/config/x.cfg", content: "Enabled = true\n" };
+    const res = await t.run(input, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(calls[0]!.url).toContain("file=%2FBepInEx%2Fconfig%2Fx.cfg");
+    expect(calls[0]!.init.body).toBe("Enabled = true\n");
+    expect(calls[0]!.init.headers["Content-Type"]).toBe("text/plain");
+    expect(res.text).toContain("15 bytes");
+    expect(res.text).not.toContain("Enabled = true");
+    expect(t.confirm!(input, target())).toContain("15 bytes");
+    expect(t.confirm!(input, target())).not.toContain("Enabled");
+  });
+
+  it("write_file refuses oversized content before any call", async () => {
+    const calls = mockFetch([{ match: () => true, reply: { status: 204 } }]);
+    const res = await tool("write_file").run({ server: REF, file: "/x", content: "y".repeat(FILE_WRITE_MAX_BYTES + 1) }, ctx());
+    expect(res.isError).toBe(true);
+    expect(calls.length).toBe(0);
+  });
+
+  it("create_folder POSTs root + name", async () => {
+    const calls = mockFetch([{ match: (u) => u.includes("/files/create-folder"), reply: { status: 204 } }]);
+    const res = await tool("create_folder").run({ server: REF, root: "/BepInEx/plugins", name: "Jotunn" }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(calls[0]!.init.body)).toEqual({ root: "/BepInEx/plugins", name: "Jotunn" });
+  });
+
+  it("pull_file refuses an http or in-network URL before any call", async () => {
+    const calls = mockFetch([{ match: () => true, reply: { status: 204 } }]);
+    const bad = ["http://thunderstore.io/x.zip", "https://192.168.0.1/x.zip", "https://localhost/x.zip"];
+    for (const url of bad) {
+      const res = await tool("pull_file").run({ server: REF, url, directory: "/", filename: "x.zip" }, ctx());
+      expect(res.isError).toBe(true);
+    }
+    expect(calls.length).toBe(0);
+  });
+
+  it("pull_file asks Wings for a foreground download and verifies the landed size", async () => {
+    FILE_PULL_POLL.intervalMs = 1;
+    const url = "https://thunderstore.io/package/download/denikson/BepInExPack_Valheim/5.4.2351/";
+    const calls = mockFetch([
+      { match: (u, init) => u.includes("/files/pull") && init.method === "POST", reply: { status: 204 } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("bepinex.zip", 702924)]) } },
+    ]);
+    const t = tool("pull_file");
+    const input = { server: REF, url, directory: "/_staging", filename: "bepinex.zip", expectedBytes: 702924 };
+    const res = await t.run(input, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(writes(calls)[0]!.init.body)).toEqual({ url, directory: "/_staging", filename: "bepinex.zip", use_header: false, foreground: true });
+    expect(authOn(calls[0]!)).toBe(`Bearer ${CLI}`);
+    expect(res.text).toContain("702924 bytes — matches");
+    expect(t.confirm!(input, target())).toBe(
+      `Download ${url} to '/_staging/bepinex.zip' on Pelican server '${REF}' on pelican-panel (the Wings daemon fetches it; expecting 702924 bytes)`,
+    );
+  });
+
+  it("pull_file survives the panel's 15s daemon timeout by watching the file land", async () => {
+    FILE_PULL_POLL.intervalMs = 1;
+    const sizes = [0, 300_000, 702_924];
+    let polls = 0;
+    mockFetch([
+      {
+        match: (u) => u.includes("/files/pull"),
+        reply: { status: 504, json: { errors: [{ code: "DaemonConnectionException", detail: "Could not establish a connection to the machine running this server. Please try again." }] } },
+      },
+      {
+        match: (u) => u.includes("/files/list"),
+        reply: () => {
+          const size = sizes[Math.min(polls++, sizes.length - 1)]!;
+          return { json: list(size ? [fileObj("x.zip", size)] : []) };
+        },
+      },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", directory: "/", filename: "x.zip", expectedBytes: 702_924 }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("matches the expected size");
+    expect(res.text).toContain("outlived the panel's 15s daemon timeout");
+    expect(polls).toBe(3);
+  });
+
+  it("pull_file fails on a size mismatch, and on a download that never finishes", async () => {
+    FILE_PULL_POLL.intervalMs = 1;
+    FILE_PULL_POLL.maxWaitMs = 20;
+    mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 204 } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("x.zip", 999_999)]) } },
+    ]);
+    const big = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip", expectedBytes: 100 }, ctx());
+    expect(big.isError).toBe(true);
+    expect(big.text).toContain("999999 bytes but 100 were expected");
+    mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 204 } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("x.zip", 50)]) } },
+    ]);
+    const stuck = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip", expectedBytes: 100 }, ctx());
+    expect(stuck.isError).toBe(true);
+    expect(stuck.text).toContain("did not finish landing");
+    expect(stuck.text).toContain("50 bytes of 100");
+  });
+
+  it("pull_file surfaces a real panel error rather than polling for a file that will never come", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 422, json: { errors: [{ code: "ValidationException", detail: "The url field must be a valid URL." }] } } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("422");
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(0);
+  });
+
+  it("decompress_file POSTs root+file and lists the result", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/files/decompress"), reply: { status: 204 } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("x.zip", 10), fileObj("BepInExPack_Valheim", 4096, false)]) } },
+    ]);
+    const res = await tool("decompress_file").run({ server: REF, root: "/_staging", file: "x.zip" }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(writes(calls)[0]!.init.body)).toEqual({ root: "/_staging", file: "x.zip" });
+    expect(res.text).toContain("BepInExPack_Valheim/");
+    expect(res.text).toContain("archive itself is kept");
+  });
+
+  it("rename_files PUTs the moves and names them in the confirm; refuses patterns and escapes", async () => {
+    const calls = mockFetch([{ match: (u, init) => u.includes("/files/rename") && init.method === "PUT", reply: { status: 204 } }]);
+    const t = tool("rename_files");
+    const files = [{ from: "_staging/plugins\\Jotunn.dll", to: "BepInEx/plugins/Jotunn/Jotunn.dll" }];
+    const res = await t.run({ server: REF, files }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(calls[0]!.init.body)).toEqual({ root: "/", files });
+    expect(t.confirm!({ server: REF, files }, target())).toContain("_staging/plugins\\Jotunn.dll -> BepInEx/plugins/Jotunn/Jotunn.dll");
+    const bad = await t.run({ server: REF, files: [{ from: "*.dll", to: "x" }] }, ctx());
+    expect(bad.isError).toBe(true);
+    const esc = await t.run({ server: REF, files: [{ from: "a", to: "../b" }] }, ctx());
+    expect(esc.isError).toBe(true);
+    expect(calls.length).toBe(1);
+  });
+
+  it("delete_files refuses patterns and the root, POSTs exact names, and says it is permanent", async () => {
+    const calls = mockFetch([{ match: (u) => u.includes("/files/delete"), reply: { status: 204 } }]);
+    const t = tool("delete_files");
+    for (const files of [["*"], ["/"], ["."], ["../x"]]) {
+      const res = await t.run({ server: REF, files }, ctx());
+      expect(res.isError).toBe(true);
+    }
+    expect(calls.length).toBe(0);
+    const res = await t.run({ server: REF, root: "/_staging", files: ["x.zip", "leftover"] }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(calls[0]!.init.body)).toEqual({ root: "/_staging", files: ["x.zip", "leftover"] });
+    expect(res.text).toContain("permanent");
+    expect(t.confirm!({ server: REF, root: "/_staging", files: ["x.zip"] }, target())).toContain("PERMANENTLY delete [x.zip] under '/_staging'");
+  });
+
+  it("every file tool declares its tier: reads free, writes gated", () => {
+    const tiers = Object.fromEntries(pelicanConnector.buildTools(target()).map((x) => [x.name, x.tier]));
+    expect(tiers.list_files).toBe("read");
+    expect(tiers.read_file).toBe("read");
+    for (const name of ["write_file", "create_folder", "pull_file", "decompress_file", "rename_files", "delete_files"]) {
+      expect(tiers[name]).toBe("execute");
+      expect(tool(name).confirm).toBeTypeOf("function");
+    }
   });
 });

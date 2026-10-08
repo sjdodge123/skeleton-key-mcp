@@ -424,7 +424,7 @@ export function assertEggSourceUrl(raw: string): URL {
     throw new Error(`Refusing to fetch an egg over '${url.protocol}' — use https so the egg can't be swapped in transit.`);
   }
   const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (isBlockedFetchIPv4(host) || isBlockedFetchIPv6(host) || isLocalHostname(host)) {
+  if (isInsideNetworkHost(host)) {
     throw new Error(
       `Refusing to fetch an egg from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ` +
         `This tool fetches from inside your network, so it is restricted to public https sources (e.g. raw.githubusercontent.com). ` +
@@ -432,6 +432,142 @@ export function assertEggSourceUrl(raw: string): URL {
     );
   }
   return url;
+}
+
+// --- Files (client API) ------------------------------------------------------
+
+/** True when a hostname/IP literal points inside the network — loopback,
+ *  private, link-local, or a local-only name — the set an in-LAN fetch refuses. */
+function isInsideNetworkHost(host: string): boolean {
+  return isBlockedFetchIPv4(host) || isBlockedFetchIPv6(host) || isLocalHostname(host);
+}
+
+/**
+ * A path inside a server's volume, for the client file routes. Wings resolves
+ * every path against the volume root and refuses escapes itself; refusing `..`,
+ * `.` and control characters HERE keeps a cryptic daemon error out of the loop
+ * and keeps the approval prompt honest about what will be touched. Backslashes
+ * are allowed on purpose: a Thunderstore zip built on Windows carries entries
+ * like `plugins\Jotunn.dll`, which Wings extracts as ONE file with that literal
+ * name, and the only way to fix it is to rename it by that name. Exported for
+ * testing.
+ */
+export function assertVolumePath(path: string, field: string, opts: { allowRoot?: boolean } = {}): string {
+  const trimmed = path.trim();
+  const inner = trimmed.replace(/^\/+|\/+$/g, "");
+  if (inner === "") {
+    if (opts.allowRoot) return "/";
+    throw new Error(`'${field}' must name a file or directory inside the server, not the volume root.`);
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) throw new Error(`'${field}' contains control characters.`);
+  for (const seg of inner.split("/")) {
+    if (seg === "..") throw new Error(`'${field}' must stay inside the server's volume — '..' is refused (got '${path}').`);
+    if (seg === "." || seg === "") throw new Error(`'${field}' has an empty or '.' path segment (got '${path}').`);
+  }
+  return trimmed;
+}
+
+/** Glob characters mean nothing to Wings, but refusing them keeps a stray `*`
+ *  from reading as "everything" in an approval prompt. Exported for testing. */
+export function assertExactName(name: string, field: string): string {
+  if (/[*?[\]]/.test(name)) throw new Error(`'${field}' must be an exact name, not a pattern (got '${name}').`);
+  return name;
+}
+
+/**
+ * Guard a pull URL. The download is made by the WINGS DAEMON, from inside the
+ * LAN, so this is the same SSRF shape as `assertEggSourceUrl`: public https
+ * only. Wings also refuses URLs that resolve to internal addresses; this just
+ * says so before any request is made. Exported for testing.
+ */
+export function assertPullUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`Invalid download URL '${raw}'.`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`Refusing to pull a file over '${url.protocol}' — use https so the file can't be swapped in transit.`);
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (isInsideNetworkHost(host)) {
+    throw new Error(
+      `Refusing to pull from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ` +
+        `The download is made by the Wings daemon from inside your LAN, so it is restricted to public https sources (e.g. thunderstore.io).`,
+    );
+  }
+  return url;
+}
+
+const FILE_READ_DEFAULT_BYTES = 64 * 1024;
+/** Hard cap on what read_file returns — a log can be megabytes; the model context is not where it goes. */
+export const FILE_READ_MAX_BYTES = 256 * 1024;
+/** write_file is for config files; anything bigger is a download, not a chat payload. */
+export const FILE_WRITE_MAX_BYTES = 512 * 1024;
+/** How pull_file watches a download land. Mutable so tests don't wait. */
+export const FILE_PULL_POLL = { intervalMs: 2000, maxWaitMs: 180_000 };
+
+const pauseMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One entry of the panel's `files/list` (FileObjectTransformer). */
+interface FileObject {
+  name: string;
+  mode?: string;
+  size?: number;
+  is_file?: boolean;
+  is_symlink?: boolean;
+  mimetype?: string;
+  modified_at?: string;
+}
+
+/** Directory listing, folders first. Exported for testing. */
+export function summarizeFiles(dir: string, files: FileObject[]): string {
+  if (!files.length) return `${dir}: (empty)`;
+  const isDir = (f: FileObject) => f.is_file === false;
+  const sorted = [...files].sort((a, b) => Number(!isDir(a)) - Number(!isDir(b)) || a.name.localeCompare(b.name));
+  const MAX = 400;
+  const lines = sorted.slice(0, MAX).map((f) => {
+    const when = (f.modified_at ?? "").slice(0, 16).replace("T", " ");
+    return isDir(f)
+      ? `  ${"<dir>".padStart(10)}  ${when}  ${f.name}/`
+      : `  ${String(f.size ?? 0).padStart(10)}  ${when}  ${f.name}${f.is_symlink ? "  (symlink)" : ""}`;
+  });
+  const more = files.length > MAX ? `\n  … ${files.length - MAX} more entries (list a subdirectory instead)` : "";
+  return `${dir} — ${files.length} entries (bytes, modified, name):\n${lines.join("\n")}${more}`;
+}
+
+const SECRET_LINE_KEY = "(?:pass(?:word|wd|phrase)?|token|secret|api[_-]?key|private[_-]?key|credential)";
+/** `key = value`, `key: value` — the key alone on the left, named like a secret. */
+const KV_LINE = new RegExp(`^(\\s*["']?[A-Za-z0-9_.-]*${SECRET_LINE_KEY}[A-Za-z0-9_.-]*["']?\\s*[=:]\\s*)(.+)$`, "i");
+/** `-password x`, `--token=x` — a start script's command line. */
+const FLAG_ARG = new RegExp(`((?:^|\\s)--?${SECRET_LINE_KEY}(?:=|\\s+))("[^"]*"|'[^']*'|\\S+)`, "gi");
+
+/**
+ * Mask secret-looking values in file text before it reaches the model context.
+ * A server's files are where its passwords live — a game's `-password "x"` in a
+ * start script, `rcon_password=` in a cfg, a token in a `.env` — and a read tool
+ * must not become the channel that leaks them into chat. A heuristic by nature:
+ * it masks the value after a secret-named `key=` / `key:`, and the argument
+ * after a `-password` / `--token`-style flag; everything else passes untouched.
+ * Exported for testing.
+ */
+export function redactFileLines(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.replace(KV_LINE, (_m, pre: string) => `${pre}[redacted]`).replace(FLAG_ARG, (_m, pre: string) => `${pre}[redacted]`))
+    .join("\n");
+}
+
+/**
+ * The panel proxies file calls to Wings with a 15-second timeout
+ * (`panel.guzzle.timeout`, verified in the live config). A foreground pull that
+ * outlives it comes back as a daemon connection error even though Wings keeps
+ * downloading — so that one shape is "still running", not "failed".
+ */
+function looksLikeDaemonTimeout(res: { ok: boolean; status: number; text: string }): boolean {
+  return !res.ok && (res.status === 502 || res.status === 504 || /timed? ?out|cURL error 28|DaemonConnection|could not establish a connection|E_CONN/i.test(res.text));
 }
 
 /**
@@ -997,7 +1133,7 @@ class Pelican {
   private async request(
     api: PelicanApi,
     path: string,
-    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number> } = {},
+    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string } = {},
   ): Promise<{ ok: boolean; status: number; json?: unknown; text: string }> {
     assertTransportOk(this.base);
     const key = keyFor(this.cred, api);
@@ -1018,7 +1154,7 @@ class Pelican {
     // `$request->getContent()` — the egg document IS the body, not a field in a
     // JSON envelope — so it must not be re-serialized.
     const payload = opts.rawBody !== undefined ? opts.rawBody : opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
-    if (payload !== undefined) headers["Content-Type"] = "application/json";
+    if (payload !== undefined) headers["Content-Type"] = opts.contentType ?? "application/json";
     const res = await tlsFetch(
       `${this.base}/api/${api}${path}${qs}`,
       { method: opts.method ?? "GET", headers, body: payload },
@@ -1046,7 +1182,9 @@ class Pelican {
     // and list_servers (Application API) cheerfully shows the server, which makes
     // it look like a bug in Skeleton Key rather than a panel permission.
     const hint =
-      api === "client" && res.status === 404 && path.startsWith("/servers/")
+      api === "client" && res.status === 404 && path.includes("/files/")
+        ? ` — no such file or directory on the server (list_files to check the path), or the client key's user does not own this server (list_servers marks which it can act on).`
+        : api === "client" && res.status === 404 && path.startsWith("/servers/")
         ? ` — the Client API only sees servers its key's user OWNS or is a subuser on. Run list_servers: it marks which servers this key can act on, and names each owner. Fix by making that user the server's owner or adding them as a subuser in the panel.`
         : "";
     throw new Error(`Pelican HTTP ${res.status} on ${path}: ${scrubSecrets(detail || res.text).slice(0, 400)}${hint}`);
@@ -1662,6 +1800,164 @@ class Pelican {
 
   /** Disaster-recovery snapshot: the inventory needed to rebuild the panel's
    *  server layout. Redacted — environment variables carry game passwords. */
+  // --- files (client API) --------------------------------------------------
+
+  private filesPath(ref: string, op: string): string {
+    return `/servers/${encodeURIComponent(ref)}/files/${op}`;
+  }
+
+  private listDir(ref: string, directory: string): Promise<FileObject[]> {
+    return this.list<FileObject>("client", this.filesPath(ref, "list"), { directory });
+  }
+
+  async listFiles(ref: string, directory = "/"): Promise<string> {
+    const dir = assertVolumePath(directory, "directory", { allowRoot: true });
+    return summarizeFiles(dir, await this.listDir(ref, dir));
+  }
+
+  async readFile(ref: string, file: string, opts: { tail?: number; maxBytes?: number } = {}): Promise<string> {
+    const f = assertVolumePath(file, "file");
+    const path = this.filesPath(ref, "contents");
+    const res = await this.request("client", path, { query: { file: f } });
+    this.ensureOk(res, path, "client");
+    let text = res.text;
+    if (text.includes("\u0000")) return `'${f}' is binary (${Buffer.byteLength(text, "utf8")} bytes); not shown.`;
+    let note = "";
+    if (opts.tail && opts.tail > 0) {
+      const lines = text.split("\n");
+      if (lines.length > opts.tail) {
+        text = lines.slice(-opts.tail).join("\n");
+        note = ` (last ${opts.tail} of ${lines.length} lines)`;
+      }
+    }
+    const cap = Math.min(Math.max(opts.maxBytes ?? FILE_READ_DEFAULT_BYTES, 1024), FILE_READ_MAX_BYTES);
+    const buf = Buffer.from(text, "utf8");
+    if (buf.length > cap) {
+      text = (opts.tail ? buf.subarray(-cap) : buf.subarray(0, cap)).toString("utf8");
+      note += ` (truncated to ${cap} of ${buf.length} bytes${opts.tail ? ", from the end" : ""}; use tail/maxBytes to see more)`;
+    }
+    return `${f}${note}:\n${redactFileLines(text)}`;
+  }
+
+  async writeFile(ref: string, file: string, content: string): Promise<string> {
+    const f = assertVolumePath(file, "file");
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes > FILE_WRITE_MAX_BYTES) {
+      throw new Error(`Content is ${bytes} bytes; write_file caps at ${FILE_WRITE_MAX_BYTES}. Put large files on the server with pull_file instead.`);
+    }
+    const path = this.filesPath(ref, "write");
+    const res = await this.request("client", path, { method: "POST", query: { file: f }, rawBody: content, contentType: "text/plain" });
+    this.ensureOk(res, path, "client");
+    return `Wrote ${bytes} bytes to '${f}' on Pelican server '${ref}' on ${this.target.name}.`;
+  }
+
+  async createFolder(ref: string, root: string, name: string): Promise<string> {
+    const r = assertVolumePath(root, "root", { allowRoot: true });
+    const n = assertExactName(assertVolumePath(name, "name"), "name");
+    const path = this.filesPath(ref, "create-folder");
+    const res = await this.request("client", path, { method: "POST", body: { root: r, name: n } });
+    this.ensureOk(res, path, "client");
+    return `Created folder '${n}' under '${r}' on Pelican server '${ref}' on ${this.target.name}.`;
+  }
+
+  /**
+   * Ask Wings to download a URL into the volume, and don't report success until
+   * the file is actually there. The request is made in the foreground so a
+   * small file completes within the call; a large one outlives the panel's
+   * daemon timeout (see `looksLikeDaemonTimeout`), in which case the listing is
+   * polled until the size matches `expectedBytes` — or, without one, stops
+   * changing. The size check doubles as an integrity check when the caller knows
+   * the exact byte count of what it expects.
+   */
+  async pullFile(input: { server: string; url: string; directory?: string; filename: string; expectedBytes?: number }): Promise<string> {
+    const url = assertPullUrl(input.url);
+    const dir = assertVolumePath(input.directory ?? "/", "directory", { allowRoot: true });
+    const name = assertExactName(assertVolumePath(input.filename, "filename"), "filename");
+    if (name.includes("/")) throw new Error("'filename' is a bare file name; put the folder in 'directory'.");
+    const path = this.filesPath(input.server, "pull");
+    const res = await this.request("client", path, {
+      method: "POST",
+      body: { url: url.href, directory: dir, filename: name, use_header: false, foreground: true },
+    });
+    let how = "completed within the call";
+    if (!res.ok) {
+      if (!looksLikeDaemonTimeout(res)) this.ensureOk(res, path, "client");
+      how = "outlived the panel's 15s daemon timeout, so the listing was watched until it landed";
+    }
+    const landed = await this.waitForFile(input.server, dir, name, input.expectedBytes);
+    const size = landed.size ?? 0;
+    const check =
+      input.expectedBytes !== undefined
+        ? `${size} bytes — matches the expected size`
+        : `${size} bytes — size stable across two polls (pass expectedBytes to verify an exact byte count)`;
+    return `Pulled ${url.href} to '${dir === "/" ? "" : dir}/${name}' on Pelican server '${input.server}' on ${this.target.name}: ${check}. The download ${how}.`;
+  }
+
+  private async waitForFile(ref: string, dir: string, name: string, expectedBytes?: number): Promise<FileObject> {
+    const started = Date.now();
+    let last: FileObject | undefined;
+    let stable = 0;
+    for (;;) {
+      const entry = (await this.listDir(ref, dir)).find((f) => f.name === name);
+      if (entry) {
+        const size = entry.size ?? 0;
+        if (expectedBytes !== undefined) {
+          if (size === expectedBytes) return entry;
+          if (size > expectedBytes) {
+            throw new Error(`'${name}' landed at ${size} bytes but ${expectedBytes} were expected — wrong file or a changed upstream. Delete it before retrying.`);
+          }
+        } else if (last && (last.size ?? 0) === size && size > 0 && ++stable >= 2) {
+          return entry;
+        }
+        last = entry;
+      }
+      if (Date.now() - started > FILE_PULL_POLL.maxWaitMs) {
+        throw new Error(
+          `'${name}' did not finish landing in '${dir}' within ${Math.round(FILE_PULL_POLL.maxWaitMs / 1000)}s` +
+            `${last ? ` (last seen at ${last.size ?? 0} bytes${expectedBytes !== undefined ? ` of ${expectedBytes}` : ""})` : " (never appeared)"}. ` +
+            `Check list_files; Wings may still be downloading, or the download failed on its side.`,
+        );
+      }
+      await pauseMs(FILE_PULL_POLL.intervalMs);
+    }
+  }
+
+  async decompressFile(ref: string, root: string, file: string): Promise<string> {
+    const r = assertVolumePath(root, "root", { allowRoot: true });
+    const f = assertExactName(assertVolumePath(file, "file"), "file");
+    const path = this.filesPath(ref, "decompress");
+    const res = await this.request("client", path, { method: "POST", body: { root: r, file: f } });
+    this.ensureOk(res, path, "client");
+    const after = await this.listDir(ref, r);
+    return (
+      `Extracted '${f}' into '${r}' on Pelican server '${ref}' on ${this.target.name}. The archive itself is kept — delete_files to remove it.\n` +
+      summarizeFiles(r, after)
+    );
+  }
+
+  async renameFiles(ref: string, root: string, files: { from: string; to: string }[]): Promise<string> {
+    const r = assertVolumePath(root, "root", { allowRoot: true });
+    if (!files.length) throw new Error("'files' is empty — nothing to move.");
+    const moves = files.map((m, i) => ({
+      from: assertExactName(assertVolumePath(m.from, `files[${i}].from`), `files[${i}].from`),
+      to: assertExactName(assertVolumePath(m.to, `files[${i}].to`), `files[${i}].to`),
+    }));
+    const path = this.filesPath(ref, "rename");
+    const res = await this.request("client", path, { method: "PUT", body: { root: r, files: moves } });
+    this.ensureOk(res, path, "client");
+    return `Moved ${moves.length} item(s) under '${r}' on Pelican server '${ref}' on ${this.target.name}:\n${moves.map((m) => `  ${m.from} -> ${m.to}`).join("\n")}`;
+  }
+
+  async deleteFiles(ref: string, root: string, files: string[]): Promise<string> {
+    const r = assertVolumePath(root, "root", { allowRoot: true });
+    if (!files.length) throw new Error("'files' is empty — nothing to delete.");
+    const names = files.map((f, i) => assertExactName(assertVolumePath(f, `files[${i}]`), `files[${i}]`));
+    const path = this.filesPath(ref, "delete");
+    const res = await this.request("client", path, { method: "POST", body: { root: r, files: names } });
+    this.ensureOk(res, path, "client");
+    return `Deleted ${names.length} item(s) under '${r}' on Pelican server '${ref}' on ${this.target.name}: ${names.join(", ")}. There is no trash — this is permanent.`;
+  }
+
   async snapshot(): Promise<SnapshotArtifact[]> {
     const arts: SnapshotArtifact[] = [];
     const servers = await this.list<Server>("application", "/servers");
@@ -2248,6 +2544,152 @@ function buildTools(target: Target): ConnectorTool[] {
       inputSchema: z.object({ server: SERVER_REF }),
       confirm: (input, t) => `Assign an additional allocation to Pelican server '${(input as { server: string }).server}' on ${t.name} (the panel picks a free IP:port)`,
       run: run((p, i) => p.assignAllocation(i.server)),
+    },
+    // --- files (client API) ------------------------------------------------
+    {
+      name: "list_files",
+      description:
+        `List a directory inside a Pelican server's volume on ${target.name} (folders first; size in bytes). Paths are relative ` +
+        `to the server's root, e.g. '/' or '/BepInEx/plugins'. This is how you check what a game server actually has on disk — ` +
+        `its mods, configs, logs and saves — without shell access to the node.`,
+      tier: "read",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        directory: z.string().optional().describe("Directory to list, relative to the server root. Default '/'."),
+      }),
+      run: run((p, i) => p.listFiles(i.server, i.directory)),
+    },
+    {
+      name: "read_file",
+      description:
+        `Read a text file from a Pelican server's volume on ${target.name} — a config, a log, a start script. Capped at ` +
+        `${FILE_READ_DEFAULT_BYTES} bytes by default (${FILE_READ_MAX_BYTES} max) and the panel refuses files over 4 MiB; for a ` +
+        `big log pass 'tail' to get its last N lines. Values on secret-named lines (password=, token:, -password x) are masked ` +
+        `before the text comes back — a file read must never be how a game password reaches the chat. Binary files are refused.`,
+      tier: "read",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        file: z.string().min(1).describe("File path relative to the server root, e.g. '/BepInEx/LogOutput.log'."),
+        tail: z.number().int().positive().max(5000).optional().describe("Return only the last N lines."),
+        maxBytes: z.number().int().positive().optional().describe(`Byte cap for the returned text (1024–${FILE_READ_MAX_BYTES}).`),
+      }),
+      run: run((p, i) => p.readFile(i.server, i.file, { tail: i.tail, maxBytes: i.maxBytes })),
+    },
+    {
+      name: "write_file",
+      description:
+        `Write a text file into a Pelican server's volume on ${target.name}, creating or REPLACING it — for config files ` +
+        `(a BepInEx cfg, a mod's policy file, a start script). Capped at ${FILE_WRITE_MAX_BYTES} bytes; larger files go in with ` +
+        `pull_file. Never put a secret in 'content' — a game's password belongs in a vault-backed startup variable.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        file: z.string().min(1).describe("File path relative to the server root."),
+        content: z.string().describe("The complete new contents of the file."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; file: string; content: string };
+        return `Write ${Buffer.byteLength(i.content, "utf8")} bytes to '${i.file}' on Pelican server '${i.server}' on ${t.name} (replaces the file if it exists; contents not shown)`;
+      },
+      run: run((p, i) => p.writeFile(i.server, i.file, i.content)),
+    },
+    {
+      name: "create_folder",
+      description: `Create a folder inside a Pelican server's volume on ${target.name}. 'name' may be nested (e.g. 'BepInEx/plugins/Jotunn'); parents are created.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        root: z.string().optional().describe("Directory to create it under. Default '/'."),
+        name: z.string().min(1).describe("Folder name or relative path to create."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; root?: string; name: string };
+        return `Create folder '${i.name}' under '${i.root ?? "/"}' on Pelican server '${i.server}' on ${t.name}`;
+      },
+      run: run((p, i) => p.createFolder(i.server, i.root ?? "/", i.name)),
+    },
+    {
+      name: "pull_file",
+      description:
+        `Have the Wings daemon download a public https URL straight into a Pelican server's volume on ${target.name} — the way ` +
+        `to get a mod zip, a plugin or a world file onto a game server without shell access. The file lands owned by the server's ` +
+        `own user. Only public https sources are accepted (the daemon fetches from inside your LAN, so a private address is ` +
+        `refused). The call waits for the download; pass 'expectedBytes' (the exact size of the file you expect, e.g. from ` +
+        `downloading it yourself first) and the result is only reported as success when the landed size matches. Then ` +
+        `decompress_file to unpack it and rename_files to move pieces into place.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        url: z.string().url().describe("Public https URL to download, e.g. a thunderstore.io package download link."),
+        directory: z.string().optional().describe("Directory to download into, relative to the server root. Default '/'."),
+        filename: z.string().min(1).describe("File name to save as (required — many download URLs end in a version, not a name)."),
+        expectedBytes: z.number().int().positive().optional().describe("Exact expected size in bytes; the pull is verified against it."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; url: string; directory?: string; filename: string; expectedBytes?: number };
+        return `Download ${i.url} to '${(i.directory ?? "/").replace(/\/$/, "")}/${i.filename}' on Pelican server '${i.server}' on ${t.name} (the Wings daemon fetches it${i.expectedBytes ? `; expecting ${i.expectedBytes} bytes` : ""})`;
+      },
+      run: run((p, i) => p.pullFile(i)),
+    },
+    {
+      name: "decompress_file",
+      description:
+        `Extract an archive (zip, tar, tar.gz) already inside a Pelican server's volume on ${target.name}, in place, into 'root'. ` +
+        `Files already there with the same names are overwritten. The archive is kept. The result lists 'root' afterwards so ` +
+        `you can see the layout the archive produced before moving anything.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        root: z.string().optional().describe("Directory containing the archive and receiving its contents. Default '/'."),
+        file: z.string().min(1).describe("Archive file name, relative to 'root'."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; root?: string; file: string };
+        return `Extract '${i.file}' into '${i.root ?? "/"}' on Pelican server '${i.server}' on ${t.name} (may overwrite same-named files)`;
+      },
+      run: run((p, i) => p.decompressFile(i.server, i.root ?? "/", i.file)),
+    },
+    {
+      name: "rename_files",
+      description:
+        `Rename or MOVE files and folders inside a Pelican server's volume on ${target.name}. Each 'from'/'to' is relative to ` +
+        `'root' and 'to' may point into another folder, so this is how an extracted mod's DLL gets from a staging folder into ` +
+        `BepInEx/plugins. An existing destination is refused by the daemon, never overwritten — delete it first if you mean to.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        root: z.string().optional().describe("Directory both sides are relative to. Default '/'."),
+        files: z
+          .array(z.object({ from: z.string().min(1), to: z.string().min(1) }))
+          .min(1)
+          .max(100)
+          .describe("Moves to perform, in order: [{from, to}]."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; root?: string; files: { from: string; to: string }[] };
+        const shown = i.files.slice(0, 8).map((m) => `${m.from} -> ${m.to}`);
+        const more = i.files.length > 8 ? ` (+${i.files.length - 8} more)` : "";
+        return `Move ${i.files.length} item(s) under '${i.root ?? "/"}' on Pelican server '${i.server}' on ${t.name}: ${shown.join("; ")}${more}`;
+      },
+      run: run((p, i) => p.renameFiles(i.server, i.root ?? "/", i.files)),
+    },
+    {
+      name: "delete_files",
+      description:
+        `PERMANENTLY delete files or folders inside a Pelican server's volume on ${target.name} — there is no trash. Names are ` +
+        `exact (no patterns) and relative to 'root'; the volume root itself is refused. Meant for cleaning up a downloaded ` +
+        `archive or a staging folder; think twice before pointing it at a game's save directory.`,
+      tier: "execute",
+      inputSchema: z.object({
+        server: SERVER_REF,
+        root: z.string().optional().describe("Directory the names are relative to. Default '/'."),
+        files: z.array(z.string().min(1)).min(1).max(100).describe("Exact file/folder names to delete."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { server: string; root?: string; files: string[] };
+        return `PERMANENTLY delete [${i.files.join(", ")}] under '${i.root ?? "/"}' on Pelican server '${i.server}' on ${t.name} (no trash)`;
+      },
+      run: run((p, i) => p.deleteFiles(i.server, i.root ?? "/", i.files)),
     },
   ];
 }
