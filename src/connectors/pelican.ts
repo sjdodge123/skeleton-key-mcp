@@ -414,21 +414,33 @@ function isLocalHostname(host: string): boolean {
  * Exported for testing.
  */
 export function assertEggSourceUrl(raw: string): URL {
+  return assertPublicHttpsUrl(raw, {
+    what: "an egg",
+    verb: "fetch",
+    why: "This tool fetches from inside your network, so it is restricted to public https sources (e.g. raw.githubusercontent.com). Paste the egg via 'content' instead.",
+  });
+}
+
+/**
+ * The one rule behind every URL Skeleton Key (or a daemon it drives) fetches
+ * from inside the LAN: https, and a public host — never loopback, private,
+ * link-local or a local-only name. The messages are parameterized so each
+ * caller can say who makes the request and what to do instead.
+ */
+function assertPublicHttpsUrl(raw: string, msg: { what: string; verb: string; why: string }): URL {
   let url: URL;
   try {
     url = new URL(raw.trim());
   } catch {
-    throw new Error(`Invalid egg URL '${raw}'.`);
+    throw new Error(`Invalid ${msg.what} URL '${raw}'.`);
   }
   if (url.protocol !== "https:") {
-    throw new Error(`Refusing to fetch an egg over '${url.protocol}' — use https so the egg can't be swapped in transit.`);
+    throw new Error(`Refusing to ${msg.verb} ${msg.what} over '${url.protocol}' — use https so it can't be swapped in transit.`);
   }
   const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (isInsideNetworkHost(host)) {
     throw new Error(
-      `Refusing to fetch an egg from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ` +
-        `This tool fetches from inside your network, so it is restricted to public https sources (e.g. raw.githubusercontent.com). ` +
-        `Paste the egg via 'content' instead.`,
+      `Refusing to ${msg.verb} ${msg.what} from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ${msg.why}`,
     );
   }
   return url;
@@ -482,23 +494,11 @@ export function assertExactName(name: string, field: string): string {
  * says so before any request is made. Exported for testing.
  */
 export function assertPullUrl(raw: string): URL {
-  let url: URL;
-  try {
-    url = new URL(raw.trim());
-  } catch {
-    throw new Error(`Invalid download URL '${raw}'.`);
-  }
-  if (url.protocol !== "https:") {
-    throw new Error(`Refusing to pull a file over '${url.protocol}' — use https so the file can't be swapped in transit.`);
-  }
-  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (isInsideNetworkHost(host)) {
-    throw new Error(
-      `Refusing to pull from '${url.hostname}' — that address is loopback, private, link-local or otherwise inside the network. ` +
-        `The download is made by the Wings daemon from inside your LAN, so it is restricted to public https sources (e.g. thunderstore.io).`,
-    );
-  }
-  return url;
+  return assertPublicHttpsUrl(raw, {
+    what: "a download",
+    verb: "pull",
+    why: "The download is made by the Wings daemon from inside your LAN, so it is restricted to public https sources (e.g. thunderstore.io).",
+  });
 }
 
 const FILE_READ_DEFAULT_BYTES = 64 * 1024;
@@ -506,8 +506,11 @@ const FILE_READ_DEFAULT_BYTES = 64 * 1024;
 export const FILE_READ_MAX_BYTES = 256 * 1024;
 /** write_file is for config files; anything bigger is a download, not a chat payload. */
 export const FILE_WRITE_MAX_BYTES = 512 * 1024;
-/** How pull_file watches a download land. Mutable so tests don't wait. */
-export const FILE_PULL_POLL = { intervalMs: 2000, maxWaitMs: 180_000 };
+/** How pull_file watches a download land. `appearWithinMs` is how long a file
+ *  may take to show up at all — Wings creates it before streaming, so a long
+ *  absence means the download never started (a Wings-side refusal that the
+ *  panel reported as a generic error). Mutable so tests don't wait. */
+export const FILE_PULL_POLL = { intervalMs: 2000, maxWaitMs: 180_000, appearWithinMs: 30_000 };
 
 const pauseMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -539,10 +542,16 @@ export function summarizeFiles(dir: string, files: FileObject[]): string {
 }
 
 const SECRET_LINE_KEY = "(?:pass(?:word|wd|phrase)?|token|secret|api[_-]?key|private[_-]?key|credential)";
-/** `key = value`, `key: value` — the key alone on the left, named like a secret. */
-const KV_LINE = new RegExp(`^(\\s*["']?[A-Za-z0-9_.-]*${SECRET_LINE_KEY}[A-Za-z0-9_.-]*["']?\\s*[=:]\\s*)(.+)$`, "i");
-/** `-password x`, `--token=x` — a start script's command line. */
-const FLAG_ARG = new RegExp(`((?:^|\\s)--?${SECRET_LINE_KEY}(?:=|\\s+))("[^"]*"|'[^']*'|\\S+)`, "gi");
+/** `key = value`, `key: value` — a secret-named key alone on the left, allowing a
+ *  comment marker (a commented-out password is still a password) and a shell
+ *  `export` / batch `set` prefix. */
+const KV_LINE = new RegExp(
+  `^(\\s*(?:[#;]+\\s*|//\\s*)?(?:(?:export|set)\\s+)?["']?[A-Za-z0-9_.-]*${SECRET_LINE_KEY}[A-Za-z0-9_.-]*["']?\\s*[=:]\\s*)(.+)$`,
+  "i",
+);
+/** `-password x`, `--token=x`, `+sv_password x`, `-rconpassword x` — a start
+ *  script's or cvar list's command line. */
+const FLAG_ARG = new RegExp(`((?:^|\\s)[-+]{1,2}[A-Za-z0-9_.]*${SECRET_LINE_KEY}(?:=|\\s+))("[^"]*"|'[^']*'|\\S+)`, "gi");
 
 /**
  * Mask secret-looking values in file text before it reaches the model context.
@@ -565,9 +574,21 @@ export function redactFileLines(text: string): string {
  * (`panel.guzzle.timeout`, verified in the live config). A foreground pull that
  * outlives it comes back as a daemon connection error even though Wings keeps
  * downloading — so that one shape is "still running", not "failed".
+ *
+ * Telling the two apart needs the envelope's `code`, not its text: the live
+ * panel's Handler renders any non-HTTP exception as a 500 whose `detail` is the
+ * generic "An unexpected error was encountered…" and whose `code` is the
+ * exception's class name — `ConnectionException` for a timeout (Laravel's HTTP
+ * client could not get an answer), `RequestException` when Wings DID answer,
+ * with an error (bad URL, internal address, disk limit). The latter is a real
+ * failure and must surface at once. Exported for testing.
  */
-function looksLikeDaemonTimeout(res: { ok: boolean; status: number; text: string }): boolean {
-  return !res.ok && (res.status === 502 || res.status === 504 || /timed? ?out|cURL error 28|DaemonConnection|could not establish a connection|E_CONN/i.test(res.text));
+export function looksLikeDaemonTimeout(res: { ok: boolean; status: number; json?: unknown; text: string }): boolean {
+  if (res.ok) return false;
+  const codes = ((res.json as { errors?: { code?: string }[] })?.errors ?? []).map((e) => e.code ?? "");
+  if (codes.some((c) => /RequestException/i.test(c))) return false;
+  if (codes.some((c) => /ConnectionException/i.test(c))) return true;
+  return res.status === 502 || res.status === 504 || /timed? ?out|cURL error 28|could not establish a connection|E_CONN/i.test(res.text);
 }
 
 /**
@@ -1175,7 +1196,12 @@ class Pelican {
   private ensureOk(res: { ok: boolean; status: number; json?: unknown; text: string }, path: string, api?: PelicanApi): void {
     if (res.ok) return;
     const errs = (res.json as { errors?: { detail?: string; code?: string }[] })?.errors;
-    const detail = errs?.map((e) => e.detail ?? e.code).filter(Boolean).join("; ");
+    // The panel renders any non-HTTP exception with a generic detail and puts the
+    // only real information — the exception class — in `code`; surface it then.
+    const detail = errs
+      ?.map((e) => (e.code && e.detail && /^An unexpected error was encountered/i.test(e.detail) ? `${e.code}: ${e.detail}` : (e.detail ?? e.code)))
+      .filter(Boolean)
+      .join("; ");
     // A Client-API 404 on a server path almost never means "no such server" — it
     // means the client key's user neither owns it nor is a subuser on it, so the
     // panel hides it entirely. Without this hint the failure looks like a bad id,
@@ -1820,8 +1846,11 @@ class Pelican {
     const path = this.filesPath(ref, "contents");
     const res = await this.request("client", path, { query: { file: f } });
     this.ensureOk(res, path, "client");
-    let text = res.text;
-    if (text.includes("\u0000")) return `'${f}' is binary (${Buffer.byteLength(text, "utf8")} bytes); not shown.`;
+    if (res.text.includes("\u0000")) return `'${f}' is binary (${Buffer.byteLength(res.text, "utf8")} bytes); not shown.`;
+    // Redact on the WHOLE text, before any cut: a tail or byte cap that lands
+    // mid-line would otherwise strip the `password =` the mask keys on and hand
+    // back the rest of the value.
+    let text = redactFileLines(res.text);
     let note = "";
     if (opts.tail && opts.tail > 0) {
       const lines = text.split("\n");
@@ -1836,7 +1865,7 @@ class Pelican {
       text = (opts.tail ? buf.subarray(-cap) : buf.subarray(0, cap)).toString("utf8");
       note += ` (truncated to ${cap} of ${buf.length} bytes${opts.tail ? ", from the end" : ""}; use tail/maxBytes to see more)`;
     }
-    return `${f}${note}:\n${redactFileLines(text)}`;
+    return `${f}${note}:\n${text}`;
   }
 
   async writeFile(ref: string, file: string, content: string): Promise<string> {
@@ -1880,20 +1909,39 @@ class Pelican {
       body: { url: url.href, directory: dir, filename: name, use_header: false, foreground: true },
     });
     let how = "completed within the call";
+    let panelError: string | undefined;
     if (!res.ok) {
       if (!looksLikeDaemonTimeout(res)) this.ensureOk(res, path, "client");
+      panelError = scrubSecrets(res.text).slice(0, 300);
       how = "outlived the panel's 15s daemon timeout, so the listing was watched until it landed";
     }
-    const landed = await this.waitForFile(input.server, dir, name, input.expectedBytes);
+    const landed = await this.waitForFile(input.server, dir, name, { expectedBytes: input.expectedBytes, settled: res.ok, panelError });
     const size = landed.size ?? 0;
     const check =
       input.expectedBytes !== undefined
         ? `${size} bytes — matches the expected size`
-        : `${size} bytes — size stable across two polls (pass expectedBytes to verify an exact byte count)`;
+        : res.ok
+          ? `${size} bytes (pass expectedBytes to verify an exact byte count)`
+          : `${size} bytes — size stable across two polls (pass expectedBytes to verify an exact byte count)`;
     return `Pulled ${url.href} to '${dir === "/" ? "" : dir}/${name}' on Pelican server '${input.server}' on ${this.target.name}: ${check}. The download ${how}.`;
   }
 
-  private async waitForFile(ref: string, dir: string, name: string, expectedBytes?: number): Promise<FileObject> {
+  /**
+   * Watch a pulled file land. `settled` means the panel answered 2xx to a
+   * FOREGROUND pull, i.e. Wings finished before replying, so the first sighting
+   * is final and no stability polls are spent; otherwise the download is still
+   * running and the size must match `expectedBytes` or hold still across two
+   * polls. A file that never appears within `appearWithinMs` is a download that
+   * never started — reported with the panel's original error, if there was one,
+   * rather than after the full wait.
+   */
+  private async waitForFile(
+    ref: string,
+    dir: string,
+    name: string,
+    opts: { expectedBytes?: number; settled: boolean; panelError?: string },
+  ): Promise<FileObject> {
+    const { expectedBytes, settled, panelError } = opts;
     const started = Date.now();
     let last: FileObject | undefined;
     let stable = 0;
@@ -1903,18 +1951,25 @@ class Pelican {
         const size = entry.size ?? 0;
         if (expectedBytes !== undefined) {
           if (size === expectedBytes) return entry;
-          if (size > expectedBytes) {
+          if (size > expectedBytes || settled) {
             throw new Error(`'${name}' landed at ${size} bytes but ${expectedBytes} were expected — wrong file or a changed upstream. Delete it before retrying.`);
           }
-        } else if (last && (last.size ?? 0) === size && size > 0 && ++stable >= 2) {
+        } else if (settled || (last && (last.size ?? 0) === size && size > 0 && ++stable >= 2)) {
           return entry;
         }
         last = entry;
       }
-      if (Date.now() - started > FILE_PULL_POLL.maxWaitMs) {
+      const elapsed = Date.now() - started;
+      if (!entry && !last && elapsed > FILE_PULL_POLL.appearWithinMs) {
+        throw new Error(
+          `'${name}' never appeared in '${dir}' within ${Math.round(FILE_PULL_POLL.appearWithinMs / 1000)}s — the download did not start. ` +
+            `${panelError ? `The panel's error was: ${panelError}. ` : ""}Check the URL (Wings refuses ones that resolve inside the network) and the server's disk limit.`,
+        );
+      }
+      if (elapsed > FILE_PULL_POLL.maxWaitMs) {
         throw new Error(
           `'${name}' did not finish landing in '${dir}' within ${Math.round(FILE_PULL_POLL.maxWaitMs / 1000)}s` +
-            `${last ? ` (last seen at ${last.size ?? 0} bytes${expectedBytes !== undefined ? ` of ${expectedBytes}` : ""})` : " (never appeared)"}. ` +
+            `${last ? ` (last seen at ${last.size ?? 0} bytes${expectedBytes !== undefined ? ` of ${expectedBytes}` : ""})` : ""}. ` +
             `Check list_files; Wings may still be downloading, or the download failed on its side.`,
         );
       }

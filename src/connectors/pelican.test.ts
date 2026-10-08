@@ -34,6 +34,7 @@ import {
   FILE_PULL_POLL,
   FILE_READ_MAX_BYTES,
   FILE_WRITE_MAX_BYTES,
+  looksLikeDaemonTimeout,
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 import { checkCommand } from "./command-policy.js";
@@ -1375,8 +1376,18 @@ describe("files — guards", () => {
       "LogLevels = Fatal, Error, Warning",
       '"author": "denikson"',
       "SteamAppId=892970",
+      "# password = commented-out-but-real",
+      "export STEAM_PASS=exported1",
+      "set RCON_PASSWORD=batch1",
+      '+sv_password "cvar1" +maxplayers 16',
+      "-rconpassword rcon1 -port 27015",
     ].join("\n");
     const out = redactFileLines(input);
+    for (const leaked of ["commented-out-but-real", "exported1", "batch1", "cvar1", "rcon1"]) expect(out).not.toContain(leaked);
+    expect(out).toContain("# password = [redacted]");
+    expect(out).toContain("export STEAM_PASS=[redacted]");
+    expect(out).toContain("+sv_password [redacted] +maxplayers 16");
+    expect(out).toContain("-rconpassword [redacted] -port 27015");
     expect(out).not.toContain("hunter2");
     expect(out).not.toContain('"abc"');
     expect(out).not.toContain("xoxb-123");
@@ -1432,6 +1443,19 @@ describe("files — client API tools", () => {
     expect(res.text).not.toContain("line 47");
     expect(res.text).not.toContain("hunter2");
     expect(res.text).toContain("password = [redacted]");
+  });
+
+  it("read_file redacts BEFORE cutting, so a tail that lands mid-line cannot expose the rest of a value", async () => {
+    const secret = "S3cr3tValueThatIsLongEnoughToBeCut";
+    const body = `prefix\npassword = ${secret}`;
+    mockFetch([{ match: () => true, reply: { text: body } }]);
+    // maxBytes clamps to 1024 minimum, so pad the file to force a byte cut from the end inside the password line.
+    const padded = `${"x".repeat(2000)}\n${body}\n${"y".repeat(1100)}`;
+    mockFetch([{ match: () => true, reply: { text: padded } }]);
+    const res = await tool("read_file").run({ server: REF, file: "/x.cfg", tail: 2, maxBytes: 1024 }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).not.toContain(secret);
+    expect(res.text).not.toContain(secret.slice(-10));
   });
 
   it("read_file caps the bytes it returns and says so", async () => {
@@ -1509,9 +1533,56 @@ describe("files — client API tools", () => {
     expect(JSON.parse(writes(calls)[0]!.init.body)).toEqual({ url, directory: "/_staging", filename: "bepinex.zip", use_header: false, foreground: true });
     expect(authOn(calls[0]!)).toBe(`Bearer ${CLI}`);
     expect(res.text).toContain("702924 bytes — matches");
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(1);
     expect(t.confirm!(input, target())).toBe(
       `Download ${url} to '/_staging/bepinex.zip' on Pelican server '${REF}' on pelican-panel (the Wings daemon fetches it; expecting 702924 bytes)`,
     );
+  });
+
+  it("a completed foreground pull without expectedBytes is accepted on first sight", async () => {
+    FILE_PULL_POLL.intervalMs = 1;
+    const calls = mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 204 } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("x.zip", 10)]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(1);
+    expect(res.text).toContain("10 bytes");
+  });
+
+  it("looksLikeDaemonTimeout keys on the envelope's exception class, as the live panel renders it", () => {
+    const env = (code: string) => ({ ok: false, status: 500, json: { errors: [{ code, status: "500", detail: "An unexpected error was encountered while processing this request, please try again." }] }, text: "" });
+    expect(looksLikeDaemonTimeout(env("ConnectionException"))).toBe(true); // panel→Wings timed out; Wings keeps downloading
+    expect(looksLikeDaemonTimeout(env("RequestException"))).toBe(false); // Wings answered with an error — a real failure
+    expect(looksLikeDaemonTimeout({ ok: false, status: 504, text: "Gateway Time-out" })).toBe(true);
+    expect(looksLikeDaemonTimeout({ ok: false, status: 422, text: "The url field must be a valid URL." })).toBe(false);
+    expect(looksLikeDaemonTimeout({ ok: true, status: 204, text: "" })).toBe(false);
+  });
+
+  it("pull_file fails at once on a Wings-side refusal (RequestException), without polling", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 500, json: { errors: [{ code: "RequestException", status: "500", detail: "An unexpected error was encountered while processing this request, please try again." }] } } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("RequestException");
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(0);
+  });
+
+  it("pull_file gives up quickly, quoting the panel's error, when the file never appears", async () => {
+    FILE_PULL_POLL.intervalMs = 1;
+    FILE_PULL_POLL.appearWithinMs = 15;
+    FILE_PULL_POLL.maxWaitMs = 10_000;
+    mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 500, json: { errors: [{ code: "ConnectionException", status: "500", detail: "An unexpected error was encountered while processing this request, please try again." }] } } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("never appeared");
+    expect(res.text).toContain("ConnectionException");
   });
 
   it("pull_file survives the panel's 15s daemon timeout by watching the file land", async () => {
@@ -1521,7 +1592,7 @@ describe("files — client API tools", () => {
     mockFetch([
       {
         match: (u) => u.includes("/files/pull"),
-        reply: { status: 504, json: { errors: [{ code: "DaemonConnectionException", detail: "Could not establish a connection to the machine running this server. Please try again." }] } },
+        reply: { status: 500, json: { errors: [{ code: "ConnectionException", status: "500", detail: "An unexpected error was encountered while processing this request, please try again." }] } },
       },
       {
         match: (u) => u.includes("/files/list"),
@@ -1548,8 +1619,10 @@ describe("files — client API tools", () => {
     const big = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip", expectedBytes: 100 }, ctx());
     expect(big.isError).toBe(true);
     expect(big.text).toContain("999999 bytes but 100 were expected");
+    const settledShort = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip", expectedBytes: 100 }, ctx());
+    expect(settledShort.isError).toBe(true); // a FINISHED download that is the wrong size is wrong now, not "still landing"
     mockFetch([
-      { match: (u) => u.includes("/files/pull"), reply: { status: 204 } },
+      { match: (u) => u.includes("/files/pull"), reply: { status: 504, text: "Gateway Time-out" } },
       { match: (u) => u.includes("/files/list"), reply: { json: list([fileObj("x.zip", 50)]) } },
     ]);
     const stuck = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip", expectedBytes: 100 }, ctx());
