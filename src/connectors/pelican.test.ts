@@ -651,6 +651,106 @@ describe("update_server_startup (the admin-API repair path)", () => {
   });
 });
 
+describe("update_server_build (the full-payload build route)", () => {
+  /** What GET /api/application/servers/125 returns: the deprecated oom_disabled
+   *  sits beside oom_killer, and `allocation` is the primary allocation id. */
+  const valheim = item({
+    id: 125,
+    name: "Valheim",
+    allocation: 42,
+    limits: { memory: 8192, swap: 0, disk: 20480, io: 500, cpu: 0, threads: null, oom_disabled: true, oom_killer: false },
+    feature_limits: { databases: 0, allocations: 2, backups: 3 },
+  });
+  const notFound = { status: 404, json: { errors: [{ code: "NotFoundHttpException", detail: "The requested resource does not exist on this server." }] } };
+  const routes = (server: unknown = valheim) => [
+    { match: (u: string, i: any) => u.includes("/build") && i?.method === "PATCH", reply: { json: item({ id: 125 }) } },
+    { match: (u: string) => /\/servers\/125\b/.test(u), reply: { json: server } },
+    { match: (u: string) => /\/servers\/\d+/.test(u), reply: notFound },
+  ];
+
+  it("a backups-only change sends the FULL build with every other limit preserved (the panel zeroes what it isn't sent)", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_build").run({ id: 125, featureLimits: { backups: 2 } }, ctx());
+    expect(res.isError).toBeFalsy();
+    const patch = writes(calls)[0]!;
+    expect(patch.url).toContain("/api/application/servers/125/build");
+    expect(patch.init.method).toBe("PATCH");
+    expect(authOn(patch)).toBe(`Bearer ${APP}`);
+    expect(JSON.parse(patch.init.body)).toEqual({
+      allocation: 42, // the primary allocation, re-sent so it never moves
+      oom_killer: false, // the top-level boolean the request validates — NOT limits.oom_disabled
+      limits: { memory: 8192, swap: 0, disk: 20480, io: 500, cpu: 0, threads: null },
+      feature_limits: { databases: 0, allocations: 2, backups: 2 },
+    });
+    expect(res.text).toContain("feature_limits.backups 3 → 2");
+    expect(res.text).toContain("Revert");
+  });
+
+  it("merges a resource-limit change the same way and reports prior → new per field", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_build").run({ id: 125, limits: { memory: 12288 }, featureLimits: { backups: 3 } }, ctx());
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(writes(calls)[0]!.init.body);
+    expect(body.limits).toEqual({ memory: 12288, swap: 0, disk: 20480, io: 500, cpu: 0, threads: null });
+    expect(body.feature_limits).toEqual({ databases: 0, allocations: 2, backups: 3 });
+    expect(res.text).toContain("limits.memory 8192 → 12288");
+    expect(res.text).toContain("feature_limits.backups 3 → 3 (unchanged)");
+  });
+
+  it("refuses an unknown field before any request", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_build").run({ id: 125, featureLimits: { backup: 2 } }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("'backup'");
+    expect(res.text).toContain("backups"); // names the known fields so the fix is obvious
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the input schema refuses an unknown field too, so the gate can't strip it silently", () => {
+    const schema = tool("update_server_build").inputSchema;
+    expect(schema.safeParse({ id: 125, featureLimits: { backups: 2 } }).success).toBe(true);
+    expect(schema.safeParse({ id: 125, featureLimits: { backup: 2 } }).success).toBe(false);
+    expect(schema.safeParse({ id: 125, limits: { ram: 1 } }).success).toBe(false);
+    expect(schema.safeParse({ id: 125, backups: 2 }).success).toBe(false);
+  });
+
+  it("errors clearly on a server that does not exist, and sends nothing", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_build").run({ id: 999, featureLimits: { backups: 2 } }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("999");
+    expect(res.text).toContain("list_servers");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("FAILS CLOSED when the panel omits a current limit, rather than sending a guess", async () => {
+    const partial = item({ id: 125, name: "Valheim", allocation: 42, limits: { memory: 8192, swap: 0, disk: 20480, io: 500, cpu: 0 } });
+    const calls = mockFetch(routes(partial));
+    const res = await tool("update_server_build").run({ id: 125, featureLimits: { backups: 2 } }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("feature_limits.databases");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("requires at least one field to change", async () => {
+    const calls = mockFetch(routes());
+    const res = await tool("update_server_build").run({ id: 125 }, ctx());
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("is execute-tier and the confirm names the server and exactly the fields changing", () => {
+    const t = tool("update_server_build");
+    expect(t.tier).toBe("execute");
+    expect(t.confirm!({ id: 125, featureLimits: { backups: 2 } }, target({ ownerUserId: 7 }))).toBe(
+      "Change build of Pelican server [125] on pelican-panel: feature_limits.backups=2 (every other build field is re-sent unchanged)",
+    );
+    expect(t.confirm!({ id: 125, limits: { memory: 12288, threads: null }, oomKiller: true }, target())).toContain(
+      "limits.memory=12288, limits.threads=null, oom_killer=true",
+    );
+  });
+});
+
 describe("schedules", () => {
   it("create_schedule attaches the power task in the same call", async () => {
     const calls = mockFetch([
@@ -1298,6 +1398,7 @@ describe("connector wiring", () => {
       "pull_file",
       "rename_files",
       "update_schedule",
+      "update_server_build",
       "update_server_startup",
       "update_startup_variables",
       "write_file",
