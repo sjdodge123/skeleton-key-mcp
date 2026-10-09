@@ -938,6 +938,7 @@ interface Server {
   egg?: number;
   allocation?: number;
   limits?: Record<string, unknown>;
+  feature_limits?: Record<string, unknown>;
   [k: string]: unknown;
 }
 interface Schedule {
@@ -1117,6 +1118,33 @@ export function assertCronField(name: string, value: string): void {
 }
 
 /** Pelican client bound to one target. */
+/** The build fields `update_server_build` can change, by the panel's names. */
+const BUILD_LIMIT_KEYS = ["memory", "swap", "disk", "io", "cpu", "threads"] as const;
+const BUILD_FEATURE_KEYS = ["databases", "allocations", "backups"] as const;
+type BuildLimitsInput = { memory?: number; swap?: number; disk?: number; io?: number; cpu?: number; threads?: string | null };
+type BuildFeatureLimitsInput = { databases?: number; allocations?: number; backups?: number };
+type UpdateServerBuildInput = { id: number; limits?: BuildLimitsInput; featureLimits?: BuildFeatureLimitsInput; oomKiller?: boolean };
+
+/** Refuse a key this tool doesn't know. The panel would ignore it and the
+ *  caller would believe the change landed. */
+function assertKnownKeys(label: string, obj: unknown, known: readonly string[]): void {
+  if (!obj || typeof obj !== "object") return;
+  const unknown = Object.keys(obj).filter((k) => !known.includes(k));
+  if (unknown.length) {
+    throw new Error(`Unknown ${label} field(s) ${unknown.map((k) => `'${k}'`).join(", ")} — known: ${known.join(", ")}.`);
+  }
+}
+
+/** The `path → value` pairs a build update names, in the panel's field names —
+ *  shared by the confirm text and the prior → new report so they agree. */
+function buildChanges(input: UpdateServerBuildInput): [string, unknown][] {
+  const out: [string, unknown][] = [];
+  for (const [k, v] of Object.entries(input.limits ?? {})) if (v !== undefined) out.push([`limits.${k}`, v]);
+  for (const [k, v] of Object.entries(input.featureLimits ?? {})) if (v !== undefined) out.push([`feature_limits.${k}`, v]);
+  if (input.oomKiller !== undefined) out.push(["oom_killer", input.oomKiller]);
+  return out;
+}
+
 class Pelican {
   constructor(
     private readonly target: Target,
@@ -1639,6 +1667,112 @@ class Pelican {
       `${input.startup ? "Startup command replaced. " : ""}${input.dockerImage ? `Docker image set to ${input.dockerImage}. ` : ""}` +
       `Variables are read at boot, and a changed appid or library path only takes effect after a REINSTALL — restart alone is not enough.` +
       (await this.fingerprints(secrets))
+    );
+  }
+
+  /** GET one server by NUMERIC id on the application half, turning the panel's
+   *  bare 404 into the "wrong kind of id" message the caller can act on. */
+  private async applicationServer(id: number): Promise<Server> {
+    const path = `/servers/${id}`;
+    const res = await this.request("application", path);
+    const notFound = `No Pelican server with id ${id}. Use list_servers — this tool takes the NUMERIC id, not the identifier.`;
+    if (res.status === 404) throw new Error(notFound);
+    this.ensureOk(res, path, "application");
+    const server = (res.json as { attributes?: Server })?.attributes;
+    if (!server?.id) throw new Error(notFound);
+    return server;
+  }
+
+  /**
+   * Change a server's build — resource limits, feature limits (backups,
+   * databases, allocations) and the OOM killer — through the APPLICATION API,
+   * by NUMERIC id. Pelican's `PATCH /servers/{id}/build` wants the WHOLE build
+   * on every call (verified against the panel's
+   * UpdateServerBuildConfigurationRequest and BuildModificationService on main
+   * and v1.0.0-beta35): `feature_limits` is `required`, each `limits.*` is
+   * `required_with:limits`, and the service writes `database_limit` /
+   * `allocation_limit` / `backup_limit` with a default of 0 — so a request
+   * naming only `backups` would silently ZERO the other two. This reads the
+   * server, merges the caller's fields over the current values and sends the
+   * complete body, then reports prior → new so the change can be reverted. A
+   * current value the panel does not return fails the call closed rather than
+   * being guessed.
+   *
+   * Field names follow the request, not the GET: the OOM switch is a top-level
+   * boolean `oom_killer`; the `limits.oom_disabled` the GET also returns is its
+   * deprecated inverse and is not accepted on write.
+   */
+  async updateServerBuild(input: UpdateServerBuildInput): Promise<string> {
+    // Unknown fields are refused BEFORE any request is made.
+    assertKnownKeys("update_server_build", input, ["id", "limits", "featureLimits", "oomKiller"]);
+    assertKnownKeys("limits", input.limits, BUILD_LIMIT_KEYS);
+    assertKnownKeys("featureLimits", input.featureLimits, BUILD_FEATURE_KEYS);
+    const wanted = buildChanges(input);
+    if (!wanted.length) throw new Error("update_server_build needs at least one field to change: limits.*, featureLimits.* or oomKiller.");
+
+    const server = await this.applicationServer(input.id);
+    const curLimits = (server.limits ?? {}) as Record<string, unknown>;
+    const curFeature = (server.feature_limits ?? {}) as Record<string, unknown>;
+    /** A current numeric value the full payload must carry. Missing ⇒ fail
+     *  closed: the route replaces every limit, and the service writes a missing
+     *  feature limit as 0. */
+    const reported = (path: string, v: unknown): number => {
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+      if (!Number.isFinite(n)) {
+        throw new Error(
+          `The panel did not report '${path}' for server ${input.id}, so the full build cannot be rebuilt safely — refusing to guess, ` +
+            `because the build route replaces every limit and writes a missing feature limit as 0. Check server_details.`,
+        );
+      }
+      return n;
+    };
+
+    const limits: Record<string, number | string | null> = {};
+    for (const k of ["memory", "swap", "disk", "io", "cpu"] as const) limits[k] = input.limits?.[k] ?? reported(`limits.${k}`, curLimits[k]);
+    // threads is CPU pinning ('0-1,3') or null, and null is a real value (clear
+    // the pinning) — so presence, not nullish-ness, decides whether it was set.
+    const curThreads = typeof curLimits.threads === "string" && curLimits.threads !== "" ? curLimits.threads : null;
+    limits.threads = input.limits && "threads" in input.limits ? (input.limits.threads ?? null) : curThreads;
+
+    const feature: Record<string, number> = {};
+    for (const k of BUILD_FEATURE_KEYS) feature[k] = input.featureLimits?.[k] ?? reported(`feature_limits.${k}`, curFeature[k]);
+
+    const curOom =
+      typeof curLimits.oom_killer === "boolean" ? curLimits.oom_killer : typeof curLimits.oom_disabled === "boolean" ? !curLimits.oom_disabled : undefined;
+    const oomKiller = input.oomKiller ?? curOom;
+
+    // The primary allocation is part of the build: re-send the current one so it
+    // never moves. Pelican allows a server with no allocation — then the key is
+    // omitted (its rule is sometimes|nullable) rather than invented.
+    const allocation = typeof server.allocation === "number" ? server.allocation : undefined;
+
+    const body = {
+      ...(allocation !== undefined ? { allocation } : {}),
+      ...(oomKiller !== undefined ? { oom_killer: oomKiller } : {}),
+      limits,
+      feature_limits: feature,
+    };
+    const path = `/servers/${input.id}/build`;
+    const res = await this.request("application", path, { method: "PATCH", body });
+    this.ensureOk(res, path, "application");
+
+    const fmt = (v: unknown): string => (v === undefined ? "?" : v === null ? "null" : String(v));
+    const priorOf = (p: string): unknown =>
+      p === "oom_killer" ? curOom : p === "limits.threads" ? curThreads : p.startsWith("limits.") ? curLimits[p.slice("limits.".length)] : curFeature[p.slice("feature_limits.".length)];
+    const diff = wanted.map(([p, next]) => {
+      const prior = fmt(priorOf(p));
+      return `${p} ${prior} → ${fmt(next)}${prior === fmt(next) ? " (unchanged)" : ""}`;
+    });
+    const sent =
+      `allocation=${allocation ?? "none"}, oom_killer=${fmt(oomKiller)}, ` +
+      `limits ${Object.entries(limits).map(([k, v]) => `${k}=${fmt(v)}`).join(" ")}, ` +
+      `feature_limits ${Object.entries(feature).map(([k, v]) => `${k}=${v}`).join(" ")}`;
+    return (
+      `Updated build on Pelican server '${server.name ?? input.id}' [${input.id}] via the admin API: ${diff.join("; ")}. ` +
+      `Revert by calling update_server_build with the prior values above. ` +
+      `The full build was re-sent so nothing else moved: ${sent}. ` +
+      `Feature limits apply at once — a scheduled backup task rotates out the oldest backup once the limit is reached, and lowering it deletes nothing by itself. ` +
+      `Resource limits are synced to Wings, which adjusts a running container in place where Docker allows; restart if server_resources still shows the old limit.`
     );
   }
 
@@ -2471,6 +2605,50 @@ function buildTools(target: Target): ConnectorTool[] {
         return `Set ${parts.join(" + ") || "nothing"} on Pelican server [${i.id}] on ${t.name} via the admin API (can write read-only variables; values not shown)`;
       },
       run: run((p, i) => p.updateServerStartup(i)),
+    },
+    {
+      name: "update_server_build",
+      description:
+        `Change a Pelican server's build on ${target.name} through the ADMIN (application) API, by NUMERIC server id: resource limits ` +
+        `(memory, swap, disk, io, cpu, threads), feature limits (how many backups, databases and allocations it may hold) and the OOM ` +
+        `killer. The panel's build route demands the WHOLE build every time and writes any feature limit it isn't sent as 0, so this ` +
+        `is a read-merge-write: the server is read first, only the fields you pass change, everything else is re-sent as it is, and ` +
+        `the result reports prior → new so you can revert. Unknown fields are refused. Lowering the backup limit is how a scheduled ` +
+        `backup is told how many to keep — it rotates out the oldest once the limit is reached — and deletes nothing by itself.`,
+      tier: "execute",
+      inputSchema: z
+        .object({
+          id: z.number().int().positive().describe("Numeric application server id from list_servers (NOT the short identifier)."),
+          limits: z
+            .object({
+              memory: z.number().int().min(0).optional().describe("Memory limit MiB (0 = unlimited)."),
+              swap: z.number().int().min(-1).optional().describe("Swap MiB (0 = none, -1 = unlimited)."),
+              disk: z.number().int().min(0).optional().describe("Disk limit MiB (0 = unlimited)."),
+              io: z.number().int().min(0).max(1000).optional().describe("Block IO weight, 0–1000."),
+              cpu: z.number().int().min(0).optional().describe("CPU limit % (100 = one core; 0 = unlimited)."),
+              threads: z.string().regex(/^[0-9,-]+$/).nullable().optional().describe("CPU pinning, e.g. '0-1,3'; null clears it."),
+            })
+            .strict()
+            .optional()
+            .describe("Resource limits to change. Any you omit keep their current value."),
+          featureLimits: z
+            .object({
+              databases: z.number().int().min(0).optional().describe("How many databases the server may have."),
+              allocations: z.number().int().min(0).optional().describe("How many allocations (ports) the server may hold."),
+              backups: z.number().int().min(0).optional().describe("How many backups the server may keep; a scheduled backup rotates out the oldest once this is reached."),
+            })
+            .strict()
+            .optional()
+            .describe("Feature limits to change. Any you omit keep their current value."),
+          oomKiller: z.boolean().optional().describe("Enable the container's OOM killer. Omit to leave it alone."),
+        })
+        .strict(),
+      confirm: (input, t) => {
+        const i = input as UpdateServerBuildInput;
+        const fields = buildChanges(i).map(([p, v]) => `${p}=${v === null ? "null" : String(v)}`);
+        return `Change build of Pelican server [${i.id}] on ${t.name}: ${fields.join(", ") || "nothing"} (every other build field is re-sent unchanged)`;
+      },
+      run: run((p, i) => p.updateServerBuild(i)),
     },
     {
       name: "power_action",
