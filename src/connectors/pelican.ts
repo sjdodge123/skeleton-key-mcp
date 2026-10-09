@@ -591,6 +591,57 @@ export function looksLikeDaemonTimeout(res: { ok: boolean; status: number; json?
   return res.status === 502 || res.status === 504 || /timed? ?out|cURL error 28|could not establish a connection|E_CONN/i.test(res.text);
 }
 
+/** What `Pelican.request` hands back. `headers` is the live response header
+ *  bag: the pull path needs it, because the panel's throttle answer carries
+ *  `Retry-After` / `X-RateLimit-Reset` and nothing else says when to retry. */
+interface PelicanResponse {
+  ok: boolean;
+  status: number;
+  json?: unknown;
+  text: string;
+  headers: Pick<Headers, "get">;
+}
+
+/** The panel's default `ResourceLimit::FilePull` budget — config/http.php
+ *  `file_pull` / `file_pull_period`, env APP_API_FILE_PULL_RATELIMIT and
+ *  APP_API_FILE_PULL_RATELIMIT_PERIOD. Per user, so one client key shares it
+ *  across every server it reaches. */
+export const FILE_PULL_RATE_LIMIT = { pulls: 5, minutes: 10 };
+
+/**
+ * Explain a 429 from `files/pull`. Laravel's throttle rejects a request BEFORE
+ * counting it, so hammering the route does not push the window out — the only
+ * cure is to wait, and the sixth pull in a batch is the usual way to find this
+ * out. Whatever the panel says about when (`Retry-After` in seconds,
+ * `X-RateLimit-Reset` as a unix timestamp) is passed along, and so is its
+ * configured ceiling (`X-RateLimit-Limit`), since an operator may have raised
+ * it above the default. Header values are panel-controlled numbers, not
+ * secrets, but are still bounded. Exported for testing.
+ */
+export function filePullThrottleMessage(res: { headers: Pick<Headers, "get"> }, path: string): string {
+  const header = (name: string): string | undefined => res.headers.get(name)?.trim().slice(0, 64) || undefined;
+  const retryAfter = header("retry-after");
+  const reset = header("x-ratelimit-reset");
+  const limit = header("x-ratelimit-limit");
+  const when: string[] = [];
+  // Retry-After is seconds from Laravel; HTTP also allows a date, passed through as-is.
+  if (retryAfter) when.push(`Retry-After: ${/^\d+$/.test(retryAfter) ? `${retryAfter}s` : retryAfter}`);
+  if (reset) {
+    const epoch = Number(reset);
+    const iso = Number.isInteger(epoch) && epoch > 0 ? ` (${new Date(epoch * 1000).toISOString()})` : "";
+    when.push(`X-RateLimit-Reset: ${reset}${iso}`);
+  }
+  return (
+    `Pelican HTTP 429 on ${path}: the panel throttles file pulls to ${FILE_PULL_RATE_LIMIT.pulls} per ${FILE_PULL_RATE_LIMIT.minutes} minutes per user by default ` +
+    `(APP_API_FILE_PULL_RATELIMIT / APP_API_FILE_PULL_RATELIMIT_PERIOD in the panel's .env${limit ? `; this panel reports a limit of ${limit}` : ""}). ` +
+    `Rejected attempts are not counted, so retrying does not extend the window — wait for it to pass. ` +
+    (when.length
+      ? `The panel says: ${when.join(", ")}. `
+      : `The panel did not say when the window resets; it opened with the first pull of the current batch. `) +
+    `Nothing was downloaded by this call. Plan installs in groups of at most ${FILE_PULL_RATE_LIMIT.pulls} pulls.`
+  );
+}
+
 /**
  * Read a response body, enforcing the size cap **while reading** rather than
  * after. `await res.text()` would buffer the whole thing first, so a cap applied
@@ -1183,7 +1234,7 @@ class Pelican {
     api: PelicanApi,
     path: string,
     opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string } = {},
-  ): Promise<{ ok: boolean; status: number; json?: unknown; text: string }> {
+  ): Promise<PelicanResponse> {
     assertTransportOk(this.base);
     const key = keyFor(this.cred, api);
     if (!key) throw missingKeyError(api);
@@ -1216,7 +1267,7 @@ class Pelican {
     } catch {
       /* non-JSON body */
     }
-    return { ok: res.ok, status: res.status, json, text };
+    return { ok: res.ok, status: res.status, json, text, headers: res.headers };
   }
 
   /** Throw on an HTTP error, surfacing Pelican's `{errors:[{detail}]}` envelope
@@ -2030,7 +2081,9 @@ class Pelican {
    * daemon timeout (see `looksLikeDaemonTimeout`), in which case the listing is
    * polled until the size matches `expectedBytes` — or, without one, stops
    * changing. The size check doubles as an integrity check when the caller knows
-   * the exact byte count of what it expects.
+   * the exact byte count of what it expects. A 429 is the panel's per-user
+   * pull throttle and is reported as such (`filePullThrottleMessage`) rather
+   * than as a bare status — nothing was downloaded, so there is no file to watch.
    */
   async pullFile(input: { server: string; url: string; directory?: string; filename: string; expectedBytes?: number }): Promise<string> {
     const url = assertPullUrl(input.url);
@@ -2045,6 +2098,7 @@ class Pelican {
     let how = "completed within the call";
     let panelError: string | undefined;
     if (!res.ok) {
+      if (res.status === 429) throw new Error(filePullThrottleMessage(res, path));
       if (!looksLikeDaemonTimeout(res)) this.ensureOk(res, path, "client");
       panelError = scrubSecrets(res.text).slice(0, 300);
       how = "outlived the panel's 15s daemon timeout, so the listing was watched until it landed";
@@ -2849,7 +2903,10 @@ function buildTools(target: Target): ConnectorTool[] {
         `own user. Only public https sources are accepted (the daemon fetches from inside your LAN, so a private address is ` +
         `refused). The call waits for the download; pass 'expectedBytes' (the exact size of the file you expect, e.g. from ` +
         `downloading it yourself first) and the result is only reported as success when the landed size matches. Then ` +
-        `decompress_file to unpack it and rename_files to move pieces into place.`,
+        `decompress_file to unpack it and rename_files to move pieces into place. The panel throttles this route to ` +
+        `${FILE_PULL_RATE_LIMIT.pulls} pulls per ${FILE_PULL_RATE_LIMIT.minutes} minutes per user by default, and a rejected attempt does ` +
+        `not extend the window — plan a mod install in groups of at most ${FILE_PULL_RATE_LIMIT.pulls} pulls and let the window pass ` +
+        `before the next group (a 429 names the limit and, when the panel sends them, the Retry-After / X-RateLimit-Reset values).`,
       tier: "execute",
       inputSchema: z.object({
         server: SERVER_REF,

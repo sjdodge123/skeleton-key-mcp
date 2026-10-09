@@ -64,7 +64,7 @@ const list = (attrs: unknown[], page = 1, totalPages = 1) => ({
 });
 const item = (attrs: unknown) => ({ object: "x", attributes: attrs });
 
-type MockReply = { status?: number; json?: unknown; text?: string };
+type MockReply = { status?: number; json?: unknown; text?: string; headers?: Record<string, string> };
 function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: MockReply | (() => MockReply) }[]) {
   const calls: { url: string; init: any }[] = [];
   const fn = vi.fn(async (url: string, init: any) => {
@@ -73,11 +73,12 @@ function mockFetch(routes: { match: (url: string, init: any) => boolean; reply: 
     if (!route) throw new Error(`no mock route for ${init?.method ?? "GET"} ${url}`);
     const reply = typeof route.reply === "function" ? route.reply() : route.reply;
     const status = reply.status ?? 200;
+    const hdrs = Object.fromEntries(Object.entries(reply.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
     return {
       ok: status >= 200 && status < 300,
       status,
       statusText: "",
-      headers: { get: () => null, getSetCookie: () => [] },
+      headers: { get: (name: string) => hdrs[name.toLowerCase()] ?? null, getSetCookie: () => [] },
       text: async () => reply.text ?? (reply.json !== undefined ? JSON.stringify(reply.json) : ""),
     } as any;
   });
@@ -1741,6 +1742,51 @@ describe("files — client API tools", () => {
     expect(res.isError).toBe(true);
     expect(res.text).toContain("422");
     expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(0);
+  });
+
+  it("pull_file explains the panel's per-user pull throttle on a 429, without polling", async () => {
+    const calls = mockFetch([
+      { match: (u) => u.includes("/files/pull"), reply: { status: 429, json: { message: "Too Many Attempts." } } },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("429");
+    expect(res.text).toContain("5 per 10 minutes per user");
+    expect(res.text).toContain("does not extend the window");
+    expect(res.text).toContain("groups of at most 5");
+    // No header from the panel: say so rather than inventing a retry time.
+    expect(res.text).toContain("did not say when the window resets");
+    expect(res.text).not.toContain("Retry-After");
+    expect(res.text).not.toContain("X-RateLimit");
+    // Nothing was downloaded, so nothing is watched for.
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(0);
+  });
+
+  it("pull_file passes along Retry-After and X-RateLimit-Reset when the panel sends them", async () => {
+    const calls = mockFetch([
+      {
+        match: (u) => u.includes("/files/pull"),
+        reply: {
+          status: 429,
+          json: { message: "Too Many Attempts." },
+          headers: { "Retry-After": "412", "X-RateLimit-Reset": "1791417600", "X-RateLimit-Limit": "5" },
+        },
+      },
+      { match: (u) => u.includes("/files/list"), reply: { json: list([]) } },
+    ]);
+    const res = await tool("pull_file").run({ server: REF, url: "https://thunderstore.io/x", filename: "x.zip" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Retry-After: 412s");
+    expect(res.text).toContain("X-RateLimit-Reset: 1791417600 (2026-10-08T00:00:00.000Z)");
+    expect(res.text).toContain("this panel reports a limit of 5");
+    expect(res.text).not.toContain("did not say when");
+    expect(calls.filter((c) => c.url.includes("/files/list")).length).toBe(0);
+  });
+
+  it("pull_file's description tells the model to batch pulls in fives", () => {
+    expect(tool("pull_file").description).toMatch(/5 pulls per 10 minutes per user/);
+    expect(tool("pull_file").description).toMatch(/groups of at most 5/);
   });
 
   it("decompress_file POSTs root+file and lists the result", async () => {
