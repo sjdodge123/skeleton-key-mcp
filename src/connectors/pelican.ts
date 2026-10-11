@@ -6,7 +6,7 @@ import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } fr
 import { checkCommand } from "./command-policy.js";
 import { resolveSecretRefs, secretFingerprintBlock, describeSecretRef, type SecretRef, type SecretValue } from "./secret-refs.js";
 import { withKuma, monitorsForServer, MANAGED_PELICAN_TAG, type ServerIdentity } from "./uptime-kuma-client.js";
-import { kumaConnectOptions, resumeExactly } from "./uptime-kuma.js";
+import { kumaConnectOptions, resumeExactly, resumeUnconditionally } from "./uptime-kuma.js";
 
 /**
  * Pelican Panel connector — inventory, provisioning, power and schedules for a
@@ -1238,7 +1238,7 @@ class Pelican {
   private async request(
     api: PelicanApi,
     path: string,
-    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string } = {},
+    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string; signal?: AbortSignal } = {},
   ): Promise<PelicanResponse> {
     assertTransportOk(this.base);
     const key = keyFor(this.cred, api);
@@ -1262,7 +1262,7 @@ class Pelican {
     if (payload !== undefined) headers["Content-Type"] = opts.contentType ?? "application/json";
     const res = await tlsFetch(
       `${this.base}/api/${api}${path}${qs}`,
-      { method: opts.method ?? "GET", headers, body: payload },
+      { method: opts.method ?? "GET", headers, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) },
       this.insecure,
     );
     const text = await res.text();
@@ -1320,8 +1320,8 @@ class Pelican {
     }
   }
 
-  private async item<T>(api: PelicanApi, path: string, query: Record<string, string | number> = {}): Promise<T> {
-    const res = await this.request(api, path, { query });
+  private async item<T>(api: PelicanApi, path: string, query: Record<string, string | number> = {}, signal?: AbortSignal): Promise<T> {
+    const res = await this.request(api, path, { query, ...(signal ? { signal } : {}) });
     this.ensureOk(res, path, api);
     return ((res.json as { attributes?: T })?.attributes ?? {}) as T;
   }
@@ -1373,13 +1373,15 @@ class Pelican {
     return { name: s.name ?? ref, identifier: s.identifier, uuid: s.uuid };
   }
 
-  private resources(ref: string): Promise<{ current_state?: string; is_suspended?: boolean; resources?: Record<string, number> }> {
-    return this.item("client", `/servers/${encodeURIComponent(ref)}/resources`);
+  private resources(ref: string, signal?: AbortSignal): Promise<{ current_state?: string; is_suspended?: boolean; resources?: Record<string, number> }> {
+    return this.item("client", `/servers/${encodeURIComponent(ref)}/resources`, {}, signal);
   }
 
-  /** Just the power state and process uptime — what a power-action wait polls. */
-  async currentState(ref: string): Promise<{ state?: string; uptimeMs?: number }> {
-    const r = await this.resources(ref);
+  /** Just the power state and process uptime — what a power-action wait polls.
+   *  Bounded by `timeoutMs`: a hung read must not hold paused monitors past the
+   *  caller's own deadline. */
+  async currentState(ref: string, timeoutMs = 15_000): Promise<{ state?: string; uptimeMs?: number }> {
+    const r = await this.resources(ref, AbortSignal.timeout(Math.max(1, timeoutMs)));
     const up = r.resources?.uptime;
     return { state: r.current_state, uptimeMs: typeof up === "number" ? up : undefined };
   }
@@ -1851,7 +1853,7 @@ class Pelican {
   /** Send a power signal via the Client API. */
   async powerAction(ref: string, signal: string): Promise<string> {
     const path = `/servers/${encodeURIComponent(ref)}/power`;
-    const res = await this.request("client", path, { method: "POST", body: { signal } });
+    const res = await this.request("client", path, { method: "POST", body: { signal }, signal: AbortSignal.timeout(30_000) });
     this.ensureOk(res, path);
     return (
       `Sent '${signal}'${signal === "kill" ? " (UNGRACEFUL — the process was terminated, not asked to stop)" : ""} to Pelican server '${ref}' on ${this.target.name}. ` +
@@ -2417,7 +2419,7 @@ export interface PowerWaitOutcome {
  * deadline. Exported for testing.
  */
 export async function waitForPowerState(
-  read: () => Promise<{ state?: string; uptimeMs?: number }>,
+  read: (remainingMs: number) => Promise<{ state?: string; uptimeMs?: number }>,
   signal: string,
   seconds: number,
 ): Promise<PowerWaitOutcome> {
@@ -2429,7 +2431,7 @@ export async function waitForPowerState(
   for (;;) {
     let cur: { state?: string; uptimeMs?: number } = {};
     try {
-      cur = await read();
+      cur = await read(Math.max(1, deadline - Date.now()));
     } catch {
       /* transient — keep polling until the deadline */
     }
@@ -2542,12 +2544,13 @@ export async function whiteGlovePowerAction(ctx: ToolContext, p: Pelican, input:
         await s.pause(m.id);
         paused.push({ id: m.id, name: m.name });
       } catch (e) {
-        const back = await resumeExactly(s, paused);
+        // Undo what WE paused, unconditionally — not via the cached list, which
+        // on Kuma 2.x may not yet reflect the pauses — and refuse.
+        const back = await resumeUnconditionally(s, paused);
+        const lead = back.failed.length ? `MONITORS STILL PAUSED on ${kuma.target.name}: ${back.failed.join("; ")}. Resume them now with that target's resume_monitor. ` : "";
         throw new Error(
-          `Could not pause monitor '${m.name}' [${m.id}] on ${kuma.target.name}: ${e instanceof Error ? e.message : String(e)}. The '${input.signal}' was NOT sent.` +
-            (paused.length
-              ? ` Rolled back: resumed ${nameOf(back.resumed) || "none"}${back.failed.length ? `; STILL PAUSED (resume manually): ${back.failed.join("; ")}` : ""}.`
-              : ""),
+          `${lead}Could not pause monitor '${m.name}' [${m.id}] on ${kuma.target.name}: ${e instanceof Error ? e.message : String(e)}. The '${input.signal}' was NOT sent.` +
+            (back.resumed.length ? ` Rolled back: resumed ${nameOf(back.resumed)}.` : ""),
         );
       }
     }
@@ -2560,7 +2563,9 @@ export async function whiteGlovePowerAction(ctx: ToolContext, p: Pelican, input:
   let back!: ResumeReport;
   try {
     action = await p.powerAction(input.server, input.signal);
-    wait = await waitForPowerState(() => p.currentState(input.server), input.signal, seconds);
+    // Each read is capped at 15 s and never past the deadline, so a hung
+    // panel cannot hold the monitors paused beyond `waitSeconds`.
+    wait = await waitForPowerState((remainingMs) => p.currentState(input.server, Math.min(15_000, remainingMs)), input.signal, seconds);
   } catch (e) {
     failure = e;
   } finally {

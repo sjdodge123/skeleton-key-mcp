@@ -41,7 +41,7 @@ import {
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 import { checkCommand } from "./command-policy.js";
-import { startFakeKuma, type FakeKuma } from "../../test/helpers/fake-uptime-kuma.js";
+import { startFakeKuma, settled, type FakeKuma } from "../../test/helpers/fake-uptime-kuma.js";
 
 const APP = "papp_ApplicationKeySecret123";
 const CLI = "pacc_ClientKeySecret456";
@@ -1868,6 +1868,10 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
   });
   afterEach(async () => {
     Object.assign(POWER_WAIT, WAIT_DEFAULTS);
+    // Both sessions (pause, resume) must have closed — a leaked socket is a leaked login.
+    const s = await settled(fake);
+    expect(s.open).toBe(0);
+    expect(s.disconnections).toBe(s.connections);
     await fake.close();
   });
 
@@ -1917,7 +1921,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
         reply: () => {
           const s = states[Math.min(i, states.length - 1)]!;
           i += 1;
-          return { json: item({ current_state: s.state, resources: { uptime: s.uptime ?? 0 } }) };
+          return { json: item({ current_state: s.state, resources: { uptime: s.uptime ?? 9_000_000 } }) };
         },
       },
     ]);
@@ -2012,7 +2016,48 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     const t = target({ ownerUserId: 7, monitorsTarget: "status-kuma" });
     const ok = await power({}, gloveCtx({ targetsOfType: () => two }, t));
     expect(ok.isError).toBeFalsy();
+    expect(ok.text).toMatch(/observed: running → stopping → starting → running/);
     expect(ok.text).toContain("4. Resumed: Valheim [12].");
+  });
+
+  it("puts MONITORS STILL PAUSED first when Kuma is unreachable at resume time", async () => {
+    panelRoutes([{ state: "starting" }], {
+      json: {},
+    });
+    // Kuma goes away right after the pause: the fake closes while the wait is
+    // still polling, so the fresh resume session cannot connect.
+    const closing = (async () => {
+      while (!fake.log.includes("POWER")) await new Promise((r) => setTimeout(r, 5));
+      await fake.close();
+    })();
+    const res = await power({ waitSeconds: 1 });
+    await closing;
+    expect(res.isError).toBe(true);
+    expect(res.text.startsWith("MONITORS STILL PAUSED on status-kuma: [12] Valheim:")).toBe(true);
+    expect(res.text).toMatch(/Could not connect to Uptime Kuma|Timed out/);
+    expect(res.text).toContain("4. Resumed: nothing to resume.");
+    expect(fake.monitors.get(12)!.active).toBe(0);
+  }, 15_000);
+
+  it("rolls back unconditionally on a Kuma 2.x server that only pushes per-monitor updates", async () => {
+    await fake.close();
+    fake = await startFakeKuma({
+      listUpdates: "updateMonitorIntoList",
+      monitors: [
+        { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+        { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.0.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] },
+      ],
+    });
+    fake.failPause.add(17);
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("The 'restart' was NOT sent.");
+    expect(res.text).toContain("Rolled back: resumed Valheim [12]");
+    expect(res.text).not.toContain("STILL PAUSED");
+    expect(fake.log).toContain("resumeMonitor:12");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+    expect(writes(calls)).toHaveLength(0);
   });
 
   it("refuses a monitorsTarget that is not an uptime-kuma target or is not registered", async () => {
@@ -2062,6 +2107,16 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     expect(res.text).toContain("Rolled back: resumed Valheim [12]");
     expect(writes(calls)).toHaveLength(0);
     expect(fake.monitors.get(12)!.active).toBe(1);
+
+    // And if the rollback itself fails, that is the headline.
+    fake.failResume.add(12);
+    fake.log.length = 0;
+    const worse = await power({});
+    expect(worse.isError).toBe(true);
+    expect(worse.text).toMatch(/^Pelican error: MONITORS STILL PAUSED on status-kuma: \[12\] Valheim: .*injected resume failure/);
+    expect(worse.text).toContain("The 'restart' was NOT sent.");
+    expect(fake.monitors.get(12)!.active).toBe(0);
+    fake.monitors.get(12)!.active = 1; // leave the fixture clean
   });
 
   it("confirm text names the white-glove cycle only when the flag is set", () => {

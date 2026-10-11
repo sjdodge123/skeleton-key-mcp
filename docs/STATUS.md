@@ -60,7 +60,8 @@ Roughly in priority order — pick up any of these:
 4. **Scan accuracy round 2** — fingerprints are content-based now but still imperfect (e.g., SPA shells that don't self-identify show as "likely"/"open"). Consider secondary probes (Portainer `/api/status`, Pi-hole `/admin`) and de-noising the results list.
 5. **Operational polish** — consider a scan progress indicator (the fingerprinting scan is slower than the old port scan).
 6. **Operator-side follow-ups from the hardening release** — the web-UI target form (`POST /api/targets`) doesn't pin `credentialId` (such targets pin lazily on first read); `verify` URLs over plain http are allowed only for literal LAN IPs, not LAN hostnames; `overwrite` replaces named fields but never removes stale ones; `container_inspect` fingerprints every env var, not just secrets (harmless, a little noisy).
-7. **Per-target command policies & dry-run** — per-target `allowPatterns`/`denyPatterns` now exist on ssh AND portainer (`exec_container`); still open: dry-run for execute tools (esp. a `create_stack`/`update_stack` compose preview).
+7. **White-glove audit detail** — the Pelican `power_action … suppressMonitors` cycle pauses/resumes monitors on the *uptime-kuma* target under the Pelican tool's single approval; the audit row records the args + confirm text, but not which monitor ids were paused/resumed (that is only in the returned text). A `ToolContext.audit?` hook (or result→detail capture) would close the gap; so would a first-class `uptime-kuma` audit row per pause/resume.
+8. **Per-target command policies & dry-run** — per-target `allowPatterns`/`denyPatterns` now exist on ssh AND portainer (`exec_container`); still open: dry-run for execute tools (esp. a `create_stack`/`update_stack` compose preview).
 
 ## Environment notes (not in the repo on purpose)
 

@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { io, type Socket } from "socket.io-client";
 import { isPrivateIPv4 } from "./net.js";
 
@@ -14,12 +15,20 @@ import { isPrivateIPv4 } from "./net.js";
  *
  * One session per tool call: connect, log in, do the work, disconnect. Nothing
  * is cached across calls, and the password is used exactly once — in the `login`
- * payload — and never appears in an error, a result or a log.
+ * payload — and never appears in an error, a result or a log (see
+ * `suppressSocketIoDebug` for the one place it otherwise could).
  *
  * **2FA.** A Kuma account with TOTP enabled answers `login` with
  * `{ tokenRequired: true }`. This client supports 2FA-less accounts only and
  * turns that reply into a clear error rather than prompting for a code (there
  * is nowhere a code could come from without a secret transiting the chat).
+ *
+ * **Versions.** Verified against Kuma 1.23.x's handlers. 2.x keeps the same
+ * events but, after a pause/resume, pushes `updateMonitorIntoList` (one
+ * monitor) instead of re-sending the whole `monitorList`, so both are listened
+ * for. A build whose login has moved off the `login` event (the 2.x "better
+ * auth" branch emits `loginRequired` and never acks `login`) is reported as
+ * unsupported, naming the version, instead of as a bare timeout.
  */
 
 export interface KumaTag {
@@ -96,6 +105,80 @@ export function assertKumaTransportOk(base: string): URL {
   }
   return url;
 }
+
+// --- Keeping the login out of debug output -------------------------------------
+
+/** debug namespaces whose output includes raw packet payloads — i.e. the `login` event. */
+const SENSITIVE_DEBUG_NAMESPACES = [
+  "socket.io-client:manager",
+  "socket.io-client:socket",
+  "socket.io-client:url",
+  "socket.io-parser",
+  "engine.io-client:socket",
+  "engine.io-client:polling",
+  "engine.io-client:websocket",
+  "engine.io-client:transport",
+];
+
+/** Does a `debug`-style pattern (`*` wildcards, `-` negation) select `name`? Exported for testing. */
+export function debugPatternMatches(pattern: string, name: string): boolean {
+  const p = pattern.startsWith("-") ? pattern.slice(1) : pattern;
+  const re = new RegExp(`^${p.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*?")}$`);
+  return re.test(name);
+}
+
+/** Drop every enabling pattern that would turn on a sensitive namespace. Exported for testing. */
+export function filterDebugNamespaces(namespaces: string): { kept: string; dropped: string[] } {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const raw of namespaces.split(/[\s,]+/)) {
+    if (!raw) continue;
+    if (!raw.startsWith("-") && SENSITIVE_DEBUG_NAMESPACES.some((n) => debugPatternMatches(raw, n))) dropped.push(raw);
+    else kept.push(raw);
+  }
+  return { kept: kept.join(","), dropped };
+}
+
+/**
+ * socket.io-client's Node build is wired to the `debug` package and, under
+ * `DEBUG=socket.io-client:*` (or `DEBUG=*`), prints every outgoing packet —
+ * including the `login` payload with the password — to stderr. `DEBUG=*` is a
+ * plausible troubleshooting step on the container, so this is closed here
+ * rather than documented: the exact `debug` instance socket.io-client and
+ * engine.io-client resolve is located and re-enabled WITHOUT the namespaces
+ * that carry payloads. Other libraries' debug output is left alone. Cheap and
+ * idempotent in effect (once dropped, a pattern is gone from the instance), so
+ * it runs before every connection. Returns what it dropped. Exported for testing.
+ */
+export function suppressSocketIoDebug(): string[] {
+  const dropped: string[] = [];
+  try {
+    const here = createRequire(import.meta.url);
+    const seen = new Set<unknown>();
+    for (const pkg of ["socket.io-client", "engine.io-client", "socket.io-parser"]) {
+      let dbg: { disable?: () => string; enable?: (ns: string) => void } | undefined;
+      try {
+        dbg = createRequire(here.resolve(pkg))("debug");
+      } catch {
+        continue; // package or its debug not resolvable — nothing to print through
+      }
+      if (!dbg || seen.has(dbg) || typeof dbg.disable !== "function" || typeof dbg.enable !== "function") continue;
+      seen.add(dbg);
+      const current = dbg.disable();
+      const { kept, dropped: d } = filterDebugNamespaces(typeof current === "string" ? current : "");
+      dbg.enable(kept);
+      dropped.push(...d);
+    }
+    if (dropped.length) {
+      console.error(`[skeleton-key] DEBUG pattern(s) ${dropped.join(", ")} disabled for socket.io: that output would include the Uptime Kuma login.`);
+    }
+  } catch {
+    /* best-effort — a failure here cannot enable anything */
+  }
+  return dropped;
+}
+
+// --- Normalisation ---------------------------------------------------------------
 
 function toBool(v: unknown): boolean {
   return v === true || v === 1 || v === "1" || v === "true";
@@ -211,18 +294,28 @@ export function redactMonitorUrl(u: string | undefined): string | undefined {
 
 type Ack<T> = T & { ok?: boolean; msg?: string };
 
+/** Longest server-supplied message we will quote back. */
+const MAX_SERVER_MSG = 200;
+
 /**
  * One logged-in socket.io session. Create with `KumaSession.connect`, always
  * `close()` it (or use `withKuma`). Listeners for the server's pushes
- * (`monitorList`, `heartbeatList`) are registered BEFORE `login` is sent,
- * because the real server emits them from `afterLogin` without waiting for the
- * login ack to be delivered — they can arrive first.
+ * (`monitorList`, `updateMonitorIntoList`, `deleteMonitor`, `heartbeatList`) are
+ * registered BEFORE `login` is sent, because the real server emits them from
+ * `afterLogin` without waiting for the login ack to be delivered — they can
+ * arrive first.
  */
 export class KumaSession {
   private monitorList: Record<string, unknown> | null = null;
   private listWaiters: ((list: Record<string, unknown>) => void)[] = [];
   private readonly heartbeats = new Map<number, KumaBeat[]>();
   private readonly baseUrl: string;
+  /** From the server's `info` push, for error messages only. */
+  private serverVersion: string | undefined;
+  /** Set when the server announces the non-`login` auth flow. */
+  private loginRequiredSeen = false;
+  /** Held only to scrub it out of anything the server echoes back. */
+  private password = "";
 
   private constructor(
     private readonly socket: Socket,
@@ -230,12 +323,33 @@ export class KumaSession {
     baseUrl: string,
   ) {
     this.baseUrl = baseUrl;
+    socket.on("info", (info: unknown) => {
+      const v = info && typeof info === "object" ? (info as { version?: unknown }).version : undefined;
+      if (typeof v === "string") this.serverVersion = v;
+    });
+    socket.on("loginRequired", () => {
+      this.loginRequiredSeen = true;
+    });
     socket.on("monitorList", (list: unknown) => {
       if (!list || typeof list !== "object") return;
       this.monitorList = list as Record<string, unknown>;
       const waiters = this.listWaiters;
       this.listWaiters = [];
       for (const w of waiters) w(this.monitorList);
+    });
+    // Kuma 2.x: after pause/resume/edit the server pushes just the changed
+    // monitor(s) — `{ [id]: monitor }` — rather than the whole list.
+    socket.on("updateMonitorIntoList", (patch: unknown) => {
+      if (!patch || typeof patch !== "object") return;
+      this.monitorList = { ...(this.monitorList ?? {}), ...(patch as Record<string, unknown>) };
+    });
+    socket.on("deleteMonitor", (id: unknown) => {
+      if (!this.monitorList) return;
+      const key = String(id);
+      if (key in this.monitorList) {
+        const { [key]: _gone, ...rest } = this.monitorList;
+        this.monitorList = rest;
+      }
     });
     socket.on("heartbeatList", (monitorID: unknown, list: unknown, overwrite: unknown) => {
       const id = optNum(monitorID);
@@ -248,6 +362,7 @@ export class KumaSession {
 
   static async connect(opts: KumaConnectOptions): Promise<KumaSession> {
     const url = assertKumaTransportOk(opts.baseUrl);
+    suppressSocketIoDebug();
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     // Origin only: to socket.io-client a URL *path* is a namespace, and Kuma
     // serves from the root of its own host (it does not support sub-path
@@ -265,6 +380,7 @@ export class KumaSession {
       rejectUnauthorized: !opts.insecureTLS,
     });
     const session = new KumaSession(socket, timeoutMs, opts.baseUrl);
+    session.password = opts.password;
     try {
       await session.waitConnected();
       await session.login(opts.username, opts.password);
@@ -300,13 +416,29 @@ export class KumaSession {
     });
   }
 
+  /** A server-supplied message, safe to quote: the password scrubbed out
+   *  (the server has just been handed it, and a compromised or on-path Kuma
+   *  could reflect it) and the length capped. */
+  private safeMsg(msg: unknown): string {
+    if (typeof msg !== "string" || !msg) return "no reason given";
+    const scrubbed = this.password ? msg.split(this.password).join("[redacted]") : msg;
+    return scrubbed.length > MAX_SERVER_MSG ? `${scrubbed.slice(0, MAX_SERVER_MSG)}…` : scrubbed;
+  }
+
   /** Emit with an ack, bounded by the session timeout. Never includes the
    *  event's arguments in an error — `login` carries the password. */
   private async ack<T>(event: string, ...args: unknown[]): Promise<Ack<T>> {
     try {
       return (await this.socket.timeout(this.timeoutMs).emitWithAck(event, ...args)) as Ack<T>;
     } catch {
-      throw new Error(`Uptime Kuma at ${this.baseUrl} did not answer '${event}' within ${this.timeoutMs}ms.`);
+      const version = this.serverVersion ? ` (Kuma ${this.serverVersion})` : "";
+      if (event === "login" && this.loginRequiredSeen) {
+        throw new Error(
+          `Uptime Kuma at ${this.baseUrl}${version} uses a login flow this connector does not speak (it announced 'loginRequired' and never answered 'login'). ` +
+            `Skeleton Key supports the classic username/password login of Kuma 1.23.x and the 2.x releases that keep it.`,
+        );
+      }
+      throw new Error(`Uptime Kuma at ${this.baseUrl}${version} did not answer '${event}' within ${this.timeoutMs}ms.`);
     }
   }
 
@@ -323,7 +455,7 @@ export class KumaSession {
     }
     if (!res.ok) {
       // Kuma's own text: "Incorrect username or password." / "Too frequently, try again later."
-      throw new Error(`Uptime Kuma rejected the login: ${res.msg ?? "no reason given"}. Check the vault item's username/password (overwrite it via request_credential; never paste it in chat).`);
+      throw new Error(`Uptime Kuma rejected the login: ${this.safeMsg(res.msg)}. Check the vault item's username/password (overwrite it via request_credential; never paste it in chat).`);
     }
   }
 
@@ -345,8 +477,11 @@ export class KumaSession {
   /**
    * Every monitor, from the server's `monitorList` push. The real server sends
    * one right after login; if it has not arrived shortly, `getMonitorList` asks
-   * for it (the list still arrives as an event, not in the ack). After a pause
-   * or resume the server re-pushes the list, so a later call sees fresh state.
+   * for it (the list still arrives as an event, not in the ack). The cache is
+   * kept current by the server's own pushes — a whole `monitorList` on 1.x, a
+   * per-monitor `updateMonitorIntoList` on 2.x — but a caller that must act on
+   * what IT did (a rollback) should not consult it at all; see
+   * `resumeExactly` vs `resumeUnconditionally` in `uptime-kuma.ts`.
    */
   async monitors(): Promise<KumaMonitor[]> {
     let list = await this.waitForList(LIST_PUSH_GRACE_MS);
@@ -366,12 +501,12 @@ export class KumaSession {
 
   async pause(id: number): Promise<void> {
     const res = await this.ack<Record<string, never>>("pauseMonitor", id);
-    if (!res.ok) throw new Error(`Uptime Kuma refused to pause monitor ${id}: ${res.msg ?? "no reason given"}`);
+    if (!res.ok) throw new Error(`Uptime Kuma refused to pause monitor ${id}: ${this.safeMsg(res.msg)}`);
   }
 
   async resume(id: number): Promise<void> {
     const res = await this.ack<Record<string, never>>("resumeMonitor", id);
-    if (!res.ok) throw new Error(`Uptime Kuma refused to resume monitor ${id}: ${res.msg ?? "no reason given"}`);
+    if (!res.ok) throw new Error(`Uptime Kuma refused to resume monitor ${id}: ${this.safeMsg(res.msg)}`);
   }
 
   /** Heartbeats for one monitor over the last `hours` (oldest first). Falls back
@@ -380,7 +515,7 @@ export class KumaSession {
     try {
       const res = await this.ack<{ data?: KumaBeat[] }>("getMonitorBeats", id, hours);
       if (res.ok && Array.isArray(res.data)) return res.data;
-      if (res.ok === false && res.msg) throw new Error(`Uptime Kuma could not return heartbeats for monitor ${id}: ${res.msg}`);
+      if (res.ok === false && res.msg) throw new Error(`Uptime Kuma could not return heartbeats for monitor ${id}: ${this.safeMsg(res.msg)}`);
     } catch (e) {
       if (!this.heartbeats.has(id)) throw e;
     }
@@ -388,6 +523,7 @@ export class KumaSession {
   }
 
   close(): void {
+    this.password = "";
     this.socket.removeAllListeners();
     this.socket.disconnect();
   }

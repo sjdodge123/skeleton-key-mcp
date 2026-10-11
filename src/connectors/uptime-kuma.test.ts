@@ -1,10 +1,21 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { startFakeKuma, type FakeKuma, type FakeMonitor } from "../../test/helpers/fake-uptime-kuma.js";
+import { startFakeKuma, settled, type FakeKuma, type FakeMonitor } from "../../test/helpers/fake-uptime-kuma.js";
 import { buildUptimeKumaTools, MaintenanceStore, resolveMonitor, monitorsWithTag, uptimeKumaConnector, kumaConnectOptions } from "./uptime-kuma.js";
-import { assertKumaTransportOk, monitorsForServer, normalizeMonitor, redactMonitorUrl, KumaSession, tagLabel } from "./uptime-kuma-client.js";
+import {
+  assertKumaTransportOk,
+  monitorsForServer,
+  normalizeMonitor,
+  redactMonitorUrl,
+  KumaSession,
+  tagLabel,
+  suppressSocketIoDebug,
+  filterDebugNamespaces,
+  debugPatternMatches,
+} from "./uptime-kuma-client.js";
 import type { Credential, Target, ToolContext } from "./types.js";
 
 /** The owner's shape: game-server monitors tagged managed:pelican and named after the server. */
@@ -34,6 +45,11 @@ beforeEach(async () => {
   store = new MaintenanceStore(path.join(dir, "handles.json"));
 });
 afterEach(async () => {
+  // Every session a test opened must have closed itself — a leaked socket is a
+  // leaked login and a process that never exits.
+  const s = await settled(fake);
+  expect(s.open).toBe(0);
+  expect(s.disconnections).toBe(s.connections);
   await fake.close();
   await rm(dir, { recursive: true, force: true });
 });
@@ -347,6 +363,123 @@ describe("maintenance / end_maintenance", () => {
     const tag = await tool("maintenance").run({ tag: "nope" }, ctx());
     expect(tag.isError).toBe(true);
     expect(tag.text).toMatch(/No monitor on status-kuma carries the tag 'nope'/);
+  });
+});
+
+describe("keeping the login out of debug output", () => {
+  const dbg = createRequire(createRequire(import.meta.url).resolve("socket.io-client"))("debug") as { enable: (ns: string) => void; disable: () => string; enabled: (ns: string) => boolean };
+  afterEach(() => dbg.disable());
+
+  it("recognises the patterns that would print socket payloads", () => {
+    expect(debugPatternMatches("*", "socket.io-client:manager")).toBe(true);
+    expect(debugPatternMatches("socket.io-client:*", "socket.io-client:socket")).toBe(true);
+    expect(debugPatternMatches("engine*", "engine.io-client:polling")).toBe(true);
+    expect(debugPatternMatches("express:*", "socket.io-client:manager")).toBe(false);
+    expect(filterDebugNamespaces("express:*,socket.io-client:*")).toEqual({ kept: "express:*", dropped: ["socket.io-client:*"] });
+    expect(filterDebugNamespaces("*")).toEqual({ kept: "", dropped: ["*"] });
+    expect(filterDebugNamespaces("-socket.io-client:manager, express:router")).toEqual({ kept: "-socket.io-client:manager,express:router", dropped: [] });
+    expect(filterDebugNamespaces("")).toEqual({ kept: "", dropped: [] });
+  });
+
+  it("disables socket.io's namespaces on the live debug instance and leaves others alone", () => {
+    dbg.enable("express:*,socket.io-client:*,engine.io-client:*");
+    expect(dbg.enabled("socket.io-client:manager")).toBe(true);
+    const dropped = suppressSocketIoDebug();
+    expect(dropped.sort()).toEqual(["engine.io-client:*", "socket.io-client:*"]);
+    expect(dbg.enabled("socket.io-client:manager")).toBe(false);
+    expect(dbg.enabled("engine.io-client:socket")).toBe(false);
+    expect(dbg.enabled("express:router")).toBe(true);
+    expect(suppressSocketIoDebug()).toEqual([]); // nothing left to drop
+  });
+
+  it("with DEBUG=* in effect, a login never reaches stderr", async () => {
+    dbg.enable("*");
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    const err = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      chunks.push(args.map(String).join(" "));
+    });
+    try {
+      const res = await tool("list_monitors").run({}, ctx());
+      expect(res.isError).toBeFalsy();
+    } finally {
+      spy.mockRestore();
+      err.mockRestore();
+    }
+    expect(chunks.join("\n")).not.toContain("kuma-pass");
+    expect(chunks.some((c) => c.includes("disabled for socket.io"))).toBe(true);
+  });
+});
+
+describe("Kuma 2.x list updates", () => {
+  it("merges updateMonitorIntoList so a second pause in the same session sees the new state", async () => {
+    const v2 = await startFakeKuma({ monitors: MONITORS, listUpdates: "updateMonitorIntoList" });
+    try {
+      const t = target({ baseUrl: v2.url });
+      const s = await KumaSession.connect({ baseUrl: v2.url, username: "admin", password: "kuma-pass", timeoutMs: 5000 });
+      try {
+        await s.pause(12);
+        await new Promise((r) => setTimeout(r, 20)); // let the push land
+        expect((await s.monitors()).find((m) => m.id === 12)!.active).toBe(false);
+      } finally {
+        s.close();
+      }
+      const res = await tool("maintenance", t).run({ monitors: ["Palworld"] }, ctx(t));
+      const handle = /mw_[0-9a-f]{8}/.exec(res.text)![0];
+      const end = await tool("end_maintenance", t).run({ handle }, ctx(t));
+      expect(end.text).toContain("resumed 1 of 1 — Palworld [13]");
+      expect(v2.monitors.get(13)!.active).toBe(1);
+      const st = await settled(v2);
+      expect(st.open).toBe(0);
+    } finally {
+      await v2.close();
+    }
+  });
+});
+
+describe("a broken handle store", () => {
+  it("maintenance rolls the pauses back and refuses when the handle cannot be recorded", async () => {
+    await writeFile(path.join(dir, "handles.json"), "{ this is not json", "utf8");
+    const res = await tool("maintenance").run({ tag: "managed:pelican" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Could not record the maintenance handle \(.*not valid JSON.*\), so the window was NOT opened — rolled back: resumed Valheim \[12\], Palworld \[13\]/);
+    expect(res.text).not.toContain("STILL PAUSED");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+    expect(fake.monitors.get(13)!.active).toBe(1);
+    expect(fake.log.indexOf("pauseMonitor:12")).toBeLessThan(fake.log.indexOf("resumeMonitor:12"));
+  });
+
+  it("…and says MONITORS STILL PAUSED when even the rollback fails", async () => {
+    await writeFile(path.join(dir, "handles.json"), "{ this is not json", "utf8");
+    fake.failResume.add(13);
+    const res = await tool("maintenance").run({ tag: "managed:pelican" }, ctx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/MONITORS STILL PAUSED on status-kuma: \[13\] Palworld: .*injected resume failure.*Resume them now with resume_monitor/);
+    expect(res.text).toContain("rolled back: resumed Valheim [12]");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+    expect(fake.monitors.get(13)!.active).toBe(0);
+  });
+
+  it("list_monitors still lists, with a warning, and malformed records are skipped", async () => {
+    await writeFile(path.join(dir, "handles.json"), "{ this is not json", "utf8");
+    const res = await tool("list_monitors").run({}, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("[12] Valheim");
+    expect(res.text).toMatch(/WARNING: the maintenance-handle store could not be read/);
+
+    await writeFile(path.join(dir, "handles.json"), JSON.stringify({ handles: [null, 42, { handle: "mw_ok", target: "status-kuma", monitors: [{ id: 12, name: "Valheim" }], startedAt: "2026-10-11T00:00:00Z" }] }), "utf8");
+    expect((await store.list()).map((h) => h.handle)).toEqual(["mw_ok"]);
+  });
+
+  it("a tag that matches nothing is noted when named monitors were still paused", async () => {
+    const res = await tool("maintenance").run({ monitors: ["Valheim"], tag: "nope" }, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("paused 1 monitor — Valheim [12]");
+    expect(res.text).toContain("No monitor carries the tag 'nope'");
+    expect(monitorsWithTag([], "  ")).toEqual([]);
   });
 });
 

@@ -101,18 +101,37 @@ export const ENDED_HANDLES_KEPT = 20;
  * is unanswerable after a crash, which is the failure this whole design exists
  * to prevent.
  */
+function isMaintenanceRecord(h: unknown): h is MaintenanceRecord {
+  if (!h || typeof h !== "object") return false;
+  const r = h as Record<string, unknown>;
+  return typeof r.handle === "string" && typeof r.target === "string" && Array.isArray(r.monitors) && typeof r.startedAt === "string";
+}
+
 export class MaintenanceStore {
   private chain: Promise<unknown> = Promise.resolve();
-  constructor(private readonly file: string) {}
+  constructor(readonly file: string) {}
 
   private async read(): Promise<MaintenanceRecord[]> {
+    let text: string;
     try {
-      const parsed = JSON.parse(await readFile(this.file, "utf8")) as { handles?: MaintenanceRecord[] };
-      return Array.isArray(parsed.handles) ? parsed.handles : [];
+      text = await readFile(this.file, "utf8");
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw new Error(`Could not read the maintenance-handle store at ${this.file}: ${e instanceof Error ? e.message : String(e)}`);
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      throw new Error(
+        `The maintenance-handle store at ${this.file} is not valid JSON (${e instanceof Error ? e.message : String(e)}). ` +
+          `Resume any paused monitors by hand (resume_monitor), then fix or delete the file.`,
+      );
+    }
+    const handles = parsed && typeof parsed === "object" ? (parsed as { handles?: unknown }).handles : undefined;
+    // Malformed entries are skipped rather than crashing every tool that reads
+    // the store; a record is only trusted with the shape end_maintenance needs.
+    return Array.isArray(handles) ? handles.filter(isMaintenanceRecord) : [];
   }
 
   private async write(handles: MaintenanceRecord[]): Promise<void> {
@@ -203,6 +222,7 @@ export function resolveMonitor(monitors: KumaMonitor[], ref: MonitorRef): KumaMo
 /** Monitors carrying a tag given as `name` or `name:value`. Exported for testing. */
 export function monitorsWithTag(monitors: KumaMonitor[], tag: string): KumaMonitor[] {
   const want = norm(tag);
+  if (!want) return [];
   return monitors.filter((m) => m.tags.some((t) => norm(tagLabel(t)) === want || (!tag.includes(":") && norm(t.name) === want)));
 }
 
@@ -302,7 +322,19 @@ export function buildUptimeKumaTools(store: MaintenanceStore): (target: Target) 
         `Also lists any open Skeleton Key maintenance handles. Monitors of Pelican game servers carry the tag 'managed:pelican' and are named after the server.`,
       tier: "read",
       inputSchema: z.object({ query: z.string().optional().describe("Case-insensitive filter on name or tag, e.g. 'valheim' or 'managed:pelican'.") }),
-      run: run(async (s, i) => summarizeMonitors(target.name, await s.monitors(), await store.open(target.name), i.query)),
+      run: run(async (s, i) => {
+        const monitors = await s.monitors();
+        // A broken handle store must not hide the live list — that is exactly
+        // when the operator needs to see what is paused.
+        let open: MaintenanceRecord[] = [];
+        let note = "";
+        try {
+          open = await store.open(target.name);
+        } catch (e) {
+          note = `\nWARNING: the maintenance-handle store could not be read (${e instanceof Error ? e.message : String(e)}) — open windows, if any, are not shown; the states above are live.`;
+        }
+        return summarizeMonitors(target.name, monitors, open, i.query) + note;
+      }),
     },
     {
       name: "monitor_status",
@@ -355,7 +387,7 @@ export function buildUptimeKumaTools(store: MaintenanceStore): (target: Target) 
       tier: "execute",
       inputSchema: z.object({
         monitors: z.array(MONITOR_REF).max(100).optional().describe("Monitors to pause, by id or exact name."),
-        tag: z.string().min(1).optional().describe("Also pause every monitor carrying this tag ('name' or 'name:value'), e.g. 'managed:pelican'."),
+        tag: z.string().trim().min(1).optional().describe("Also pause every monitor carrying this tag ('name' or 'name:value'), e.g. 'managed:pelican'."),
         note: z.string().max(200).optional().describe("Why — shown on the handle in list_monitors."),
       }),
       confirm: (input, t) => {
@@ -375,9 +407,13 @@ export function buildUptimeKumaTools(store: MaintenanceStore): (target: Target) 
           const m = resolveMonitor(all, ref);
           selected.set(m.id, m);
         }
+        const notes: string[] = [];
         if (i.tag) {
           const tagged = monitorsWithTag(all, i.tag);
-          if (!tagged.length && !refs.length) throw new Error(`No monitor on ${target.name} carries the tag '${i.tag}'. Run list_monitors to see tags (shown as name:value).`);
+          if (!tagged.length) {
+            if (!refs.length) throw new Error(`No monitor on ${target.name} carries the tag '${i.tag}'. Run list_monitors to see tags (shown as name:value).`);
+            notes.push(`No monitor carries the tag '${i.tag}' — only the named monitors were considered.`);
+          }
           for (const m of tagged) selected.set(m.id, m);
         }
         const paused: { id: number; name: string }[] = [];
@@ -401,11 +437,28 @@ export function buildUptimeKumaTools(store: MaintenanceStore): (target: Target) 
         }
         const handle = newHandle();
         const startedAt = new Date().toISOString();
-        if (paused.length) await store.add({ handle, target: target.name, monitors: paused, note: i.note, startedAt });
+        if (paused.length) {
+          try {
+            await store.add({ handle, target: target.name, monitors: paused, note: i.note, startedAt });
+          } catch (e) {
+            // The pauses have happened and nothing durable says so — a window
+            // nobody could end. Undo it now, on this still-open session, and
+            // refuse; resume what WE paused without consulting any cached list.
+            const back = await resumeUnconditionally(s, paused);
+            const why = e instanceof Error ? e.message : String(e);
+            const lead = back.failed.length ? `MONITORS STILL PAUSED on ${target.name}: ${back.failed.join("; ")}. Resume them now with resume_monitor. ` : "";
+            throw new Error(
+              `${lead}Could not record the maintenance handle (${why}), so the window was NOT opened` +
+                `${back.resumed.length ? ` — rolled back: resumed ${names(back.resumed)}` : ""}. ` +
+                `Fix the handle store (data volume full or read-only? corrupt file at ${store.file}?) and retry.`,
+            );
+          }
+        }
         const text =
           `Maintenance ${paused.length ? handle : "NOT opened"} on ${target.name}: paused ${paused.length} monitor${paused.length === 1 ? "" : "s"}${paused.length ? ` — ${names(paused)}` : ""}.` +
           (skipped.length ? `\n  Left alone (already paused, not covered by this handle): ${names(skipped)}.` : "") +
           (failed.length ? `\n  FAILED to pause: ${failed.join("; ")}.` : "") +
+          (notes.length ? `\n  ${notes.join(" ")}` : "") +
           (paused.length
             ? `\nWhen the work is verified, call end_maintenance with handle '${handle}' — it resumes exactly the ${paused.length} above and nothing else. Never leave a window open.`
             : "");
@@ -488,6 +541,28 @@ export async function resumeExactly(
     }
   }
   return { resumed, already, missing, failed };
+}
+
+/**
+ * Resume exactly the monitors WE just paused, without consulting the session's
+ * cached list — for rollbacks. The cache may be stale (Kuma 2.x pushes a
+ * per-monitor update this client merges, but a rollback must not depend on
+ * that), and we know these were active a moment ago because we paused them.
+ * Never throws for a single monitor; failures are returned for the caller to
+ * put under MONITORS STILL PAUSED.
+ */
+export async function resumeUnconditionally(s: KumaSession, paused: { id: number; name: string }[]): Promise<{ resumed: { id: number; name: string }[]; failed: string[] }> {
+  const resumed: { id: number; name: string }[] = [];
+  const failed: string[] = [];
+  for (const m of paused) {
+    try {
+      await s.resume(m.id);
+      resumed.push(m);
+    } catch (e) {
+      failed.push(`[${m.id}] ${m.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return { resumed, failed };
 }
 
 /** The process-wide handle store (under the data dir). */

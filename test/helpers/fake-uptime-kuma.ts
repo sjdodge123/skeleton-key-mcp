@@ -46,6 +46,9 @@ export interface FakeKumaOptions {
   twofa?: boolean;
   monitors?: FakeMonitor[];
   beats?: Record<number, FakeBeat[]>;
+  /** How a pause/resume is announced: 1.x re-sends the whole `monitorList`;
+   *  2.x pushes `updateMonitorIntoList` with just the changed monitor. */
+  listUpdates?: "monitorList" | "updateMonitorIntoList";
 }
 
 export interface FakeKuma {
@@ -59,6 +62,10 @@ export interface FakeKuma {
   failResume: Set<number>;
   /** Count of socket connections seen. */
   connections: number;
+  /** Count of socket disconnections seen — every connection must end in one. */
+  disconnections: number;
+  /** Sockets currently open on the server. */
+  clientsCount(): number;
   close(): Promise<void>;
 }
 
@@ -71,6 +78,7 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
   const failPause = new Set<number>();
   const failResume = new Set<number>();
 
+  let closed = false;
   const http: HttpServer = createServer();
   const io = new Server(http, { path: "/socket.io" });
   const fake: FakeKuma = {
@@ -81,7 +89,11 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
     failPause,
     failResume,
     connections: 0,
+    disconnections: 0,
+    clientsCount: () => io.engine.clientsCount,
     close: async () => {
+      if (closed) return;
+      closed = true;
       io.disconnectSockets(true);
       await io.close();
       await new Promise<void>((resolve) => http.close(() => resolve()));
@@ -108,8 +120,16 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
     return out;
   };
 
+  const announce = (socket: Socket, id: number): void => {
+    if (opts.listUpdates === "updateMonitorIntoList") socket.emit("updateMonitorIntoList", { [String(id)]: monitorList()[String(id)] });
+    else socket.emit("monitorList", monitorList());
+  };
+
   io.on("connection", (socket: Socket & { loggedIn?: boolean }) => {
     fake.connections += 1;
+    socket.on("disconnect", () => {
+      fake.disconnections += 1;
+    });
     socket.emit("info", { version: "1.23.16", latestVersion: "1.23.16", isContainer: true });
 
     const guard = (cb: unknown): cb is (res: unknown) => void => typeof cb === "function";
@@ -165,7 +185,7 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
       if (!m) return cb({ ok: false, msg: "Monitor not found." });
       if (failPause.has(m.id)) return cb({ ok: false, msg: "injected pause failure" });
       m.active = 0;
-      socket.emit("monitorList", monitorList());
+      announce(socket, m.id);
       cb({ ok: true, msg: "Paused Successfully.", msgi18n: true });
     });
 
@@ -176,7 +196,7 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
       if (!m) return cb({ ok: false, msg: "Monitor not found." });
       if (failResume.has(m.id)) return cb({ ok: false, msg: "injected resume failure" });
       m.active = 1;
-      socket.emit("monitorList", monitorList());
+      announce(socket, m.id);
       cb({ ok: true, msg: "Resumed Successfully.", msgi18n: true });
     });
   });
@@ -186,4 +206,13 @@ export async function startFakeKuma(opts: FakeKumaOptions = {}): Promise<FakeKum
   fake.port = port;
   fake.url = `http://127.0.0.1:${port}`;
   return fake;
+}
+
+/** Wait until every connection the fake has seen has also disconnected. */
+export async function settled(fake: FakeKuma, timeoutMs = 2000): Promise<{ connections: number; disconnections: number; open: number }> {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until && (fake.clientsCount() > 0 || fake.disconnections < fake.connections)) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return { connections: fake.connections, disconnections: fake.disconnections, open: fake.clientsCount() };
 }
