@@ -374,3 +374,46 @@ describe("updateLoginItem", () => {
     expect(edited).toBe(false);
   });
 });
+
+describe("logout / reestablish hints", () => {
+  it("logout forgets the session and tolerates a CLI that is not logged in", async () => {
+    const client = new VaultwardenClient("/unused") as any;
+    client.session = "s";
+    const calls: string[][] = [];
+    client.run = async (args: string[]) => {
+      calls.push(args);
+      throw new Error("bw logout failed: You are not logged in.");
+    };
+    await expect(client.logout()).resolves.toBeUndefined();
+    expect(client.unlocked).toBe(false);
+    expect(calls).toContainEqual(["logout"]);
+  });
+
+  it("reestablish names the https fix when the CLI refuses an insecure server URL", async () => {
+    const client = new VaultwardenClient("/unused") as any;
+    client.run = async (args: string[]) => {
+      if (args[0] === "status") return JSON.stringify({ status: "locked", serverUrl: "http://10.0.0.5:5555" });
+      if (args[0] === "unlock") {
+        throw new Error(
+          "bw unlock failed: Unable to fetch ServerConfig from http://10.0.0.5:5555/api InsecureUrlNotAllowedError: Insecure URL not allowed. All URLs must use HTTPS.",
+        );
+      }
+      return "";
+    };
+    await expect(
+      client.reestablish({ serverUrl: "http://10.0.0.5:5555", clientId: "a", clientSecret: "b", masterPassword: "c" }),
+    ).rejects.toThrow(/only accepts https:\/\/ vault server URLs/);
+  });
+
+  it("reestablish leaves unrelated errors untouched", async () => {
+    const client = new VaultwardenClient("/unused") as any;
+    client.run = async (args: string[]) => {
+      if (args[0] === "status") return JSON.stringify({ status: "locked" });
+      if (args[0] === "unlock") throw new Error("bw unlock failed: Invalid master password.");
+      return "";
+    };
+    await expect(
+      client.reestablish({ serverUrl: "https://v.example", clientId: "a", clientSecret: "b", masterPassword: "c" }),
+    ).rejects.toThrow(/^bw unlock failed: Invalid master password\.$/);
+  });
+});

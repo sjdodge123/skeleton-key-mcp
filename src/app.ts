@@ -43,6 +43,12 @@ export class AppState {
   /** SHA-256 of the MCP bearer token, so it's verifiable while locked. */
   private bearerHash: string | null = null;
 
+  /** Why the last vault (re)connect failed — the sanitized `bw` message — or
+   *  null once the vault is up. Surfaced by `/api/status` (URLs redacted) so
+   *  the admin page can explain a store that unlocked while the vault did not,
+   *  instead of leaving the only clue in the container log. */
+  vaultError: string | null = null;
+
   /**
    * Verify a presented static bearer token. Works while the store is unlocked
    * (compare the token itself) AND while locked (compare against the persisted
@@ -83,15 +89,55 @@ export class AppState {
   async postUnlock(): Promise<void> {
     const s = this.store.get();
     if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
+      try {
+        await this.vault.reestablish({
+          serverUrl: s.bwServerUrl,
+          clientId: s.bwClientId,
+          clientSecret: s.bwClientSecret,
+          masterPassword: s.bwMasterPassword,
+        });
+      } catch (err) {
+        this.vaultError = err instanceof Error ? err.message : String(err);
+        throw err;
+      }
+      this.vaultError = null;
+      // Best-effort sync; safe to fail if Vaultwarden is unreachable (offline cache).
+      await this.vault.sync().catch(() => {});
+    }
+    await this.ensureBearerHash();
+    if (!this.locked) this.emitToolsChanged();
+  }
+
+  /**
+   * Re-point the Vaultwarden client at a different server URL after setup —
+   * the repair when the stored URL stops being usable (the Bitwarden CLI now
+   * refuses plain http://). Logs the CLI out so `reestablish()` runs `config
+   * server` + the API-key login fresh, re-syncs the offline cache, and persists
+   * the URL only once the vault is actually unlocked on it (fails closed: a bad
+   * URL leaves the stored one untouched). The service-account credentials are
+   * the stored ones — nothing secret enters or leaves through this path.
+   */
+  async changeVaultServer(serverUrl: string): Promise<void> {
+    if (this.store.locked) throw new Error("Unlock the store first.");
+    const s = this.store.get();
+    if (!s.bwClientId || !s.bwClientSecret || !s.bwMasterPassword) {
+      throw new Error("The vault has not been connected yet — run the setup wizard.");
+    }
+    await this.vault.logout();
+    try {
       await this.vault.reestablish({
-        serverUrl: s.bwServerUrl,
+        serverUrl,
         clientId: s.bwClientId,
         clientSecret: s.bwClientSecret,
         masterPassword: s.bwMasterPassword,
       });
-      // Best-effort sync; safe to fail if Vaultwarden is unreachable (offline cache).
-      await this.vault.sync().catch(() => {});
+      await this.vault.sync();
+    } catch (err) {
+      this.vaultError = err instanceof Error ? err.message : String(err);
+      throw err;
     }
+    await this.store.update({ bwServerUrl: serverUrl });
+    this.vaultError = null;
     await this.ensureBearerHash();
     if (!this.locked) this.emitToolsChanged();
   }

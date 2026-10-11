@@ -11,6 +11,21 @@ import { listConnectors, getConnector, registerableType } from "../connectors/in
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
 
+/** Strip URLs from a vault error before it leaves on the unauthenticated status
+ *  endpoint — the vault's address is not something a LAN client should learn. */
+function redactUrls(msg: string | null | undefined): string | null {
+  return msg ? msg.replace(/https?:\/\/[^\s"')]+/gi, "<vault url>") : null;
+}
+
+function hostOf(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
 /** Wrap an async handler so thrown errors become 400s with a message. */
 function h(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
@@ -39,6 +54,7 @@ export function buildApiRouter(app: AppState): Router {
         storeExists: await app.store.exists(),
         storeLocked: app.store.locked,
         vaultUnlocked: app.vault.unlocked,
+        vaultError: redactUrls(app.vaultError),
         publicUrl: app.publicUrl(),
         targetCount: app.registry.list().length,
         toolCount: app.store.locked ? 0 : resolveTools(app).length,
@@ -72,7 +88,19 @@ export function buildApiRouter(app: AppState): Router {
       await app.store.unlock(passphrase);
       // Re-establish the saved vault session, keep the bearer hash current, and
       // nudge locked sessions to re-list tools — shared with the boot paths.
-      await app.postUnlock();
+      // A vault failure here must not read as a failed unlock: the store IS
+      // open, so say so and let the admin page offer the repair (re-pointing
+      // the vault URL) instead of bouncing the user back to the passphrase box.
+      try {
+        await app.postUnlock();
+      } catch (err) {
+        res.json({
+          ok: true,
+          vaultUnlocked: false,
+          vaultError: redactUrls(err instanceof Error ? err.message : String(err)),
+        });
+        return;
+      }
       res.json({ ok: true, vaultUnlocked: app.vault.unlocked });
     }),
   );
@@ -156,6 +184,47 @@ export function buildApiRouter(app: AppState): Router {
     }),
   );
 
+  // --- Vault connection (post-setup repair) ---
+  // Re-point the Vaultwarden client at a new https:// URL — the fix when the
+  // stored LAN http:// address stops being accepted by the Bitwarden CLI. Same
+  // gate as the auto-unlock controls: store unlocked, and once setup is
+  // complete a fresh TOTP (it re-logs the service account in and rewrites a
+  // bootstrap secret). Fails closed: the stored URL is only replaced after the
+  // vault unlocks and syncs on the new one.
+  router.post(
+    "/vault/server",
+    h(async (req, res) => {
+      if (!(await guardAutoUnlock(req, res))) return;
+      const { serverUrl } = z
+        .object({
+          serverUrl: z
+            .string()
+            .url()
+            .refine((u) => u.startsWith("https://"), { message: "The Bitwarden CLI only accepts https:// vault URLs." }),
+        })
+        .parse(req.body ?? {});
+      const prior = app.store.get().bwServerUrl;
+      try {
+        await app.changeVaultServer(serverUrl);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        app.audit.record({
+          ts: new Date().toISOString(), tool: "vault.change_server", target: "vaultwarden",
+          tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "error",
+          detail: redactUrls(message) ?? "vault reconnect failed",
+        });
+        res.status(400).json({ error: message });
+        return;
+      }
+      app.audit.record({
+        ts: new Date().toISOString(), tool: "vault.change_server", target: "vaultwarden",
+        tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "ok",
+        detail: "vault server URL changed; service account re-logged in, offline cache re-synced",
+      });
+      res.json({ ok: true, vaultUnlocked: app.vault.unlocked, checks: await setup.runChecks().catch(() => []) });
+    }),
+  );
+
   // --- Setup-only endpoints ---
   const guardSetup = async (res: Response): Promise<boolean> => {
     if (await app.isSetupComplete()) {
@@ -175,7 +244,10 @@ export function buildApiRouter(app: AppState): Router {
       if (!(await guardSetup(res))) return;
       const input = z
         .object({
-          serverUrl: z.string().url(),
+          serverUrl: z
+            .string()
+            .url()
+            .refine((u) => u.startsWith("https://"), { message: "The Bitwarden CLI only accepts https:// vault URLs." }),
           clientId: z.string().min(1),
           clientSecret: z.string().min(1),
           masterPassword: z.string().min(1),
