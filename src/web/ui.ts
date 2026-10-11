@@ -253,14 +253,21 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;
  *  Bitwarden CLI refusing a plain-http vault URL after an image upgrade. The
  *  repair reuses the stored service-account credentials; only the URL changes. */
 function vaultRepairHtml(st){
-  if(!st || st.vaultUnlocked!==false) return "";
-  return '<div class="check bad"><div class="n">✗ Vault not connected</div><div class="d">'+esc(st.vaultError||"The Vaultwarden session could not be re-established.")+'</div></div>'+
-    '<h3>Vault connection</h3>'+
-    '<p class="muted">Re-point Skeleton Key at your Vaultwarden server. The Bitwarden CLI only accepts <b>https://</b> URLs (plain <code>http://</code> LAN addresses stopped working with CLI 2025+). The stored service-account credentials are reused — nothing is re-typed. Requires your authenticator code.</p>'+
+  if(!st) return "";
+  const down = st.vaultUnlocked===false;
+  const form =
+    '<p class="muted">Re-point Skeleton Key at your Vaultwarden server. The Bitwarden CLI only accepts <b>https://</b> URLs (plain <code>http://</code> LAN addresses stopped working with CLI 2025+). The stored service-account credentials are reused — nothing is re-typed. The CLI is logged out and back in on the new address and the offline cache re-synced; the stored URL only changes once that succeeds. Requires your authenticator code.</p>'+
     field("vs_url","Vaultwarden URL (https://)","text","https://vault.example.net")+
     field("vs_totp","6-digit authenticator code","text")+
-    btn("Reconnect vault", async()=>{ const r=await api("/vault/server",{serverUrl:val("vs_url"), totp:val("vs_totp")}); render(); setTimeout(()=>err(r.vaultUnlocked?"Vault connected ✓ — MCP tools are available again.":"Vault still not connected."),0); })+
-    '<hr/>';
+    btn("Reconnect vault", async()=>{ const r=await api("/vault/server",{serverUrl:val("vs_url"), totp:val("vs_totp")}); render(); setTimeout(()=>err(r.vaultUnlocked?"Vault connected ✓ — MCP tools are available again.":"Vault still not connected."),0); });
+  if(down){
+    return '<div class="check bad"><div class="n">✗ Vault not connected</div><div class="d">'+esc(st.vaultError||"The Vaultwarden session could not be re-established.")+'</div></div>'+
+      '<h3>Vault connection</h3>'+form+'<hr/>';
+  }
+  // Vault is up: still offer the change, folded away. A cached unlock can look
+  // healthy while every write fails (the CLI serves reads offline), so the fix
+  // must be reachable without first breaking the session.
+  return '<details><summary class="muted">Vault connection — change the Vaultwarden URL</summary>'+form+'</details><hr/>';
 }
 async function adminCard(st){
   if(!S.au){
