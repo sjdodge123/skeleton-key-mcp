@@ -30,6 +30,10 @@ export const paths = {
   /** Encrypted disaster-recovery skeletons:
    *  skeletons/<id>/<target>/<artifact>.enc + manifest.json + RESTORE.md. */
   snapshotsDir: path.join(DATA_DIR, "skeletons"),
+  /** Open Uptime Kuma maintenance handles (which monitors `maintenance` paused,
+   *  so `end_maintenance` resumes exactly those — persisted so a container
+   *  restart can never strand monitors in the paused state). Non-secret. */
+  kumaMaintenance: path.join(DATA_DIR, "uptime-kuma-maintenance.json"),
   /** Self-managed TLS material (auto-generated self-signed cert + key) — see
    *  src/web/tls.ts. A user-mounted pair via SKELETON_KEY_TLS_CERT_FILE /
    *  SKELETON_KEY_TLS_KEY_FILE takes precedence over this directory. */

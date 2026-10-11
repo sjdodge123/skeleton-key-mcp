@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
   pelicanConnector,
   baseUrl,
@@ -34,8 +34,13 @@ import {
   FILE_READ_MAX_BYTES,
   FILE_WRITE_MAX_BYTES,
   looksLikeDaemonTimeout,
+  POWER_WAIT,
+  waitForPowerState,
+  expectedStateFor,
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
+import { checkCommand } from "./command-policy.js";
+import { startFakeKuma, settled, type FakeKuma } from "../../test/helpers/fake-uptime-kuma.js";
 
 const APP = "papp_ApplicationKeySecret123";
 const CLI = "pacc_ClientKeySecret456";
@@ -1819,5 +1824,344 @@ describe("files — client API tools", () => {
       expect(tiers[name]).toBe("execute");
       expect(tool(name).confirm).toBeTypeOf("function");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// White-glove power actions: suppressMonitors against a fake Uptime Kuma.
+// The rule: pause → act → verify → ALWAYS resume. "No pause, no test."
+// ---------------------------------------------------------------------------
+
+describe("power_action with suppressMonitors (the white-glove rule)", () => {
+  let fake: FakeKuma;
+  const WAIT_DEFAULTS = { ...POWER_WAIT };
+
+  beforeEach(async () => {
+    POWER_WAIT.intervalMs = 1;
+    fake = await startFakeKuma({
+      monitors: [
+        { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
+        { id: 13, name: "Palworld", type: "port", hostname: "192.168.0.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+        { id: 14, name: "node", type: "ping", hostname: "192.168.0.48", active: 1, tags: [{ name: "wing", value: "node" }] },
+        { id: 15, name: "Valheim query", type: "port", hostname: "192.168.0.48", port: 2457, active: 0, tags: [{ name: "server", value: "f5eb47ac" }] },
+      ],
+    });
+  });
+  afterEach(async () => {
+    Object.assign(POWER_WAIT, WAIT_DEFAULTS);
+    // Both sessions (pause, resume) must have closed — a leaked socket is a leaked login.
+    const s = await settled(fake);
+    expect(s.open).toBe(0);
+    expect(s.disconnections).toBe(s.connections);
+    await fake.close();
+  });
+
+  const kumaTarget = (): Target => ({
+    name: "status-kuma",
+    type: "uptime-kuma",
+    host: "127.0.0.1",
+    port: fake.port,
+    credentialRef: "kuma-login",
+    options: { baseUrl: fake.url, timeoutMs: 5000 },
+  });
+  const kumaCred: Credential = { ref: "kuma-login", username: "admin", password: "kuma-pass", fields: {}, uris: [] };
+
+  function gloveCtx(over: Partial<ToolContext> = {}, t: Target = target({ ownerUserId: 7 })): ToolContext {
+    return {
+      target: t,
+      getCredential: async () => cred(),
+      resolveCredential: async (ref: string) => {
+        if (ref === "kuma-login") return kumaCred;
+        throw new Error(`no vault item ${ref}`);
+      },
+      resolveTarget: (name: string) => (name === "status-kuma" ? kumaTarget() : undefined),
+      targetsOfType: (type: string) => (type === "uptime-kuma" ? [kumaTarget()] : []),
+      ...over,
+    };
+  }
+
+  /** Pelican routes: the server's identity, the power POST (logged into the
+   *  fake's event log so ordering against pause/resume can be asserted), and a
+   *  scripted sequence of resource states. */
+  function panelRoutes(states: { state: string; uptime?: number }[], power: MockReply = { json: {} }, name = "Valheim") {
+    let i = 0;
+    return mockFetch([
+      {
+        match: (u, init) => /\/api\/client\/servers\/f5eb47ac(\?|$)/.test(u) && (init?.method ?? "GET") === "GET",
+        reply: { json: item({ name, identifier: "f5eb47ac", uuid: "f5eb47ac-1111-2222-3333-444444444444" }) },
+      },
+      {
+        match: (u) => u.includes("/api/client/servers/f5eb47ac/power"),
+        reply: () => {
+          fake.log.push("POWER");
+          return power;
+        },
+      },
+      {
+        match: (u) => u.includes("/api/client/servers/f5eb47ac/resources"),
+        reply: () => {
+          const s = states[Math.min(i, states.length - 1)]!;
+          i += 1;
+          return { json: item({ current_state: s.state, resources: { uptime: s.uptime ?? 9_000_000 } }) };
+        },
+      },
+    ]);
+  }
+  const power = (input: Record<string, unknown>, c: ToolContext = gloveCtx()) => tool("power_action").run({ server: "f5eb47ac", signal: "restart", suppressMonitors: true, ...input }, c);
+  const idx = (ev: string): number => fake.log.indexOf(ev);
+
+  it("pauses the matching monitors, restarts, waits for the server to come back, and resumes — in that order", async () => {
+    panelRoutes([{ state: "running", uptime: 9_000_000 }, { state: "stopping" }, { state: "starting" }, { state: "running", uptime: 1500 }]);
+    const res = await power({});
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("White-glove restart of Pelican server 'Valheim' (f5eb47ac) on pelican-panel");
+    expect(res.text).toContain("1. Paused 1 Uptime Kuma monitor on status-kuma: Valheim [12]. Already paused, left alone: Valheim query [15].");
+    expect(res.text).toContain("2. Sent 'restart'");
+    expect(res.text).toMatch(/3\. Server reached 'running' after \ds \(observed: running → stopping → starting → running\)/);
+    expect(res.text).toContain("4. Resumed: Valheim [12].");
+    expect(res.text).toContain("Notifications stayed quiet for the whole bounce.");
+
+    // Sequencing is the whole point: pause BEFORE the power POST, resume AFTER.
+    expect(idx("pauseMonitor:12")).toBeGreaterThan(-1);
+    expect(idx("pauseMonitor:12")).toBeLessThan(idx("POWER"));
+    expect(idx("POWER")).toBeLessThan(idx("resumeMonitor:12"));
+    // Only the matching monitor was touched; the already-paused one is left paused.
+    expect(fake.log.filter((e) => e.startsWith("pauseMonitor"))).toEqual(["pauseMonitor:12"]);
+    expect(fake.log.filter((e) => e.startsWith("resumeMonitor"))).toEqual(["resumeMonitor:12"]);
+    expect(fake.monitors.get(12)!.active).toBe(1);
+    expect(fake.monitors.get(13)!.active).toBe(1);
+    expect(fake.monitors.get(14)!.active).toBe(1);
+    expect(fake.monitors.get(15)!.active).toBe(0);
+  });
+
+  it("STILL resumes when the power action itself fails", async () => {
+    panelRoutes([{ state: "running" }], { status: 500, json: { errors: [{ detail: "Wings is down" }] } });
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("2. The action FAILED: Pelican HTTP 500");
+    expect(res.text).toContain("4. Resumed: Valheim [12].");
+    expect(idx("POWER")).toBeLessThan(idx("resumeMonitor:12"));
+    expect(fake.monitors.get(12)!.active).toBe(1);
+  });
+
+  it("resumes anyway when the server never reaches the expected state, and says so loudly", async () => {
+    panelRoutes([{ state: "starting" }]);
+    const res = await power({ waitSeconds: 1 });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toMatch(/3\. WARNING: server did NOT reach 'running' within 1s \(last state 'starting', observed: starting\)/);
+    expect(res.text).toContain("Do not re-send the power action blindly");
+    expect(res.text).toContain("4. Resumed: Valheim [12].");
+    expect(res.text).not.toContain("Notifications stayed quiet");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+  }, 10_000);
+
+  it("puts MONITORS STILL PAUSED first when the resume fails, and flags the result as an error", async () => {
+    panelRoutes([{ state: "offline" }]);
+    fake.failResume.add(12);
+    const res = await power({ signal: "stop" });
+    expect(res.isError).toBe(true);
+    expect(res.text.startsWith("MONITORS STILL PAUSED on status-kuma: [12] Valheim:")).toBe(true);
+    expect(res.text).toContain("resume_monitor");
+    expect(fake.monitors.get(12)!.active).toBe(0);
+  });
+
+  it("after a verified stop, warns that the monitors will now report DOWN and points at maintenance", async () => {
+    panelRoutes([{ state: "running" }, { state: "stopping" }, { state: "offline" }]);
+    const res = await power({ signal: "stop" });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toMatch(/3\. Server reached 'offline'/);
+    expect(res.text).toContain("Kuma will report it DOWN on the next check");
+    expect(res.text).toContain("'maintenance' tool");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+  });
+
+  it("refuses (and sends nothing) when no uptime-kuma target is registered", async () => {
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await power({}, gloveCtx({ targetsOfType: () => [] }));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/no uptime-kuma target is registered/);
+    expect(res.text).toMatch(/register_target type 'uptime-kuma'/);
+    expect(writes(calls)).toHaveLength(0);
+    expect(fake.connections).toBe(0);
+  });
+
+  it("refuses to guess between several uptime-kuma targets, and honours monitorsTarget to disambiguate", async () => {
+    const calls = panelRoutes([{ state: "running" }, { state: "stopping" }, { state: "starting" }, { state: "running", uptime: 10 }]);
+    const two = [kumaTarget(), { ...kumaTarget(), name: "other-kuma" }];
+    const res = await power({}, gloveCtx({ targetsOfType: () => two }));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Several uptime-kuma targets are registered \(status-kuma, other-kuma\)/);
+    expect(res.text).toMatch(/monitorsTarget/);
+    expect(writes(calls)).toHaveLength(0);
+
+    const t = target({ ownerUserId: 7, monitorsTarget: "status-kuma" });
+    const ok = await power({}, gloveCtx({ targetsOfType: () => two }, t));
+    expect(ok.isError).toBeFalsy();
+    expect(ok.text).toMatch(/observed: running → stopping → starting → running/);
+    expect(ok.text).toContain("4. Resumed: Valheim [12].");
+  });
+
+  it("puts MONITORS STILL PAUSED first when Kuma is unreachable at resume time", async () => {
+    panelRoutes([{ state: "starting" }], {
+      json: {},
+    });
+    // Kuma goes away right after the pause: the fake closes while the wait is
+    // still polling, so the fresh resume session cannot connect.
+    const closing = (async () => {
+      while (!fake.log.includes("POWER")) await new Promise((r) => setTimeout(r, 5));
+      await fake.close();
+    })();
+    const res = await power({ waitSeconds: 1 });
+    await closing;
+    expect(res.isError).toBe(true);
+    expect(res.text.startsWith("MONITORS STILL PAUSED on status-kuma: [12] Valheim:")).toBe(true);
+    expect(res.text).toMatch(/Could not connect to Uptime Kuma|Timed out/);
+    expect(res.text).toContain("4. Resumed: nothing to resume.");
+    expect(fake.monitors.get(12)!.active).toBe(0);
+  }, 15_000);
+
+  it("rolls back unconditionally on a Kuma 2.x server that only pushes per-monitor updates", async () => {
+    await fake.close();
+    fake = await startFakeKuma({
+      listUpdates: "updateMonitorIntoList",
+      monitors: [
+        { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+        { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.0.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] },
+      ],
+    });
+    fake.failPause.add(17);
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("The 'restart' was NOT sent.");
+    expect(res.text).toContain("Rolled back: resumed Valheim [12]");
+    expect(res.text).not.toContain("STILL PAUSED");
+    expect(fake.log).toContain("resumeMonitor:12");
+    expect(fake.monitors.get(12)!.active).toBe(1);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("refuses a monitorsTarget that is not an uptime-kuma target or is not registered", async () => {
+    const calls = panelRoutes([{ state: "running" }]);
+    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.0.1", credentialRef: "u" };
+    const bad = await power({}, gloveCtx({ resolveTarget: () => unifi }, target({ ownerUserId: 7, monitorsTarget: "unifi" })));
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/is a 'unifi' target, not 'uptime-kuma'/);
+    const gone = await power({}, gloveCtx({ resolveTarget: () => undefined }, target({ ownerUserId: 7, monitorsTarget: "nope" })));
+    expect(gone.isError).toBe(true);
+    expect(gone.text).toMatch(/no target by that name is registered/);
+    expect(writes(calls)).toHaveLength(0);
+    expect(fake.connections).toBe(0);
+  });
+
+  it("refuses when no monitor matches the server, naming the fix, and sends nothing", async () => {
+    // A different server that shares nothing with the fixtures: no monitor is
+    // named after it, and no tag carries its identifier.
+    fake.monitors.get(15)!.tags = [{ name: "server", value: "deadbeef" }];
+    const calls = panelRoutes([{ state: "running" }], { json: {} }, "Satisfactory - Ararat");
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/No monitor on Uptime Kuma target 'status-kuma' matches Pelican server 'Satisfactory - Ararat' \(f5eb47ac\)/);
+    expect(res.text).toContain("tag it 'managed:pelican'");
+    expect(writes(calls)).toHaveLength(0);
+    expect(fake.log.some((e) => e.startsWith("pauseMonitor"))).toBe(false);
+  });
+
+  it("points at the missing managed:pelican tag when a same-named monitor exists without it", async () => {
+    fake.monitors.get(12)!.tags = [{ name: "wing", value: "node" }];
+    fake.monitors.get(15)!.tags = []; // and no identifier tag either
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/A monitor named 'Valheim' \[12\] exists but lacks the 'managed:pelican' tag/);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("rolls back and refuses when a pause fails part-way, so the action is never sent half-silenced", async () => {
+    fake.monitors.set(17, { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.0.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] });
+    fake.failPause.add(17);
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await power({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Could not pause monitor 'Valheim \(public\)' \[17\]/);
+    expect(res.text).toContain("The 'restart' was NOT sent.");
+    expect(res.text).toContain("Rolled back: resumed Valheim [12]");
+    expect(writes(calls)).toHaveLength(0);
+    expect(fake.monitors.get(12)!.active).toBe(1);
+
+    // And if the rollback itself fails, that is the headline.
+    fake.failResume.add(12);
+    fake.log.length = 0;
+    const worse = await power({});
+    expect(worse.isError).toBe(true);
+    expect(worse.text).toMatch(/^Pelican error: MONITORS STILL PAUSED on status-kuma: \[12\] Valheim: .*injected resume failure/);
+    expect(worse.text).toContain("The 'restart' was NOT sent.");
+    expect(fake.monitors.get(12)!.active).toBe(0);
+    fake.monitors.get(12)!.active = 1; // leave the fixture clean
+  });
+
+  it("confirm text names the white-glove cycle only when the flag is set", () => {
+    const t = target({ ownerUserId: 7 });
+    expect(tool("power_action").confirm!({ server: "f5eb47ac", signal: "restart" }, t)).toBe("RESTART Pelican server 'f5eb47ac' on pelican-panel");
+    expect(tool("power_action").confirm!({ server: "f5eb47ac", signal: "restart", suppressMonitors: true }, t)).toBe(
+      "RESTART Pelican server 'f5eb47ac' on pelican-panel — white-glove: pause its matching Uptime Kuma monitors first, resume them once it reports 'running' (or on failure)",
+    );
+    expect(tool("power_action").confirm!({ server: "f5eb47ac", signal: "stop", suppressMonitors: true }, t)).toContain("once it reports 'offline'");
+    expect(tool("power_action").description).toMatch(/WHITE-GLOVE RULE/);
+    expect(tool("power_action").description).toMatch(/Scheduled starts\/stops .* never suppressed/);
+  });
+
+  it("without the flag, power_action is exactly what it was", async () => {
+    const calls = panelRoutes([{ state: "running" }]);
+    const res = await tool("power_action").run({ server: "f5eb47ac", signal: "restart" }, gloveCtx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("Sent 'restart'");
+    expect(writes(calls)).toHaveLength(1);
+    expect(fake.connections).toBe(0);
+  });
+});
+
+describe("waitForPowerState", () => {
+  const WAIT_DEFAULTS = { ...POWER_WAIT };
+  beforeEach(() => {
+    POWER_WAIT.intervalMs = 1;
+  });
+  afterEach(() => Object.assign(POWER_WAIT, WAIT_DEFAULTS));
+
+  const script = (states: { state?: string; uptimeMs?: number }[]) => {
+    let i = 0;
+    return async () => states[Math.min(i++, states.length - 1)]!;
+  };
+
+  it("maps signals to end states", () => {
+    expect(expectedStateFor("start")).toBe("running");
+    expect(expectedStateFor("restart")).toBe("running");
+    expect(expectedStateFor("stop")).toBe("offline");
+    expect(expectedStateFor("kill")).toBe("offline");
+  });
+
+  it("a restart is not 'reached' on the pre-restart 'running' — it needs a transition or a fresh uptime", async () => {
+    const stale = await waitForPowerState(script([{ state: "running", uptimeMs: 9_000_000 }]), "restart", 1);
+    expect(stale.reached).toBe(false);
+    expect(stale.observed).toEqual(["running"]);
+
+    const bounced = await waitForPowerState(script([{ state: "running", uptimeMs: 9_000_000 }, { state: "starting" }, { state: "running", uptimeMs: 9_000_100 }]), "restart", 5);
+    expect(bounced).toMatchObject({ reached: true, state: "running", observed: ["running", "starting", "running"] });
+
+    // Polled too slowly to see the dip: the reset uptime still proves it.
+    const fresh = await waitForPowerState(script([{ state: "running", uptimeMs: 9_000_000 }, { state: "running", uptimeMs: 0 }]), "restart", 5);
+    expect(fresh.reached).toBe(true);
+  }, 10_000);
+
+  it("a start/stop is reached on the first matching read, and read errors are tolerated until the deadline", async () => {
+    expect((await waitForPowerState(script([{ state: "running", uptimeMs: 9_000_000 }]), "start", 5)).reached).toBe(true);
+    expect((await waitForPowerState(script([{ state: "stopping" }, { state: "offline" }]), "stop", 5))).toMatchObject({ reached: true, observed: ["stopping", "offline"] });
+    let n = 0;
+    const flaky = async () => {
+      n += 1;
+      if (n < 3) throw new Error("502");
+      return { state: "offline" };
+    };
+    expect((await waitForPowerState(flaky, "kill", 5)).reached).toBe(true);
   });
 });

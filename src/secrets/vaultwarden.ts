@@ -21,6 +21,21 @@ function sanitizeBwError(subcommand: string, err: unknown): Error {
   return new Error(`bw ${subcommand} failed${first ? `: ${first}` : ""}`);
 }
 
+/**
+ * The Bitwarden CLI (2025+) refuses plain-http server URLs with
+ * "InsecureUrlNotAllowedError: Insecure URL not allowed. All URLs must use
+ * HTTPS." — a LAN `http://nas:port` Vaultwarden that worked for a year stops
+ * unlocking the day the CLI is bumped. Name the fix in the error so the admin
+ * doesn't have to decode the CLI's wording.
+ */
+export const INSECURE_URL_HINT =
+  "The Bitwarden CLI only accepts https:// vault server URLs — re-point Skeleton Key at an https:// address for Vaultwarden (admin page → \"Vault connection\", or POST /api/vault/server).";
+
+function withInsecureUrlHint(err: unknown): Error {
+  const e = err instanceof Error ? err : new Error(String(err));
+  return /insecure url not allowed/i.test(e.message) ? new Error(`${e.message}. ${INSECURE_URL_HINT}`) : e;
+}
+
 export interface BwStatus {
   status: "unauthenticated" | "locked" | "unlocked";
   serverUrl?: string;
@@ -162,6 +177,17 @@ export class VaultwardenClient {
   }
 
   /**
+   * Drop the CLI's logged-in state (best-effort) and forget the session. Used
+   * before re-pointing the client at a different server: `bw config server`
+   * refuses to run while logged in, and `reestablish()` only sets the server
+   * from the unauthenticated state. "You are not logged in" is not an error.
+   */
+  async logout(): Promise<void> {
+    this.session = null;
+    await this.run(["logout"]).catch(() => {});
+  }
+
+  /**
    * Bring the client to an unlocked state from whatever state `bw` is in. The
    * login/config state persists on disk across restarts, so after a container
    * restart `bw` is typically "logged in but locked" — in that case we must NOT
@@ -170,12 +196,16 @@ export class VaultwardenClient {
    * (fresh cache). Idempotent and safe to call on every boot/unlock.
    */
   async reestablish(cfg: { serverUrl: string; clientId: string; clientSecret: string; masterPassword: string }): Promise<void> {
-    const st = await this.status();
-    if (st.status === "unauthenticated") {
-      await this.setServer(cfg.serverUrl);
-      await this.loginApiKey(cfg.clientId, cfg.clientSecret);
+    try {
+      const st = await this.status();
+      if (st.status === "unauthenticated") {
+        await this.setServer(cfg.serverUrl);
+        await this.loginApiKey(cfg.clientId, cfg.clientSecret);
+      }
+      await this.unlock(cfg.masterPassword);
+    } catch (err) {
+      throw withInsecureUrlHint(err);
     }
-    await this.unlock(cfg.masterPassword);
   }
 
   /** Refresh the local cache from the server. Requires connectivity. */
