@@ -21,6 +21,17 @@ export function tlsFetch(url: string, init: RequestInit, insecureTLS = false): P
   return undiciFetch(url, { ...(init as Record<string, unknown>), dispatcher: insecureAgent }) as unknown as Promise<Response>;
 }
 
+/** True only for an RFC1918 (private / LAN) IPv4 literal. The shared answer to
+ *  "is this a LAN address I trust enough to send a credential to in clear" —
+ *  used by the Pelican and Uptime Kuma transport guards. */
+export function isPrivateIPv4(ip: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return false;
+  const [a, b, c, d] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if ([a, b, c, d].some((n) => n > 255)) return false;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
 /**
  * Derive a base URL for an HTTP(S) target. An explicit `baseUrl` option wins;
  * otherwise the scheme is inferred from the port (`httpsPorts`, default `[443]`)
