@@ -1184,9 +1184,17 @@ describe("panel version comparison", () => {
     expect(compareVersions("1.0.0-beta38", "v1.0.0")).toBe(-1); // a release outranks its prereleases
   });
 
+  it("orders the prerelease stages Pelican uses: alpha < beta < rc < release", () => {
+    // beta35 → rc.1 is the live upgrade; "could not compare" there would hide it.
+    expect(compareVersions("1.0.0-beta35", "v1.0.0-rc.1")).toBe(-1);
+    expect(compareVersions("1.0.0-rc.1", "v1.0.0-rc.1")).toBe(0);
+    expect(compareVersions("1.0.0-alpha2", "1.0.0-beta38")).toBe(-1);
+    expect(compareVersions("1.0.0-rc.2", "1.0.0")).toBe(-1);
+  });
+
   it("returns undefined rather than guessing when the shapes don't match", () => {
     // Claiming "up to date" wrongly is the dangerous failure, so refuse instead.
-    expect(compareVersions("1.0.0-alpha2", "1.0.0-beta38")).toBeUndefined();
+    expect(compareVersions("1.0.0-foo2", "1.0.0-beta38")).toBeUndefined(); // an unknown stage
     expect(compareVersions("weird", "1.0.0")).toBeUndefined();
   });
 
@@ -1394,6 +1402,7 @@ describe("connector wiring", () => {
       "delete_files",
       "delete_schedule",
       "import_egg",
+      "panel_prepare_runtime",
       "panel_upgrade",
       "power_action",
       "pull_file",
@@ -1402,6 +1411,7 @@ describe("connector wiring", () => {
       "update_server_build",
       "update_server_startup",
       "update_startup_variables",
+      "wings_update",
       "write_file",
     ]);
     // Every execute tool must carry confirm text — the approval gate keys off it.

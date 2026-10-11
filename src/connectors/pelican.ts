@@ -5,6 +5,29 @@ import { deriveBaseUrl, tlsFetch } from "./net.js";
 import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } from "./ssh-exec.js";
 import { checkCommand } from "./command-policy.js";
 import { resolveSecretRefs, secretFingerprintBlock, describeSecretRef, type SecretRef, type SecretValue } from "./secret-refs.js";
+import {
+  HELPER_PATH,
+  HOST_STATUS_COMMAND,
+  currentPhpRequirementCommand,
+  helperCommand,
+  parseHostStatus,
+  hostStatusProblem,
+  classifyHelperFailure,
+  helperFailureText,
+  composerPhpRequirement,
+  fetchReleasePhpRequirement,
+  latestWingsRelease,
+  phpSatisfies,
+  phpVersionFor,
+  assertPhpVersionArg,
+  assertWingsTag,
+  assertReleaseTag,
+  runtimeReport,
+  sshUserOf,
+  compareVersions,
+  type HostStatus,
+} from "./pelican-host.js";
+export { compareVersions } from "./pelican-host.js";
 
 /**
  * Pelican Panel connector — inventory, provisioning, power and schedules for a
@@ -50,7 +73,8 @@ const optionsSchema = z
     ownerUserId: z.number().int().positive().optional(),
     /**
      * Name of the registered **ssh** target for the machine the panel is
-     * installed on. Required by `panel_version` and `panel_upgrade`: Pelican
+     * installed on. Required by `panel_version`, `panel_upgrade`,
+     * `panel_prepare_runtime` and `wings_update`: Pelican
      * exposes no version or upgrade endpoint on ANY of its API surfaces
      * (application, client, web, remote) — it reads its own version from
      * `config/app.php` and checks GitHub in the browser — so those two are
@@ -827,38 +851,6 @@ async function runOnPanelHost(host: PanelHost, command: string, timeoutMs?: numb
 export function parsePanelVersion(configLine: string): string | undefined {
   const m = /['"]version['"]\s*=>\s*['"]([^'"]+)['"]/.exec(configLine);
   return m?.[1];
-}
-
-/**
- * Compare two Pelican versions well enough to say "behind / same / ahead".
- * Pelican tags look like `v1.0.0-beta38`; compare numeric components left to
- * right, then the prerelease number. Returns -1/0/1, or undefined when the shape
- * is unrecognised — in which case the caller must say "could not compare"
- * rather than guess, because claiming "up to date" wrongly is the bad failure.
- * Exported for testing.
- */
-export function compareVersions(a: string, b: string): number | undefined {
-  const parse = (v: string) => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d+))?$/.exec(v.trim());
-    if (!m) return undefined;
-    return {
-      nums: [Number(m[1]), Number(m[2]), Number(m[3])],
-      // No prerelease outranks any prerelease: 1.0.0 > 1.0.0-beta38.
-      pre: m[4] ? { tag: m[4].toLowerCase(), num: Number(m[5]) } : undefined,
-    };
-  };
-  const pa = parse(a);
-  const pb = parse(b);
-  if (!pa || !pb) return undefined;
-  for (let i = 0; i < 3; i += 1) {
-    if (pa.nums[i]! !== pb.nums[i]!) return pa.nums[i]! < pb.nums[i]! ? -1 : 1;
-  }
-  if (!pa.pre && !pb.pre) return 0;
-  if (!pa.pre) return 1;
-  if (!pb.pre) return -1;
-  if (pa.pre.tag !== pb.pre.tag) return undefined; // alpha vs beta — don't guess
-  if (pa.pre.num === pb.pre.num) return 0;
-  return pa.pre.num < pb.pre.num ? -1 : 1;
 }
 
 /** Latest released panel version, from the same source the panel's own banner
@@ -2235,11 +2227,13 @@ class Pelican {
   }
 }
 
-/** Installed version + latest release, for the panel's own host. */
-async function panelVersion(ctx: ToolContext): Promise<string> {
-  const host = await panelHost(ctx);
-  const cmd = `grep -m1 "'version'" ${host.path}/config/app.php`;
-  const res = await runOnPanelHost(host, cmd);
+/** The fixed read of the installed version from config/app.php. */
+function versionCommand(host: PanelHost): string {
+  return `grep -m1 "'version'" ${host.path}/config/app.php`;
+}
+
+async function readInstalledVersion(host: PanelHost): Promise<string> {
+  const res = await runOnPanelHost(host, versionCommand(host));
   if (res.code !== 0) {
     throw new Error(
       `Could not read ${host.path}/config/app.php on '${host.target.name}' (exit ${res.code}): ${res.stderr.trim().slice(0, 200)}. ` +
@@ -2250,24 +2244,71 @@ async function panelVersion(ctx: ToolContext): Promise<string> {
   if (!installed) {
     throw new Error(`Read ${host.path}/config/app.php but found no version line in it. The install may be laid out differently than expected.`);
   }
+  return installed;
+}
+
+/**
+ * The host runtime picture through the root helper (or the unprivileged fallback
+ * when it is missing / sudo refuses). Never throws for a helper problem — the
+ * problem text names the exact fix (install snippet or the one sudoers line).
+ */
+async function readHostStatus(host: PanelHost): Promise<{ status: HostStatus; problem?: string }> {
+  const res = await runOnPanelHost(host, HOST_STATUS_COMMAND, 60_000);
+  const status = parseHostStatus(res.stdout);
+  return { status, problem: hostStatusProblem(res, status, sshUserOf(host.cred)) };
+}
+
+/** The installed panel's own PHP constraint (its composer.json `require.php`). */
+async function readCurrentPhpRequirement(host: PanelHost): Promise<string | undefined> {
+  const res = await runOnPanelHost(host, currentPhpRequirementCommand(host.path));
+  return res.code === 0 ? composerPhpRequirement(res.stdout) : undefined;
+}
+
+/**
+ * Installed version + latest release + the host runtime picture (PHP, the nginx
+ * socket, Wings, the helper) so the whole upgrade story is one read. The runtime
+ * part is best-effort: a missing helper or a denied sudo is REPORTED with the fix,
+ * never fatal, so the version read keeps working on a host without the helper.
+ */
+async function panelVersion(ctx: ToolContext): Promise<string> {
+  const host = await panelHost(ctx);
+  const installed = await readInstalledVersion(host);
 
   const latest = await latestPanelRelease();
+  let headline: string;
   if (!latest.tag) {
-    return (
-      `Pelican panel ${host.target.name === ctx.target.name ? "" : `(host '${host.target.name}') `}is running **${installed}**. ` +
-      `Could not reach GitHub for the latest release (${latest.error}), so I can't say whether that is current.`
-    );
+    headline =
+      `Pelican panel on host '${host.target.name}' is running **${installed}**. ` +
+      `Could not reach GitHub for the latest release (${latest.error}), so I can't say whether that is current.`;
+  } else {
+    const cmp = compareVersions(installed, latest.tag);
+    const verdict =
+      cmp === undefined
+        ? `Could not compare '${installed}' with '${latest.tag}' — the version shapes differ, so check by hand rather than trusting a guess.`
+        : cmp < 0
+          ? `An upgrade is available. Run panel_upgrade (it takes the current version as confirmation) once the PHP requirement below is met.`
+          : cmp === 0
+            ? `That is the latest release.`
+            : `Installed is NEWER than the latest release — likely a pre-release or a local build.`;
+    headline = `Pelican panel on host '${host.target.name}': installed **${installed}**, latest released **${latest.tag}**. ${verdict}`;
   }
-  const cmp = compareVersions(installed, latest.tag);
-  const verdict =
-    cmp === undefined
-      ? `Could not compare '${installed}' with '${latest.tag}' — the version shapes differ, so check by hand rather than trusting a guess.`
-      : cmp < 0
-        ? `An upgrade is available. Run panel_upgrade (it takes the current version as confirmation).`
-        : cmp === 0
-          ? `That is the latest release.`
-          : `Installed is NEWER than the latest release — likely a pre-release or a local build.`;
-  return `Pelican panel on host '${host.target.name}': installed **${installed}**, latest released **${latest.tag}**. ${verdict}`;
+
+  const { status, problem } = await readHostStatus(host);
+  const current = await readCurrentPhpRequirement(host);
+  const release = latest.tag ? await fetchReleasePhpRequirement(latest.tag) : { error: "latest release unknown" };
+  const wingsLatest = await latestWingsRelease();
+  const runtime = runtimeReport({
+    status,
+    helperProblem: problem,
+    installedPanel: installed,
+    currentPhpRequirement: current,
+    releaseTag: latest.tag,
+    releasePhpRequirement: release.php,
+    releaseRequirementError: release.error,
+    latestWingsTag: wingsLatest.tag,
+    latestWingsError: wingsLatest.error,
+  });
+  return `${headline}\n${runtime}`;
 }
 
 /**
@@ -2327,6 +2368,11 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
     );
   }
 
+  // PHP gate — BEFORE the backup and maintenance mode. v1.0.0-rc.1 raised the
+  // floor to PHP 8.4; without this the upgrade took the panel down and then died
+  // at composer install on 8.3, leaving it in maintenance mode.
+  await assertRuntimeReadyForLatest(host);
+
   const backupAt = input.skipBackup ? null : await backupPanelDatabase(host);
 
   const done: string[] = [];
@@ -2356,6 +2402,155 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
     `${backupAt ? `Pre-upgrade database backup: ${backupAt}. ` : "No database backup was taken. "}` +
     `${notes.length ? `Notes — ${notes.join("; ")}. ` : ""}` +
     `Verify with panel_version and by loading the panel; if anything looks wrong, the backup above is the rollback point.`
+  );
+}
+
+/**
+ * Refuse to start an upgrade whose target release the host's PHP cannot run.
+ * `panel_upgrade` installs `releases/latest`, so the requirement is read from
+ * THAT tag's composer.json; every failure to establish it fails closed — starting
+ * blind is exactly how the panel ends up in maintenance mode with a dead
+ * composer step.
+ */
+async function assertRuntimeReadyForLatest(host: PanelHost): Promise<void> {
+  const latest = await latestPanelRelease();
+  if (!latest.tag) {
+    throw new Error(
+      `Refusing to upgrade: could not determine the latest release from GitHub (${latest.error}), so its PHP requirement is unknown. ` +
+        `The download step needs GitHub anyway — retry when it is reachable.`,
+    );
+  }
+  const req = await fetchReleasePhpRequirement(latest.tag);
+  if (!req.php) {
+    throw new Error(`Refusing to upgrade: could not read the PHP requirement of ${latest.tag} (${req.error}). Starting blind is how the panel ends up in maintenance mode with a failed composer install.`);
+  }
+  const { status, problem } = await readHostStatus(host);
+  if (!status.phpCli) throw new Error(`Refusing to upgrade: could not read the host's PHP version${problem ? ` — ${problem}` : ""}.`);
+  const sat = phpSatisfies(req.php, status.phpCli);
+  if (sat === undefined) {
+    throw new Error(`Refusing to upgrade: cannot interpret the PHP constraint '${req.php}' of ${latest.tag} against the installed PHP ${status.phpCli}; check by hand.`);
+  }
+  if (!sat) {
+    const want = phpVersionFor(req.php);
+    throw new Error(
+      `Refusing to upgrade: ${latest.tag} requires PHP ${req.php}, but host '${host.target.name}' runs PHP ${status.phpCli} — composer install would fail AFTER the panel is already in maintenance mode. ` +
+        `Run panel_prepare_runtime${want ? ` with phpVersion '${want}'` : ""} first (it installs that PHP release, switches the panel's php-fpm socket and the CLI default), then re-run panel_upgrade.`,
+    );
+  }
+}
+
+/**
+ * Switch the panel host's PHP runtime through the root helper, after proving
+ * (1) the requested PHP satisfies the target release's composer.json, (2) the
+ * INSTALLED panel can still run on it — the runtime switches now, the code only
+ * at panel_upgrade — and (3) the helper is installed and sudo-able. Only then is
+ * the single fixed command `sudo -n <helper> php-prepare '<8.N>'` sent.
+ */
+async function panelPrepareRuntime(ctx: ToolContext, input: { phpVersion: string; release?: string }): Promise<string> {
+  const phpVersion = assertPhpVersionArg(input.phpVersion);
+  const host = await panelHost(ctx);
+  const user = sshUserOf(host.cred);
+
+  let tag: string;
+  if (input.release) {
+    tag = assertReleaseTag(input.release);
+  } else {
+    const latest = await latestPanelRelease();
+    if (!latest.tag) throw new Error(`Could not determine the latest panel release (${latest.error}); pass 'release' explicitly.`);
+    tag = latest.tag;
+  }
+  const req = await fetchReleasePhpRequirement(tag);
+  if (!req.php) throw new Error(`Could not read the PHP requirement of ${tag} (${req.error}); refusing to change the runtime without it.`);
+  const forRelease = phpSatisfies(req.php, `${phpVersion}.0`);
+  if (forRelease === undefined) throw new Error(`Cannot interpret the PHP constraint '${req.php}' of ${tag}; check by hand.`);
+  if (!forRelease) {
+    const want = phpVersionFor(req.php);
+    throw new Error(`Refusing: PHP ${phpVersion} does not satisfy ${tag}'s requirement '${req.php}'${want ? `; the lowest 8.x that does is ${want}` : ""}.`);
+  }
+
+  const { status, problem } = await readHostStatus(host);
+  const cliOk = !!status.phpCli && phpSatisfies(req.php, status.phpCli) === true;
+  const socketOk = !!status.nginxSocket && status.nginxSocket.includes(`/php${phpVersion}-fpm.sock`);
+  if (cliOk && socketOk) {
+    return (
+      `Nothing to do: host '${host.target.name}' already runs PHP ${status.phpCli}, which satisfies ${tag}'s requirement '${req.php}', ` +
+      `and nginx already uses ${status.nginxSocket}. Proceed with panel_upgrade.`
+    );
+  }
+
+  const current = await readCurrentPhpRequirement(host);
+  if (!current) {
+    throw new Error(
+      `Refusing: could not read the installed panel's own PHP requirement from ${host.path}/composer.json, so I can't tell whether it would keep running on PHP ${phpVersion}. Check the target's 'panelPath'.`,
+    );
+  }
+  const currentOk = phpSatisfies(current, `${phpVersion}.0`);
+  if (currentOk === undefined) throw new Error(`Refusing: cannot interpret the installed panel's PHP constraint '${current}'; check by hand.`);
+  if (!currentOk) {
+    throw new Error(
+      `Refusing: the installed panel declares PHP ${current} and would stop working on PHP ${phpVersion} BEFORE the upgrade replaces its code. ` +
+        `Upgrade in two hops through a release whose composer.json allows both, or do this one by hand.`,
+    );
+  }
+
+  if (problem) throw new Error(`Cannot prepare the runtime: ${problem}`);
+  const res = await runOnPanelHost(host, helperCommand("php-prepare", phpVersion), 600_000);
+  if (res.code !== 0) {
+    throw new Error(`php-prepare ${phpVersion} FAILED on '${host.target.name}' — ${helperFailureText(classifyHelperFailure(res), user, res, "php-prepare")}`);
+  }
+  const after = parseHostStatus(res.stdout);
+  return (
+    `Prepared the PHP runtime on host '${host.target.name}' for ${tag} (requires PHP ${req.php}): PHP CLI now **${after.phpCli ?? "(unreadable)"}**` +
+    `${after.phpDefault ? ` (default php${after.phpDefault})` : ""}, nginx fastcgi socket ${after.nginxSocket ?? "(unreadable)"}` +
+    `${after.phpFpmActive.length ? `, php-fpm active: ${after.phpFpmActive.join(", ")}` : ""}. ` +
+    `The previous PHP release stays installed as the rollback point (nginx site backups end in .bak-skeleton-key). Next: panel_upgrade with expectVersion = the installed version.`
+  );
+}
+
+/**
+ * Update the Wings binary through the root helper. The stale-picture guard is the
+ * installed Wings version (read by the helper — the panel's node API carries no
+ * daemon version, and `wings version` is not executable by the SSH user).
+ */
+async function wingsUpdate(ctx: ToolContext, input: { expectVersion: string; tag: string }): Promise<string> {
+  const tag = assertWingsTag(input.tag);
+  const host = await panelHost(ctx);
+  const user = sshUserOf(host.cred);
+
+  const { status, problem } = await readHostStatus(host);
+  if (problem) throw new Error(`Cannot update Wings: ${problem}`);
+  if (!status.wings) {
+    throw new Error(`Cannot update Wings: the host helper reported no Wings version — is Wings installed at /usr/local/bin/wings on '${host.target.name}'?`);
+  }
+  const expect = input.expectVersion.trim().replace(/^v/, "");
+  if (status.wings !== expect) {
+    throw new Error(
+      `Refusing to update Wings: you said it is on '${input.expectVersion}', but host '${host.target.name}' runs '${status.wings}'. Run panel_version and re-confirm.`,
+    );
+  }
+  if (status.wings === tag.slice(1)) {
+    return `Nothing to do: Wings on '${host.target.name}' is already ${status.wings}${status.wingsActive ? ` (service ${status.wingsActive})` : ""}.`;
+  }
+
+  const res = await runOnPanelHost(host, helperCommand("wings-update", tag), 300_000);
+  if (res.code !== 0) {
+    const rolledBack = /rolled back/i.test(res.stderr) ? " The previous binary was restored." : "";
+    throw new Error(`wings-update ${tag} FAILED on '${host.target.name}' — ${helperFailureText(classifyHelperFailure(res), user, res, "wings-update")}${rolledBack}`);
+  }
+  const after = parseHostStatus(res.stdout);
+
+  // Lockstep note — informational only, never blocks the result.
+  let note = "";
+  try {
+    const panel = await readInstalledVersion(host);
+    const c = compareVersions(panel, tag);
+    if (c !== undefined && c < 0) note = ` Note: the panel is on ${panel}, behind Wings ${tag} — Pelican ships them in lockstep, so run panel_upgrade too.`;
+  } catch {
+    /* the Wings update already succeeded; the panel version is just context */
+  }
+  return (
+    `Updated Wings on host '${host.target.name}': **${status.wings} → ${after.wings ?? "(unreadable)"}**${after.wingsActive ? ` (service ${after.wingsActive})` : ""}. ` +
+    `The previous binary is kept at /usr/local/bin/wings.prev. Running game servers were not stopped; consoles reconnect on their own.${note}`
   );
 }
 
@@ -2475,7 +2670,9 @@ function buildTools(target: Target): ConnectorTool[] {
         `Report the Pelican panel's installed version on ${target.name} and the latest released version. Pelican has NO version endpoint ` +
         `on any API half, so the installed version is read from config/app.php over SSH — this needs the target's 'sshTarget' option ` +
         `pointing at the registered ssh target for the panel's host. The latest release comes from the same GitHub endpoint the panel's ` +
-        `own "update available" banner uses.`,
+        `own "update available" banner uses. Also reports the host runtime the upgrade depends on — PHP version vs the release's ` +
+        `composer.json requirement, the panel's nginx php-fpm socket, the Wings version vs its latest release, and whether the root ` +
+        `helper for panel_prepare_runtime / wings_update is installed (with the exact install steps if not).`,
       tier: "read",
       inputSchema: z.object({}),
       run: async (_input, ctx) => {
@@ -2493,7 +2690,9 @@ function buildTools(target: Target): ConnectorTool[] {
         `upgrade endpoint), so it needs the target's 'sshTarget' option. Run panel_version first and pass its installed version as ` +
         `expectVersion — a mismatch is refused. It takes a database backup, then runs Pelican's documented sequence: maintenance mode, ` +
         `download, extract, composer install, migrate, clear caches, restart queue, up. artisan/composer run as the panel user, never ` +
-        `root. On any failure it STOPS, names the step, and leaves the panel in maintenance mode rather than half-upgraded and serving.`,
+        `root. On any failure it STOPS, names the step, and leaves the panel in maintenance mode rather than half-upgraded and serving. ` +
+        `It REFUSES up front — before maintenance mode — when the latest release's PHP requirement (from its composer.json) is not met ` +
+        `by the host; run panel_prepare_runtime first in that case.`,
       tier: "execute",
       inputSchema: z.object({
         expectVersion: z.string().min(1).describe("The currently installed version, exactly as panel_version reports it. A mismatch aborts."),
@@ -2514,6 +2713,75 @@ function buildTools(target: Target): ConnectorTool[] {
       run: async (input, ctx) => {
         try {
           return ok(await panelUpgrade(ctx, input as { expectVersion: string; skipBackup?: boolean }));
+        } catch (e) {
+          return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+        }
+      },
+    },
+    {
+      name: "panel_prepare_runtime",
+      description:
+        `Install and switch the PHP runtime on ${target.name}'s panel host ahead of a panel upgrade whose release raised the PHP floor ` +
+        `(v1.0.0-rc.1 needs PHP 8.4). HOST-LEVEL work over SSH through the root-owned helper ${HELPER_PATH} and ONE sudoers rule for it — ` +
+        `never general sudo; a missing helper or a denied sudo returns the exact install steps. Run panel_version first: it reports the ` +
+        `release's PHP requirement and the phpVersion to pass. This tool fetches the release's composer.json, refuses a phpVersion that does ` +
+        `not satisfy it, refuses if the INSTALLED panel could not run on that PHP (the runtime switches now, the code only at panel_upgrade), ` +
+        `and is a no-op when the host already meets it. On the host: ppa:ondrej/php if missing, php<ver> + fpm/cli/gd/mysql/mbstring/bcmath/` +
+        `xml/curl/zip/intl/sqlite3, the CLI default, the panel site's fastcgi_pass socket (only in nginx files that mention the panel root), ` +
+        `nginx -t, then restart php-fpm + nginx. The previous PHP release stays installed as the rollback point.`,
+      tier: "execute",
+      inputSchema: z.object({
+        phpVersion: z
+          .string()
+          .regex(/^8\.\d{1,2}$/, "a PHP 8 major.minor, e.g. 8.4")
+          .describe("PHP major.minor to install and switch to, e.g. '8.4' — the version panel_version says the release requires."),
+        release: z
+          .string()
+          .optional()
+          .describe("Panel release tag to prepare for, e.g. 'v1.0.0-rc.1'. Default: the latest release, which is what panel_upgrade installs."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { phpVersion: string; release?: string };
+        const o = options(t);
+        return (
+          `PREPARE the PHP runtime on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}': install PHP ${i.phpVersion} (ppa:ondrej/php + ` +
+          `Pelican's extensions), make it the CLI default, switch the panel's nginx fastcgi socket to php${i.phpVersion}-fpm and restart ` +
+          `php-fpm + nginx — for panel release ${i.release ?? "latest"}; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
+        );
+      },
+      run: async (input, ctx) => {
+        try {
+          return ok(await panelPrepareRuntime(ctx, input as { phpVersion: string; release?: string }));
+        } catch (e) {
+          return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+        }
+      },
+    },
+    {
+      name: "wings_update",
+      description:
+        `Update the Wings daemon binary on ${target.name}'s panel host to a GitHub release tag. HOST-LEVEL work through the root-owned ` +
+        `helper ${HELPER_PATH} (sudo -n for that script only): it downloads wings_linux_<arch> + checksums.txt for the tag, verifies the ` +
+        `SHA-256, swaps /usr/local/bin/wings atomically (previous kept as .prev), restarts the wings unit and rolls back if it does not come ` +
+        `up. Running game servers keep running; consoles reconnect. Run panel_version first and pass the installed Wings version as ` +
+        `expectVersion (a mismatch is refused) and the tag it reports as latest. Pelican ships panel and Wings in lockstep — update Wings ` +
+        `AFTER panel_upgrade reaches the matching release.`,
+      tier: "execute",
+      inputSchema: z.object({
+        expectVersion: z.string().min(1).describe("Installed Wings version exactly as panel_version reports it (e.g. '1.0.0-beta22'). A mismatch aborts."),
+        tag: z.string().min(1).describe("Wings release tag to install, e.g. 'v1.0.0-rc.1' (panel_version reports the latest)."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { expectVersion: string; tag: string };
+        const o = options(t);
+        return (
+          `UPDATE the Wings daemon on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.tag} — replaces ` +
+          `/usr/local/bin/wings (checksum-verified) and restarts the wings service; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
+        );
+      },
+      run: async (input, ctx) => {
+        try {
+          return ok(await wingsUpdate(ctx, input as { expectVersion: string; tag: string }));
         } catch (e) {
           return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
         }
