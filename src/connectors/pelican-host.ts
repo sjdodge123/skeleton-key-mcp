@@ -3,15 +3,15 @@ import type { Credential } from "./types.js";
 
 /**
  * Pelican panel-host plumbing — the PURE half of `panel_version`,
- * `panel_prepare_runtime` and `wings_update` (the SSH glue lives in
- * `pelican.ts`). Everything here is deterministic and unit-tested without a
+ * `panel_prepare_runtime`, `panel_upgrade` and `wings_update` (the SSH glue lives
+ * in `pelican.ts`). Everything here is deterministic and unit-tested without a
  * host: command construction, argument validation, output parsing, composer PHP
  * constraints, and the operator hints printed when the helper is missing or
  * sudo refuses.
  *
  * **The root boundary.** A panel upgrade has host-level prerequisites that need
- * root — a new PHP release + php-fpm + the nginx socket, and the Wings binary —
- * but the SSH user must not get general sudo for that. The owner installs ONE
+ * root — a new PHP release + php-fpm + the nginx socket, the panel upgrade itself,
+ * and the Wings binary — but the SSH user must not get general sudo for that. The owner installs ONE
  * root-owned, non-writable helper (`scripts/host/skeleton-key-pelican-host.sh`,
  * shipped in this repo) and grants ONE NOPASSWD sudoers rule for that path
  * alone. Skeleton Key only ever runs `sudo -n <helper> <fixed subcommand>
@@ -27,7 +27,7 @@ export const HELPER_REPO_PATH = "scripts/host/skeleton-key-pelican-host.sh";
 /** The one sudoers drop-in the rule goes into. */
 export const HELPER_SUDOERS_FILE = "/etc/sudoers.d/skeleton-key-pelican-host";
 
-export const HELPER_SUBCOMMANDS = ["status", "php-prepare", "wings-update"] as const;
+export const HELPER_SUBCOMMANDS = ["status", "php-prepare", "panel-upgrade", "wings-update"] as const;
 export type HelperSubcommand = (typeof HELPER_SUBCOMMANDS)[number];
 
 // --- Argument validation (mirrors the helper's own checks) ------------------------
@@ -59,6 +59,15 @@ export function assertReleaseTag(tag: string): string {
   return assertTag(tag, "release");
 }
 
+/** The installed panel version as config/app.php spells it (no leading `v`). */
+export function assertPanelVersion(v: string): string {
+  const t = v.trim();
+  if (t.length > 40 || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)?$/.test(t)) {
+    throw new Error(`expectVersion must be a panel version like '1.0.0-beta35' (got '${v}').`);
+  }
+  return t;
+}
+
 // --- Commands sent to the host ------------------------------------------------------
 
 /**
@@ -67,12 +76,30 @@ export function assertReleaseTag(tag: string): string {
  * validated AND single-quoted — belt and braces, since the helper re-validates.
  */
 export function helperCommand(sub: "status"): string;
-export function helperCommand(sub: "php-prepare" | "wings-update", arg: string): string;
-export function helperCommand(sub: HelperSubcommand, arg?: string): string {
-  if (sub === "status") return `sudo -n ${HELPER_PATH} status`;
-  if (arg === undefined) throw new Error(`${sub} needs an argument`);
-  const checked = sub === "php-prepare" ? assertPhpVersionArg(arg) : assertWingsTag(arg);
-  return `sudo -n ${HELPER_PATH} ${sub} ${shellQuote(checked)}`;
+export function helperCommand(sub: "php-prepare", phpVersion: string): string;
+export function helperCommand(sub: "wings-update", tag: string): string;
+export function helperCommand(sub: "panel-upgrade", expectVersion: string, tag: string, skipBackup?: boolean): string;
+export function helperCommand(sub: HelperSubcommand, a?: string, b?: string, skipBackup?: boolean): string {
+  const args: string[] = [];
+  switch (sub) {
+    case "status":
+      break;
+    case "php-prepare":
+      if (a === undefined) throw new Error("php-prepare needs a PHP version");
+      args.push(assertPhpVersionArg(a));
+      break;
+    case "wings-update":
+      if (a === undefined) throw new Error("wings-update needs a tag");
+      args.push(assertWingsTag(a));
+      break;
+    case "panel-upgrade":
+      if (a === undefined || b === undefined) throw new Error("panel-upgrade needs the installed version and a tag");
+      args.push(assertPanelVersion(a), assertReleaseTag(b));
+      // The helper accepts exactly this literal as its only option.
+      if (skipBackup) args.push("--skip-backup");
+      break;
+  }
+  return [`sudo -n ${HELPER_PATH} ${sub}`, ...args.map(shellQuote)].join(" ");
 }
 
 /** Unprivileged PHP CLI version probe, in the helper's key=value format. */
@@ -104,6 +131,8 @@ export interface HostStatus {
   /** Set when the helper exists but `sudo -n … status` exited non-zero. */
   helperRc?: number;
   helperVersion?: number;
+  /** The panel version the helper read from config/app.php (helper v2+). */
+  panelVersion?: string;
   /** `php -r 'echo PHP_VERSION;'`, e.g. "8.3.6". */
   phpCli?: string;
   /** The `php` alternative, e.g. "8.3". */
@@ -125,12 +154,18 @@ export function parseWingsVersion(text: string): string | undefined {
 }
 
 /** key=value lines → HostStatus; unknown keys and non-matching lines are ignored. */
-export function parseHostStatus(stdout: string): HostStatus {
+/** `key=value` lines → map; anything else (progress text, `php -v`) is ignored. */
+export function parseKeyValues(stdout: string): Map<string, string> {
   const kv = new Map<string, string>();
   for (const line of stdout.split(/\r?\n/)) {
     const m = /^([a-z_]+)=(.*)$/.exec(line.trim());
     if (m) kv.set(m[1]!, m[2]!.trim());
   }
+  return kv;
+}
+
+export function parseHostStatus(stdout: string): HostStatus {
+  const kv = parseKeyValues(stdout);
   const str = (k: string): string | undefined => kv.get(k) || undefined;
   const list = (k: string): string[] => (kv.get(k) ?? "").split(/\s+/).filter(Boolean);
   const num = (k: string): number | undefined => {
@@ -142,6 +177,7 @@ export function parseHostStatus(stdout: string): HostStatus {
     helper: kv.get("helper") === "1",
     helperRc: num("helper_rc"),
     helperVersion: num("helper_version"),
+    panelVersion: str("panel_version"),
     phpCli: str("php_cli"),
     phpDefault: str("php_default"),
     phpInstalled: list("php_installed"),
@@ -151,6 +187,54 @@ export function parseHostStatus(stdout: string): HostStatus {
     nginxActive: str("nginx_active"),
     wings: wings ? parseWingsVersion(wings) : undefined,
     wingsActive: str("wings_active"),
+  };
+}
+
+/** The helper's `panel-upgrade` steps in order — the names it reports in
+ *  `steps_done` / `failed_step`. Download, pre-flight and backup come BEFORE
+ *  maintenance mode by design. */
+export const PANEL_UPGRADE_STEP_NAMES = [
+  "download-release",
+  "download-checksum",
+  "preflight-platform",
+  "db-backup",
+  "maintenance-mode",
+  "extract",
+  "fix-permissions",
+  "composer-install",
+  "migrate",
+  "clear-caches",
+  "restart-queue",
+  "exit-maintenance",
+] as const;
+
+export interface UpgradeResult {
+  before?: string;
+  after?: string;
+  alreadyCurrent: boolean;
+  /** Root-only run log on the host with every step's output. */
+  log?: string;
+  /** Backup path, or the literal "skipped". */
+  dbBackup?: string;
+  stepsDone: string[];
+  failedStep?: string;
+  /** True when the helper stopped with the panel still in maintenance mode. */
+  maintenance?: boolean;
+}
+
+/** The `panel-upgrade` subcommand's stdout → result (success or failure shape). */
+export function parseUpgradeResult(stdout: string): UpgradeResult {
+  const kv = parseKeyValues(stdout);
+  const str = (k: string): string | undefined => kv.get(k) || undefined;
+  return {
+    before: str("panel_before"),
+    after: str("panel_after"),
+    alreadyCurrent: kv.get("already_current") === "1",
+    log: str("upgrade_log"),
+    dbBackup: str("db_backup"),
+    stepsDone: (kv.get("steps_done") ?? "").split(/\s+/).filter(Boolean),
+    failedStep: str("failed_step"),
+    maintenance: kv.has("maintenance") ? kv.get("maintenance") === "1" : undefined,
   };
 }
 

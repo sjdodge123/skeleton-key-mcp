@@ -2,7 +2,7 @@ import { z } from "zod";
 import yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch } from "./net.js";
-import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } from "./ssh-exec.js";
+import { runSsh, MAX_SSH_TIMEOUT_MS, type SshExecResult } from "./ssh-exec.js";
 import { checkCommand } from "./command-policy.js";
 import { resolveSecretRefs, secretFingerprintBlock, describeSecretRef, type SecretRef, type SecretValue } from "./secret-refs.js";
 import {
@@ -11,6 +11,7 @@ import {
   currentPhpRequirementCommand,
   helperCommand,
   parseHostStatus,
+  parseUpgradeResult,
   hostStatusProblem,
   classifyHelperFailure,
   helperFailureText,
@@ -867,52 +868,6 @@ export async function latestPanelRelease(): Promise<{ tag?: string; error?: stri
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
   }
-}
-
-/** One step of the upgrade. `command` is a template over the validated
- *  `{path}` / `{user}` only — never over caller input. */
-interface UpgradeStep {
-  name: string;
-  command: string;
-  timeoutMs?: number;
-  /** Output worth quoting back in the result (version checks, migration tail). */
-  capture?: boolean;
-}
-
-/**
- * The upgrade, as Pelican documents it for a bare-metal install, as an explicit
- * reviewable list rather than one opaque blob. Each step runs on its own so a
- * failure names the step it died on, and the panel is left in maintenance mode
- * with the reason rather than half-upgraded and serving.
- *
- * `artisan` and `composer` run as the panel user, never root, so the upgrade
- * cannot leave root-owned files the webserver then can't write — the classic way
- * a "successful" upgrade bricks the panel afterwards.
- */
-export const PANEL_UPGRADE_STEPS: UpgradeStep[] = [
-  { name: "maintenance-mode", command: 'cd {path} && sudo -n -u {user} php artisan down' },
-  {
-    name: "download-release",
-    command: 'cd {path} && sudo -n -u {user} curl -sSL -o /tmp/pelican-panel.tar.gz https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz',
-    timeoutMs: 300_000,
-  },
-  { name: "extract", command: 'cd {path} && sudo -n -u {user} tar -xzf /tmp/pelican-panel.tar.gz', timeoutMs: 180_000 },
-  { name: "fix-permissions", command: 'cd {path} && sudo -n chmod -R 755 storage bootstrap/cache' },
-  {
-    name: "composer-install",
-    command: 'cd {path} && sudo -n -u {user} composer install --no-dev --optimize-autoloader --no-interaction',
-    timeoutMs: 600_000,
-    capture: true,
-  },
-  { name: "migrate", command: 'cd {path} && sudo -n -u {user} php artisan migrate --seed --force', timeoutMs: 600_000, capture: true },
-  { name: "clear-caches", command: 'cd {path} && sudo -n -u {user} php artisan optimize:clear' },
-  { name: "restart-queue", command: 'cd {path} && sudo -n -u {user} php artisan queue:restart' },
-  { name: "exit-maintenance", command: 'cd {path} && sudo -n -u {user} php artisan up' },
-];
-
-/** Fill a step template with the already-validated path/user. */
-function renderStep(command: string, host: PanelHost): string {
-  return command.replaceAll("{path}", host.path).replaceAll("{user}", host.user);
 }
 
 // --- Response shapes (Fractal envelopes: {object, data:[{attributes}]}) -------
@@ -2312,55 +2267,47 @@ async function panelVersion(ctx: ToolContext): Promise<string> {
 }
 
 /**
- * Back up the panel database before an upgrade, because `migrate` is the step
- * with no undo. The engine is read from `.env`'s DB_CONNECTION — only that one
- * line, never the whole file, which holds the app key and DB password.
- *
- * For MySQL/MariaDB the dump sources `.env` **on the panel host** inside the
- * remote shell, so the password is expanded there and never crosses the wire,
- * the audit log, or the model context — the command text contains variable
- * names only.
+ * Refuse to start an upgrade whose target release the host's PHP cannot run,
+ * and surface the helper/sudo state. Every failure to establish the requirement
+ * fails closed — starting blind is exactly how the panel ends up in maintenance
+ * mode with a dead composer step.
  */
-async function backupPanelDatabase(host: PanelHost): Promise<string> {
-  const detect = await runOnPanelHost(host, `grep -m1 '^DB_CONNECTION=' ${host.path}/.env`);
-  const engine = (detect.stdout.split("=")[1] ?? "").trim().toLowerCase().replace(/["']/g, "");
-  const stamp = "$(date +%Y%m%d-%H%M%S)";
-
-  let command: string;
-  let where: string;
-  if (engine === "sqlite") {
-    where = `${host.path}/storage/pelican-db-backup-<timestamp>.sqlite`;
-    command = `cd ${host.path} && sudo -n -u ${host.user} cp database/database.sqlite storage/pelican-db-backup-${stamp}.sqlite`;
-  } else if (engine === "mysql" || engine === "mariadb") {
-    where = `${host.path}/storage/pelican-db-backup-<timestamp>.sql`;
-    command =
-      `cd ${host.path} && sudo -n -u ${host.user} bash -c 'set -a; . ./.env; set +a; ` +
-      `mysqldump --no-tablespaces -h "$DB_HOST" -P "\${DB_PORT:-3306}" -u "$DB_USERNAME" -p"$DB_PASSWORD" "$DB_DATABASE" ` +
-      `> storage/pelican-db-backup-${stamp}.sql'`;
-  } else {
+async function assertRuntimeReady(host: PanelHost, tag: string): Promise<{ status: HostStatus; problem?: string }> {
+  const req = await fetchReleasePhpRequirement(tag);
+  if (!req.php) {
+    throw new Error(`Refusing to upgrade: could not read the PHP requirement of ${tag} (${req.error}). Starting blind is how the panel ends up in maintenance mode with a failed composer install.`);
+  }
+  const { status, problem } = await readHostStatus(host);
+  if (!status.phpCli) throw new Error(`Refusing to upgrade: could not read the host's PHP version${problem ? ` — ${problem}` : ""}.`);
+  const sat = phpSatisfies(req.php, status.phpCli);
+  if (sat === undefined) {
+    throw new Error(`Refusing to upgrade: cannot interpret the PHP constraint '${req.php}' of ${tag} against the installed PHP ${status.phpCli}; check by hand.`);
+  }
+  if (!sat) {
+    const want = phpVersionFor(req.php);
     throw new Error(
-      `Refusing to upgrade: could not determine the panel's database engine from ${host.path}/.env (DB_CONNECTION='${engine || "unset"}'). ` +
-        `Only sqlite, mysql and mariadb are handled here, and 'migrate' has no undo — take a backup yourself before upgrading.`,
+      `Refusing to upgrade: ${tag} requires PHP ${req.php}, but host '${host.target.name}' runs PHP ${status.phpCli} — composer install would fail AFTER the panel is already in maintenance mode. ` +
+        `Run panel_prepare_runtime${want ? ` with phpVersion '${want}'` : ""} first (it installs that PHP release, switches the panel's php-fpm socket and the CLI default), then re-run panel_upgrade.`,
     );
   }
-
-  const res = await runOnPanelHost(host, command, 600_000);
-  if (res.code !== 0) {
-    const hint = looksLikeSudoPasswordFailure(res.stderr) ? ` ${sudoHint("php", host.cred.username ?? "<ssh-user>")}` : "";
-    throw new Error(`Refusing to upgrade: the ${engine} database backup FAILED (exit ${res.code}): ${res.stderr.trim().slice(0, 300)}.${hint}`);
-  }
-  return where;
+  return { status, problem };
 }
 
-/** Run the documented upgrade, stopping at the first failing step. */
-async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; skipBackup?: boolean }): Promise<string> {
+/**
+ * Upgrade the panel through the root helper's `panel-upgrade`, so the WHOLE
+ * documented sequence runs under the one sudoers rule (no per-step `sudo -u`).
+ * Here: the stale-picture guard, the target tag (latest unless `release` pins
+ * one), the PHP gate on that tag's composer.json, the helper pre-flight, then ONE
+ * fixed command. The helper re-checks the installed version, downloads and
+ * verifies the tarball, runs composer's platform check on the new lock file
+ * BEFORE maintenance mode, backs up the database, and stops at the first failed
+ * step — reporting which, and whether the panel was left in maintenance mode.
+ */
+async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; skipBackup?: boolean; release?: string }): Promise<string> {
   const host = await panelHost(ctx);
+  const user = sshUserOf(host.cred);
 
-  // Stale-id guard, same shape as delete_schedule: the caller says which version
-  // it believes is installed, and a mismatch means its picture is out of date.
-  const before = await runOnPanelHost(host, `grep -m1 "'version'" ${host.path}/config/app.php`);
-  const installed = parsePanelVersion(before.stdout);
-  if (!installed) throw new Error(`Could not read the installed version from ${host.path}/config/app.php; refusing to upgrade blind.`);
+  const installed = await readInstalledVersion(host);
   if (installed !== input.expectVersion.trim()) {
     throw new Error(
       `Refusing to upgrade: you said the panel is on '${input.expectVersion}', but it is actually on '${installed}'. ` +
@@ -2368,75 +2315,62 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
     );
   }
 
-  // PHP gate — BEFORE the backup and maintenance mode. v1.0.0-rc.1 raised the
-  // floor to PHP 8.4; without this the upgrade took the panel down and then died
-  // at composer install on 8.3, leaving it in maintenance mode.
-  await assertRuntimeReadyForLatest(host);
+  let tag: string;
+  if (input.release) {
+    tag = assertReleaseTag(input.release);
+  } else {
+    const latest = await latestPanelRelease();
+    if (!latest.tag) {
+      throw new Error(`Refusing to upgrade: could not determine the latest release from GitHub (${latest.error}). Pass 'release' to pin a tag, or retry when GitHub is reachable.`);
+    }
+    tag = latest.tag;
+  }
+  if (installed === tag.slice(1)) return `Nothing to do: the panel on host '${host.target.name}' is already on ${tag}.`;
 
-  const backupAt = input.skipBackup ? null : await backupPanelDatabase(host);
+  const { problem } = await assertRuntimeReady(host, tag);
+  if (problem) throw new Error(`Cannot upgrade: ${problem}`);
 
-  const done: string[] = [];
-  const notes: string[] = [];
-  for (const step of PANEL_UPGRADE_STEPS) {
-    const res = await runOnPanelHost(host, renderStep(step.command, host), step.timeoutMs);
-    if (res.code !== 0) {
-      const hint = looksLikeSudoPasswordFailure(res.stderr) ? ` ${sudoHint("php", host.cred.username ?? "<ssh-user>")}` : "";
+  let res: SshExecResult;
+  try {
+    res = await runOnPanelHost(host, helperCommand("panel-upgrade", installed, tag, input.skipBackup), MAX_SSH_TIMEOUT_MS);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/timed out/i.test(msg)) {
       throw new Error(
-        `Panel upgrade FAILED at step '${step.name}' (exit ${res.code}): ${res.stderr.trim().slice(0, 400)}.${hint} ` +
-          `Steps completed: ${done.join(", ") || "none"}. ` +
-          `${done.includes("maintenance-mode") && !done.includes("exit-maintenance") ? `The panel is still in MAINTENANCE MODE — it will not serve until 'php artisan up' runs in ${host.path}. ` : ""}` +
-          `${backupAt ? `The pre-upgrade database backup is at ${backupAt}. ` : "No database backup was taken (skipBackup was set). "}` +
-          `Fix the cause on the host, then re-run panel_upgrade.`,
+        `The SSH session timed out after ${MAX_SSH_TIMEOUT_MS / 60_000} minutes while the helper was still upgrading. The helper ignores a dropped session and ` +
+          `finishes on its own — do NOT re-run panel_upgrade yet. Wait a few minutes, then run panel_version; the run log is under /var/log/skeleton-key/ on '${host.target.name}'.`,
       );
     }
-    if (step.capture && res.stdout.trim()) notes.push(`${step.name}: ${res.stdout.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
-    done.push(step.name);
+    throw e;
   }
 
-  const after = await runOnPanelHost(host, `grep -m1 "'version'" ${host.path}/config/app.php`);
-  const now = parsePanelVersion(after.stdout) ?? "(unreadable)";
+  const result = parseUpgradeResult(res.stdout);
+  if (res.code !== 0) {
+    const kind = classifyHelperFailure(res);
+    if (kind === "missing" || kind === "sudo" || (kind === "refused" && !result.failedStep)) {
+      throw new Error(`Panel upgrade did not start — ${helperFailureText(kind, user, res, "panel-upgrade")}`);
+    }
+    const tail = res.stderr.trim().split("\n").slice(-6).join(" | ").slice(0, 600);
+    throw new Error(
+      `Panel upgrade to ${tag} FAILED at step '${result.failedStep ?? "unknown"}' on '${host.target.name}': ${tail || "(no detail)"}. ` +
+        `Steps completed: ${result.stepsDone.join(", ") || "none"}. ` +
+        `${result.maintenance ? `The panel is still in MAINTENANCE MODE — it will not serve until 'php artisan up' runs in ${host.path}. ` : "The panel was not taken down. "}` +
+        `${result.dbBackup === "skipped" ? "No database backup was taken (skipBackup was set). " : result.dbBackup ? `The pre-upgrade database backup is at ${result.dbBackup}. ` : ""}` +
+        `${result.log ? `Full step output: ${result.log} on the host. ` : ""}` +
+        `Fix the cause, then re-run panel_upgrade.`,
+    );
+  }
+  if (result.alreadyCurrent) return `Nothing to do: the panel on host '${host.target.name}' is already on ${tag}.`;
+
+  const now = result.after ?? "(unreadable)";
   return (
     `Upgraded the Pelican panel on host '${host.target.name}': **${installed} → ${now}**. ` +
-    `${now === installed ? "WARNING: the version did not change — the release may already have been installed, or the extract step did not replace the files. " : ""}` +
-    `All ${done.length} steps completed (${done.join(", ")}), and the panel is out of maintenance mode. ` +
-    `${backupAt ? `Pre-upgrade database backup: ${backupAt}. ` : "No database backup was taken. "}` +
-    `${notes.length ? `Notes — ${notes.join("; ")}. ` : ""}` +
-    `Verify with panel_version and by loading the panel; if anything looks wrong, the backup above is the rollback point.`
+    `${now === installed ? "WARNING: the version did not change — check the extract step in the run log. " : ""}` +
+    `Steps completed (${result.stepsDone.length}): ${result.stepsDone.join(", ")}; the panel is out of maintenance mode. ` +
+    `${result.dbBackup === "skipped" ? "No database backup was taken. " : result.dbBackup ? `Pre-upgrade database backup: ${result.dbBackup}. ` : ""}` +
+    `${result.log ? `Run log: ${result.log} on the host. ` : ""}` +
+    `Verify with panel_version and by loading the panel; if anything looks wrong, the backup above is the rollback point. If Wings is behind, run wings_update next.`
   );
-}
-
-/**
- * Refuse to start an upgrade whose target release the host's PHP cannot run.
- * `panel_upgrade` installs `releases/latest`, so the requirement is read from
- * THAT tag's composer.json; every failure to establish it fails closed — starting
- * blind is exactly how the panel ends up in maintenance mode with a dead
- * composer step.
- */
-async function assertRuntimeReadyForLatest(host: PanelHost): Promise<void> {
-  const latest = await latestPanelRelease();
-  if (!latest.tag) {
-    throw new Error(
-      `Refusing to upgrade: could not determine the latest release from GitHub (${latest.error}), so its PHP requirement is unknown. ` +
-        `The download step needs GitHub anyway — retry when it is reachable.`,
-    );
-  }
-  const req = await fetchReleasePhpRequirement(latest.tag);
-  if (!req.php) {
-    throw new Error(`Refusing to upgrade: could not read the PHP requirement of ${latest.tag} (${req.error}). Starting blind is how the panel ends up in maintenance mode with a failed composer install.`);
-  }
-  const { status, problem } = await readHostStatus(host);
-  if (!status.phpCli) throw new Error(`Refusing to upgrade: could not read the host's PHP version${problem ? ` — ${problem}` : ""}.`);
-  const sat = phpSatisfies(req.php, status.phpCli);
-  if (sat === undefined) {
-    throw new Error(`Refusing to upgrade: cannot interpret the PHP constraint '${req.php}' of ${latest.tag} against the installed PHP ${status.phpCli}; check by hand.`);
-  }
-  if (!sat) {
-    const want = phpVersionFor(req.php);
-    throw new Error(
-      `Refusing to upgrade: ${latest.tag} requires PHP ${req.php}, but host '${host.target.name}' runs PHP ${status.phpCli} — composer install would fail AFTER the panel is already in maintenance mode. ` +
-        `Run panel_prepare_runtime${want ? ` with phpVersion '${want}'` : ""} first (it installs that PHP release, switches the panel's php-fpm socket and the CLI default), then re-run panel_upgrade.`,
-    );
-  }
 }
 
 /**
@@ -2686,33 +2620,38 @@ function buildTools(target: Target): ConnectorTool[] {
     {
       name: "panel_upgrade",
       description:
-        `Upgrade the Pelican panel itself on ${target.name} to the latest release. This is HOST-LEVEL work over SSH (the panel has no ` +
-        `upgrade endpoint), so it needs the target's 'sshTarget' option. Run panel_version first and pass its installed version as ` +
-        `expectVersion — a mismatch is refused. It takes a database backup, then runs Pelican's documented sequence: maintenance mode, ` +
-        `download, extract, composer install, migrate, clear caches, restart queue, up. artisan/composer run as the panel user, never ` +
-        `root. On any failure it STOPS, names the step, and leaves the panel in maintenance mode rather than half-upgraded and serving. ` +
-        `It REFUSES up front — before maintenance mode — when the latest release's PHP requirement (from its composer.json) is not met ` +
-        `by the host; run panel_prepare_runtime first in that case.`,
+        `Upgrade the Pelican panel itself on ${target.name} to the latest release (or a pinned 'release' tag). HOST-LEVEL work over SSH through ` +
+        `the root-owned helper ${HELPER_PATH} and its ONE sudoers rule — never general sudo; the target's 'sshTarget' option names the host. ` +
+        `Run panel_version first and pass its installed version as expectVersion — a mismatch is refused, as is a release whose PHP ` +
+        `requirement (from its composer.json) the host does not meet (run panel_prepare_runtime first). The helper then downloads + ` +
+        `checksum-verifies panel.tar.gz, runs composer's platform check on the NEW lock file BEFORE maintenance mode, takes a database ` +
+        `backup, and runs Pelican's documented sequence — maintenance mode, extract, permissions, composer install, migrate, clear caches, ` +
+        `restart queue, up — with artisan/composer as the panel user, never root. On any failure it STOPS, names the step, and leaves the ` +
+        `panel in maintenance mode rather than half-upgraded and serving; step output is logged under /var/log/skeleton-key/ on the host.`,
       tier: "execute",
       inputSchema: z.object({
         expectVersion: z.string().min(1).describe("The currently installed version, exactly as panel_version reports it. A mismatch aborts."),
+        release: z
+          .string()
+          .optional()
+          .describe("Panel release tag to install, e.g. 'v1.0.0-rc.1'. Default: the latest release. Its composer.json decides the PHP gate."),
         skipBackup: z
           .boolean()
           .optional()
           .describe("Skip the pre-upgrade database backup. Default false. 'migrate' has no undo, so only set this if you have your own backup."),
       }),
       confirm: (input, t) => {
-        const i = input as { expectVersion: string; skipBackup?: boolean };
+        const i = input as { expectVersion: string; skipBackup?: boolean; release?: string };
         const o = options(t);
         return (
-          `UPGRADE the Pelican panel itself on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to the latest release ` +
+          `UPGRADE the Pelican panel itself on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.release ?? "the latest release"} ` +
           `(${o.panelPath}) — runs database migrations, takes the panel down during the upgrade` +
-          `${i.skipBackup ? ", and SKIPS the database backup" : ""}`
+          `${i.skipBackup ? ", and SKIPS the database backup" : ""}; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
         );
       },
       run: async (input, ctx) => {
         try {
-          return ok(await panelUpgrade(ctx, input as { expectVersion: string; skipBackup?: boolean }));
+          return ok(await panelUpgrade(ctx, input as { expectVersion: string; skipBackup?: boolean; release?: string }));
         } catch (e) {
           return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
         }

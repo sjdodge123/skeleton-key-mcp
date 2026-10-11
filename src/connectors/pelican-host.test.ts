@@ -22,6 +22,9 @@ import {
   composerPhpRequirement,
   assertPhpVersionArg,
   assertWingsTag,
+  assertPanelVersion,
+  PANEL_UPGRADE_STEP_NAMES,
+  parseUpgradeResult,
   sudoersLine,
   sudoersInstallSnippet,
   helperInstallSnippet,
@@ -62,18 +65,21 @@ const VERSION_CMD = `grep -m1 "'version'" ${PANEL}/config/app.php`;
 const COMPOSER_CMD = currentPhpRequirementCommand(PANEL);
 const PREPARE_CMD = helperCommand("php-prepare", "8.4");
 const WINGS_CMD = helperCommand("wings-update", "v1.0.0-rc.1");
-const DB_ENGINE_CMD = `grep -m1 '^DB_CONNECTION=' ${PANEL}/.env`; // panel_upgrade's first step after the gate
-const EXPECTED_COMMANDS = new Set([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD, PREPARE_CMD, WINGS_CMD, DB_ENGINE_CMD]);
+const UPGRADE_CMD = helperCommand("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.1");
+const UPGRADE_CMD_PINNED_SKIP = helperCommand("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.2", true);
+const EXPECTED_COMMANDS = new Set([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD, PREPARE_CMD, WINGS_CMD, UPGRADE_CMD, UPGRADE_CMD_PINNED_SKIP]);
 
 type Reply = { stdout?: string; stderr?: string; code?: number };
 let sent: string[] = [];
-/** A fake panel host: exact command → reply. An unknown command throws, so a tool
- *  that strays from its fixed command set fails loudly. */
-function host(replies: Record<string, Reply>) {
+/** A fake panel host: exact command → reply (or a thrower, for transport errors).
+ *  An unknown command throws, so a tool that strays from its fixed command set
+ *  fails loudly. */
+function host(replies: Record<string, Reply | (() => never)>) {
   vi.mocked(runSsh).mockImplementation(async (_t, _c, cmd: string) => {
     sent.push(cmd);
     const r = replies[cmd];
     if (!r) throw new Error(`unexpected SSH command: ${cmd}`);
+    if (typeof r === "function") return r();
     return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", code: r.code ?? 0 };
   });
 }
@@ -150,12 +156,18 @@ describe("helper arguments and the fixed commands", () => {
     expect(helperCommand("status")).toBe(`sudo -n ${HELPER_PATH} status`);
     expect(PREPARE_CMD).toBe(`sudo -n /usr/local/sbin/skeleton-key-pelican-host.sh php-prepare '8.4'`);
     expect(WINGS_CMD).toBe(`sudo -n /usr/local/sbin/skeleton-key-pelican-host.sh wings-update 'v1.0.0-rc.1'`);
+    expect(UPGRADE_CMD).toBe(`sudo -n /usr/local/sbin/skeleton-key-pelican-host.sh panel-upgrade '1.0.0-beta35' 'v1.0.0-rc.1'`);
+    expect(UPGRADE_CMD_PINNED_SKIP).toBe(`sudo -n /usr/local/sbin/skeleton-key-pelican-host.sh panel-upgrade '1.0.0-beta35' 'v1.0.0-rc.2' '--skip-backup'`);
     expect(() => helperCommand("php-prepare", "8.4 && id")).toThrow();
     expect(() => helperCommand("wings-update", "'; id; '")).toThrow();
+    expect(() => helperCommand("panel-upgrade", "1.0.0-beta35; id", "v1.0.0-rc.1")).toThrow(/panel version/);
+    expect(() => helperCommand("panel-upgrade", "1.0.0-beta35", "latest")).toThrow(/release tag/);
+    expect(assertPanelVersion(" 1.0.0-beta35 ")).toBe("1.0.0-beta35");
+    expect(() => assertPanelVersion("v1.0.0-beta35")).toThrow(/panel version/);
   });
 
   it("every fixed command survives the destructive-command deny list", () => {
-    for (const cmd of [HOST_STATUS_COMMAND, PREPARE_CMD, WINGS_CMD, COMPOSER_CMD, helperCommand("status")]) {
+    for (const cmd of [HOST_STATUS_COMMAND, PREPARE_CMD, WINGS_CMD, UPGRADE_CMD, UPGRADE_CMD_PINNED_SKIP, COMPOSER_CMD, helperCommand("status")]) {
       expect(checkCommand(cmd).allowed, cmd).toBe(true);
     }
   });
@@ -189,6 +201,18 @@ describe("helper output parsing", () => {
     expect(parseHostStatus(STATUS_NO_HELPER.stdout)).toMatchObject({ helper: false, phpCli: "8.3.6", phpInstalled: [], wings: undefined });
     expect(parseHostStatus(STATUS_SUDO_DENIED.stdout)).toMatchObject({ helper: true, helperRc: 1, phpCli: "8.3.6" });
     expect(parseHostStatus("wings=\nphp_cli=\n").wings).toBeUndefined();
+  });
+
+  it("parses the panel-upgrade result in both its shapes", () => {
+    const ok = parseUpgradeResult(
+      `panel_before=1.0.0-beta35\nupgrade_log=/var/log/skeleton-key/panel-upgrade-1.log\ndb_backup=/var/www/pelican/storage/pelican-db-backup-1.sqlite\nsteps_done=${PANEL_UPGRADE_STEP_NAMES.join(" ")}\nmaintenance=0\npanel_after=1.0.0-rc.1\n`,
+    );
+    expect(ok).toMatchObject({ before: "1.0.0-beta35", after: "1.0.0-rc.1", alreadyCurrent: false, maintenance: false, dbBackup: "/var/www/pelican/storage/pelican-db-backup-1.sqlite" });
+    expect(ok.stepsDone).toEqual([...PANEL_UPGRADE_STEP_NAMES]);
+    const bad = parseUpgradeResult("panel_before=1.0.0-beta35\nupgrade_log=/var/log/skeleton-key/x.log\ndb_backup=skipped\nfailed_step=composer-install\nsteps_done=download-release download-checksum\nmaintenance=1\n");
+    expect(bad).toMatchObject({ failedStep: "composer-install", maintenance: true, dbBackup: "skipped", stepsDone: ["download-release", "download-checksum"] });
+    expect(parseUpgradeResult("panel_before=1.0.0-rc.1\npanel_after=1.0.0-rc.1\nalready_current=1\n").alreadyCurrent).toBe(true);
+    expect(parseUpgradeResult("").maintenance).toBeUndefined();
   });
 
   it("reads the version out of `wings version` output", () => {
@@ -365,6 +389,37 @@ describe("scripts/host/skeleton-key-pelican-host.sh", () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/must run as root/);
     expect(run("wings-update", "v1.0.0-rc.1").status).toBe(2);
+  });
+
+  it("panel-upgrade: exact arity, strict shapes, one literal option — all checked before privilege", () => {
+    expect(run("panel-upgrade").status).toBe(2);
+    expect(run("panel-upgrade", "1.0.0-beta35").status).toBe(2);
+    expect(run("panel-upgrade", "1.0.0; id", "v1.0.0-rc.1").status).toBe(2);
+    expect(run("panel-upgrade", "1.0.0; id", "v1.0.0-rc.1").stderr).toMatch(/REFUSED: panel-upgrade: version must look like 1.0.0-beta35/);
+    expect(run("panel-upgrade", "1.0.0-beta35", "latest").status).toBe(2);
+    expect(run("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.1", "--nope").status).toBe(2);
+    expect(run("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.1", "--skip-backup", "x").status).toBe(2);
+    if (process.getuid?.() !== 0) {
+      const r = run("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.1", "--skip-backup");
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/must run as root/);
+    }
+  });
+
+  it("panel-upgrade runs the documented steps in order, as the panel user, with download + pre-flight + backup before maintenance mode", () => {
+    const text = readFileSync(script, "utf8");
+    const positions = PANEL_UPGRADE_STEP_NAMES.map((n) => text.indexOf(`step ${n} `));
+    for (const [i, p] of positions.entries()) expect(p, PANEL_UPGRADE_STEP_NAMES[i]).toBeGreaterThan(0);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    expect(positions[PANEL_UPGRADE_STEP_NAMES.indexOf("maintenance-mode")]).toBeGreaterThan(positions[PANEL_UPGRADE_STEP_NAMES.indexOf("db-backup")]!);
+    // artisan and tar never run as root (composer's step line continues onto the next line, so check it by name)
+    for (const line of text.split("\n").filter((l) => /^\s*step \S+ .*(artisan|tar -xzf)/.test(l))) expect(line).toContain("as_panel_user");
+    expect(text).toMatch(/step composer-install as_panel_user/);
+    expect(text).toMatch(/step preflight-platform as_panel_user/);
+    expect(text).toContain("check-platform-reqs --lock --no-dev");
+    expect(text).toContain('MYSQL_PWD="$DB_PASSWORD"');
+    expect(text).not.toMatch(/-p"\$DB_PASSWORD"/); // the password never goes on a command line
+    expect(text).toContain("trap '' HUP");
   });
 
   it("contains none of the deny-listed words, so the policy never trips on it", () => {
@@ -603,10 +658,22 @@ describe("wings_update", () => {
   });
 });
 
-describe("panel_upgrade refuses before maintenance mode when the PHP floor is not met", () => {
+describe("panel_upgrade runs through the helper, under the one sudoers rule", () => {
   const upgrade = (input: Record<string, unknown>) => tool("panel_upgrade").run(input, ctx());
+  const UPGRADE_OK = {
+    stdout:
+      [
+        "panel_before=1.0.0-beta35",
+        "upgrade_log=/var/log/skeleton-key/panel-upgrade-20261011-030000.log",
+        "db_backup=/var/www/pelican/storage/pelican-db-backup-20261011-030000.sqlite",
+        `steps_done=${PANEL_UPGRADE_STEP_NAMES.join(" ")}`,
+        "maintenance=0",
+        "panel_after=1.0.0-rc.1",
+      ].join("\n") + "\n",
+    stderr: "skeleton-key-pelican-host: step: exit-maintenance\nskeleton-key-pelican-host: done\n",
+  };
 
-  it("names panel_prepare_runtime and sends no artisan command", async () => {
+  it("refuses before maintenance mode when the PHP floor is not met, naming panel_prepare_runtime", async () => {
     mockGithub();
     host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_83 });
     const res = await upgrade({ expectVersion: "1.0.0-beta35" });
@@ -614,7 +681,6 @@ describe("panel_upgrade refuses before maintenance mode when the PHP floor is no
     expect(res.text).toMatch(/Refusing to upgrade: v1.0.0-rc.1 requires PHP \^8.4 \|\| \^8.5, but host 'panel-host' runs PHP 8.3.6/);
     expect(res.text).toContain("Run panel_prepare_runtime with phpVersion '8.4' first");
     expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND]);
-    expect(sent.some((c) => /artisan|DB_CONNECTION/.test(c))).toBe(false);
   });
 
   it("fails closed when the release's PHP requirement cannot be established", async () => {
@@ -635,15 +701,109 @@ describe("panel_upgrade refuses before maintenance mode when the PHP floor is no
     expect(res.text).toContain(sudoersLine("skeleton"));
   });
 
-  it("lets the upgrade proceed to its first real step once the requirement is met", async () => {
+  it("refuses a stale expectVersion before touching GitHub or the helper", async () => {
+    host({ [VERSION_CMD]: VERSION_LINE });
+    const res = await upgrade({ expectVersion: "1.0.0-beta34" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/you said the panel is on '1.0.0-beta34', but it is actually on '1.0.0-beta35'/);
+    expect(sent).toEqual([VERSION_CMD]);
+  });
+
+  it("is a no-op when the panel is already on the target release", async () => {
+    mockGithub({ latestPanel: "v1.0.0-beta35" });
+    host({ [VERSION_CMD]: VERSION_LINE });
+    const res = await upgrade({ expectVersion: "1.0.0-beta35" });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toMatch(/Nothing to do: the panel on host 'panel-host' is already on v1.0.0-beta35/);
+    expect(sent).toEqual([VERSION_CMD]);
+  });
+
+  it("sends exactly `sudo -n <helper> panel-upgrade '<installed>' '<tag>'` once the gate passes, and reports the result", async () => {
     mockGithub();
-    // The gate passes; the next thing the upgrade does is detect the DB engine for
-    // the backup. Replying with an unknown engine makes it stop there, which proves
-    // the gate let it through without running the rest of the sequence.
-    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_84, [DB_ENGINE_CMD]: { stdout: "DB_CONNECTION=pgsql\n" } });
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_84, [UPGRADE_CMD]: UPGRADE_OK });
+    const res = await upgrade({ expectVersion: "1.0.0-beta35" });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("Upgraded the Pelican panel on host 'panel-host': **1.0.0-beta35 → 1.0.0-rc.1**");
+    expect(res.text).toContain(`Steps completed (${PANEL_UPGRADE_STEP_NAMES.length})`);
+    expect(res.text).toContain("Pre-upgrade database backup: /var/www/pelican/storage/pelican-db-backup-20261011-030000.sqlite");
+    expect(res.text).toContain("Run log: /var/log/skeleton-key/panel-upgrade-20261011-030000.log");
+    expect(res.text).toContain("wings_update");
+    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, UPGRADE_CMD]);
+    expect(vi.mocked(runSsh).mock.calls.find((c) => c[2] === UPGRADE_CMD)![3]).toEqual({ timeoutMs: 600_000 });
+  });
+
+  it("pins an explicit release (its composer.json decides the gate) and passes --skip-backup as the one literal flag", async () => {
+    mockGithub({ composer: { "v1.0.0-rc.2": "^8.4" } });
+    host({
+      [VERSION_CMD]: VERSION_LINE,
+      [HOST_STATUS_COMMAND]: STATUS_84,
+      [UPGRADE_CMD_PINNED_SKIP]: { stdout: `panel_before=1.0.0-beta35\nupgrade_log=/var/log/skeleton-key/x.log\ndb_backup=skipped\nsteps_done=${PANEL_UPGRADE_STEP_NAMES.filter((s) => s !== "db-backup").join(" ")}\nmaintenance=0\npanel_after=1.0.0-rc.2\n` },
+    });
+    const res = await upgrade({ expectVersion: "1.0.0-beta35", release: "v1.0.0-rc.2", skipBackup: true });
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("**1.0.0-beta35 → 1.0.0-rc.2**");
+    expect(res.text).toContain("No database backup was taken.");
+    expect(vi.mocked(fetch as unknown as (...a: unknown[]) => unknown).mock.calls.map((c) => String(c[0]))).toContain(
+      "https://raw.githubusercontent.com/pelican-dev/panel/v1.0.0-rc.2/composer.json",
+    );
+    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, UPGRADE_CMD_PINNED_SKIP]);
+  });
+
+  it("reports the failed step, the maintenance state, the backup and the log when the helper stops mid-run", async () => {
+    mockGithub();
+    host({
+      [VERSION_CMD]: VERSION_LINE,
+      [HOST_STATUS_COMMAND]: STATUS_84,
+      [UPGRADE_CMD]: {
+        stdout:
+          "panel_before=1.0.0-beta35\nupgrade_log=/var/log/skeleton-key/panel-upgrade-20261011-030000.log\n" +
+          "db_backup=/var/www/pelican/storage/pelican-db-backup-20261011-030000.sqlite\nfailed_step=composer-install\n" +
+          "steps_done=download-release download-checksum preflight-platform db-backup maintenance-mode extract fix-permissions\nmaintenance=1\n",
+        stderr: "skeleton-key-pelican-host: composer-install: Your lock file does not contain a compatible set of packages.\nskeleton-key-pelican-host: ERROR: step 'composer-install' failed (exit 2); full output in /var/log/skeleton-key/panel-upgrade-20261011-030000.log\n",
+        code: 1,
+      },
+    });
     const res = await upgrade({ expectVersion: "1.0.0-beta35" });
     expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/could not determine the panel's database engine/);
-    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, DB_ENGINE_CMD]);
+    expect(res.text).toMatch(/Panel upgrade to v1.0.0-rc.1 FAILED at step 'composer-install' on 'panel-host'/);
+    expect(res.text).toContain("Steps completed: download-release, download-checksum, preflight-platform, db-backup, maintenance-mode, extract, fix-permissions.");
+    expect(res.text).toContain("still in MAINTENANCE MODE");
+    expect(res.text).toContain("/var/www/pelican/storage/pelican-db-backup-20261011-030000.sqlite");
+    expect(res.text).toContain("/var/log/skeleton-key/panel-upgrade-20261011-030000.log");
+  });
+
+  it("says the upgrade did not start when sudo refuses the helper or the helper refuses the arguments", async () => {
+    mockGithub();
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_84, [UPGRADE_CMD]: { stderr: "sudo: a password is required\n", code: 1 } });
+    let res = await upgrade({ expectVersion: "1.0.0-beta35" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Panel upgrade did not start — sudo refused/);
+    expect(res.text).toContain(sudoersLine("skeleton"));
+
+    sent = [];
+    host({
+      [VERSION_CMD]: VERSION_LINE,
+      [HOST_STATUS_COMMAND]: STATUS_84,
+      [UPGRADE_CMD]: { stdout: "", stderr: "skeleton-key-pelican-host: REFUSED: panel-upgrade: the panel is on '1.0.0-beta36', not '1.0.0-beta35' — stale picture\n", code: 2 },
+    });
+    res = await upgrade({ expectVersion: "1.0.0-beta35" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/did not start — the host helper REFUSED 'panel-upgrade' \(exit 2\): .*stale picture/);
+  });
+
+  it("turns an SSH timeout into 'wait, then panel_version' — never into a re-run", async () => {
+    mockGithub();
+    host({
+      [VERSION_CMD]: VERSION_LINE,
+      [HOST_STATUS_COMMAND]: STATUS_84,
+      [UPGRADE_CMD]: () => {
+        throw new Error("SSH command on panel-host (192.168.1.48) timed out after 600000ms (600s). Raise it via …");
+      },
+    });
+    const res = await upgrade({ expectVersion: "1.0.0-beta35" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/timed out after 10 minutes while the helper was still upgrading/);
+    expect(res.text).toContain("do NOT re-run panel_upgrade yet");
+    expect(res.text).toContain("/var/log/skeleton-key/");
   });
 });

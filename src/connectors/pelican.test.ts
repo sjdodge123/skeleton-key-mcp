@@ -15,7 +15,6 @@ import {
   assertSafeUser,
   compareVersions,
   parsePanelVersion,
-  PANEL_UPGRADE_STEPS,
   fetchEggFromUrl,
   parseEggContent,
   MAX_PORTS_PER_CALL,
@@ -37,7 +36,6 @@ import {
   looksLikeDaemonTimeout,
 } from "./pelican.js";
 import type { Credential, Target, ToolContext } from "./types.js";
-import { checkCommand } from "./command-policy.js";
 
 const APP = "papp_ApplicationKeySecret123";
 const CLI = "pacc_ClientKeySecret456";
@@ -1204,43 +1202,15 @@ describe("panel version comparison", () => {
   });
 });
 
-describe("panel_upgrade steps", () => {
-  it("runs artisan and composer as the panel user, never as root", () => {
-    for (const step of PANEL_UPGRADE_STEPS) {
-      if (/artisan|composer/.test(step.command)) {
-        expect(step.command).toContain("sudo -n -u {user}");
-      }
-    }
-  });
-
-  it("interpolates only the validated path and user — no other placeholders exist", () => {
-    for (const step of PANEL_UPGRADE_STEPS) {
-      const placeholders = [...step.command.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
-      expect(placeholders.every((p) => p === "path" || p === "user")).toBe(true);
-    }
-  });
-
-  it("every step survives the destructive-command deny list", () => {
-    // The target's ALLOWLIST is deliberately not applied here, but DEFAULT_DENY
-    // still is — so a step must never contain rm -rf, mkfs, dd of=/dev/, reboot.
-    for (const step of PANEL_UPGRADE_STEPS) {
-      const rendered = step.command.replaceAll("{path}", "/var/www/pelican").replaceAll("{user}", "www-data");
-      expect(checkCommand(rendered).allowed).toBe(true);
-    }
-  });
-
-  it("takes the panel down first and brings it back up last", () => {
-    expect(PANEL_UPGRADE_STEPS[0]!.name).toBe("maintenance-mode");
-    expect(PANEL_UPGRADE_STEPS[PANEL_UPGRADE_STEPS.length - 1]!.name).toBe("exit-maintenance");
-    expect(PANEL_UPGRADE_STEPS.map((s) => s.name)).toContain("migrate");
-  });
-
-  it("confirm names the host, the version and whether the backup is being skipped", () => {
+describe("panel_upgrade confirm (the sequence itself lives in the host helper — see pelican-host.test.ts)", () => {
+  it("names the host, the version, the target release, the backup choice and the helper", () => {
     const t = target({ ownerUserId: 7, sshTarget: "pelican48" });
     const confirm = pelicanConnector.buildTools(t).find((x) => x.name === "panel_upgrade")!.confirm!;
     expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself on host 'pelican48'");
-    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("from 1.0.0-beta35");
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("from 1.0.0-beta35 to the latest release");
+    expect(confirm({ expectVersion: "1.0.0-beta35", release: "v1.0.0-rc.1" }, t)).toContain("to v1.0.0-rc.1");
     expect(confirm({ expectVersion: "1.0.0-beta35", skipBackup: true }, t)).toMatch(/SKIPS the database backup/);
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("/usr/local/sbin/skeleton-key-pelican-host.sh via sudo -n and nothing else");
   });
 });
 
