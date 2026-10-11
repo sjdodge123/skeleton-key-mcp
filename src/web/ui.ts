@@ -116,7 +116,7 @@ const views = {
         btn("Unlock", async()=>{ await api("/store/unlock",{passphrase:val("passphrase")}); if(st.setupComplete){ render(); } else { go(1); } }));
     }
     if(st.storeExists && !st.storeLocked){
-      if(st.setupComplete) return adminCard();
+      if(st.setupComplete) return adminCard(st);
       go(1); return "";
     }
     return card("Choose a master passphrase",
@@ -156,7 +156,7 @@ const views = {
     '<p class="muted">Because this account owns only this one org and holds no personal data, it is cryptographically unable to read your real passwords. Keep the API key and this account\\'s master password for the next step.</p>'+
     btn("I\\'ve done this", ()=>go(3))),
   3: async ()=> card("Connect the vault",
-    field("serverUrl","Vaultwarden internal URL (LAN)","text","http://192.168.0.x:port")+
+    field("serverUrl","Vaultwarden URL (https:// — the Bitwarden CLI refuses plain http://)","text","https://vault.example.net")+
     field("collectionName","Collection name (optional)","text","Homelab")+
     field("clientId","API key client_id","text")+
     pwField("clientSecret","API key client_secret")+
@@ -248,10 +248,26 @@ const views = {
  *  boot auto-unlock keyslot. Everything — even reading whether auto-unlock is
  *  on and where the key file lives — is behind a fresh TOTP code, so an
  *  unauthenticated LAN client can't probe the kill-switch state. */
-async function adminCard(){
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+/** Shown when the store is open but the Vaultwarden session is not — e.g. the
+ *  Bitwarden CLI refusing a plain-http vault URL after an image upgrade. The
+ *  repair reuses the stored service-account credentials; only the URL changes. */
+function vaultRepairHtml(st){
+  if(!st || st.vaultUnlocked!==false) return "";
+  return '<div class="check bad"><div class="n">✗ Vault not connected</div><div class="d">'+esc(st.vaultError||"The Vaultwarden session could not be re-established.")+'</div></div>'+
+    '<h3>Vault connection</h3>'+
+    '<p class="muted">Re-point Skeleton Key at your Vaultwarden server. The Bitwarden CLI only accepts <b>https://</b> URLs (plain <code>http://</code> LAN addresses stopped working with CLI 2025+). The stored service-account credentials are reused — nothing is re-typed. Requires your authenticator code.</p>'+
+    field("vs_url","Vaultwarden URL (https://)","text","https://vault.example.net")+
+    field("vs_totp","6-digit authenticator code","text")+
+    btn("Reconnect vault", async()=>{ const r=await api("/vault/server",{serverUrl:val("vs_url"), totp:val("vs_totp")}); render(); setTimeout(()=>err(r.vaultUnlocked?"Vault connected ✓ — MCP tools are available again.":"Vault still not connected."),0); })+
+    '<hr/>';
+}
+async function adminCard(st){
   if(!S.au){
-    return card("Unlocked ✓",
-      '<p class="muted">Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.</p>'+
+    const vaultDown = !!(st && st.vaultUnlocked===false);
+    return card(vaultDown ? "Unlocked — vault not connected" : "Unlocked ✓",
+      vaultRepairHtml(st)+
+      '<p class="muted">'+(vaultDown ? 'The store is unlocked, but MCP tools stay withheld until the vault reconnects.' : 'Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.')+'</p>'+
       '<h3>Boot auto-unlock</h3>'+
       '<p class="muted">Control whether the container unlocks itself after a restart (trading away the restart kill-switch for convenience). Enter your authenticator code to view or change it.</p>'+
       field("au_totp","6-digit authenticator code","text")+
