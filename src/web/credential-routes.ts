@@ -144,6 +144,11 @@ function formPage(req: CredentialRequest, opts: FormOptions = {}): string {
   ${verifyNote}
   <div class="warn">Only continue if <b>you</b> just asked Claude to onboard this host. This stores ${multi ? "credentials" : "a credential"} in your vault.</div>
   <form method="post" action="/credential/${htmlEscape(req.id)}">
+    <!-- Implicit submission (Enter in a field) activates the form's FIRST submit
+         button. Cancel is listed first for layout, so without this hidden default
+         Enter would cancel the request — which is exactly what happened to an
+         operator typing a value and pressing Enter. Hidden, unfocusable, store. -->
+    <button type="submit" name="action" value="submit" hidden aria-hidden="true" tabindex="-1"></button>
     <input type="hidden" name="formToken" value="${htmlEscape(req.formToken)}"/>
     ${inputs}
     <label>6-digit authenticator code</label>
