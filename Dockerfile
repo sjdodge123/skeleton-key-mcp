@@ -22,7 +22,7 @@ ENV NODE_ENV=production
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates openssh-client openssl \
   && rm -rf /var/lib/apt/lists/* \
-  && npm install -g @bitwarden/cli@2024.9.0 \
+  && npm install -g @bitwarden/cli@2026.9.1 \
   && npm cache clean --force
 
 COPY package.json package-lock.json* ./
