@@ -1,10 +1,12 @@
 import { z } from "zod";
 import yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
-import { deriveBaseUrl, tlsFetch } from "./net.js";
+import { deriveBaseUrl, tlsFetch, isPrivateIPv4 } from "./net.js";
 import { runSsh, looksLikeSudoPasswordFailure, sudoHint, type SshExecResult } from "./ssh-exec.js";
 import { checkCommand } from "./command-policy.js";
 import { resolveSecretRefs, secretFingerprintBlock, describeSecretRef, type SecretRef, type SecretValue } from "./secret-refs.js";
+import { withKuma, monitorsForServer, MANAGED_PELICAN_TAG, type ServerIdentity } from "./uptime-kuma-client.js";
+import { kumaConnectOptions, resumeExactly, resumeUnconditionally } from "./uptime-kuma.js";
 
 /**
  * Pelican Panel connector — inventory, provisioning, power and schedules for a
@@ -60,6 +62,14 @@ const optionsSchema = z
     /** Where the panel is installed on that host. Must be an absolute path with
      *  no shell metacharacters — it is interpolated into fixed commands. */
     panelPath: z.string().default("/var/www/pelican"),
+    /**
+     * Name of the registered **uptime-kuma** target whose monitors watch this
+     * panel's game servers — for `power_action`'s `suppressMonitors` (the
+     * white-glove rule). Optional: with exactly one uptime-kuma target
+     * registered it is found automatically; this disambiguates when there are
+     * several.
+     */
+    monitorsTarget: z.string().optional(),
     /** Unix user that owns the panel files; artisan/composer run as this user so
      *  the upgrade cannot leave root-owned files the webserver can't write. */
     panelUser: z.string().default("www-data"),
@@ -142,14 +152,9 @@ export function scrubSecrets(s: string): string {
   );
 }
 
-/** True only for an RFC1918 (private / LAN) IPv4 literal. Exported for testing. */
-export function isPrivateIPv4(ip: string): boolean {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
-  if (!m) return false;
-  const [a, b, c, d] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
-  if ([a, b, c, d].some((n) => n > 255)) return false;
-  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-}
+// `isPrivateIPv4` moved to net.ts (the Uptime Kuma transport guard shares it);
+// re-exported so existing imports and tests keep working.
+export { isPrivateIPv4 };
 
 /**
  * A Pelican API key is a bearer credential, so it may only cross the wire in
@@ -591,6 +596,57 @@ export function looksLikeDaemonTimeout(res: { ok: boolean; status: number; json?
   return res.status === 502 || res.status === 504 || /timed? ?out|cURL error 28|could not establish a connection|E_CONN/i.test(res.text);
 }
 
+/** What `Pelican.request` hands back. `headers` is the live response header
+ *  bag: the pull path needs it, because the panel's throttle answer carries
+ *  `Retry-After` / `X-RateLimit-Reset` and nothing else says when to retry. */
+interface PelicanResponse {
+  ok: boolean;
+  status: number;
+  json?: unknown;
+  text: string;
+  headers: Pick<Headers, "get">;
+}
+
+/** The panel's default `ResourceLimit::FilePull` budget — config/http.php
+ *  `file_pull` / `file_pull_period`, env APP_API_FILE_PULL_RATELIMIT and
+ *  APP_API_FILE_PULL_RATELIMIT_PERIOD. Per user, so one client key shares it
+ *  across every server it reaches. */
+export const FILE_PULL_RATE_LIMIT = { pulls: 5, minutes: 10 };
+
+/**
+ * Explain a 429 from `files/pull`. Laravel's throttle rejects a request BEFORE
+ * counting it, so hammering the route does not push the window out — the only
+ * cure is to wait, and the sixth pull in a batch is the usual way to find this
+ * out. Whatever the panel says about when (`Retry-After` in seconds,
+ * `X-RateLimit-Reset` as a unix timestamp) is passed along, and so is its
+ * configured ceiling (`X-RateLimit-Limit`), since an operator may have raised
+ * it above the default. Header values are panel-controlled numbers, not
+ * secrets, but are still bounded. Exported for testing.
+ */
+export function filePullThrottleMessage(res: { headers: Pick<Headers, "get"> }, path: string): string {
+  const header = (name: string): string | undefined => res.headers.get(name)?.trim().slice(0, 64) || undefined;
+  const retryAfter = header("retry-after");
+  const reset = header("x-ratelimit-reset");
+  const limit = header("x-ratelimit-limit");
+  const when: string[] = [];
+  // Retry-After is seconds from Laravel; HTTP also allows a date, passed through as-is.
+  if (retryAfter) when.push(`Retry-After: ${/^\d+$/.test(retryAfter) ? `${retryAfter}s` : retryAfter}`);
+  if (reset) {
+    const epoch = Number(reset);
+    const iso = Number.isInteger(epoch) && epoch > 0 ? ` (${new Date(epoch * 1000).toISOString()})` : "";
+    when.push(`X-RateLimit-Reset: ${reset}${iso}`);
+  }
+  return (
+    `Pelican HTTP 429 on ${path}: the panel throttles file pulls to ${FILE_PULL_RATE_LIMIT.pulls} per ${FILE_PULL_RATE_LIMIT.minutes} minutes per user by default ` +
+    `(APP_API_FILE_PULL_RATELIMIT / APP_API_FILE_PULL_RATELIMIT_PERIOD in the panel's .env${limit ? `; this panel reports a limit of ${limit}` : ""}). ` +
+    `Rejected attempts are not counted, so retrying does not extend the window — wait for it to pass. ` +
+    (when.length
+      ? `The panel says: ${when.join(", ")}. `
+      : `The panel did not say when the window resets; it opened with the first pull of the current batch. `) +
+    `Nothing was downloaded by this call. Plan installs in groups of at most ${FILE_PULL_RATE_LIMIT.pulls} pulls.`
+  );
+}
+
 /**
  * Read a response body, enforcing the size cap **while reading** rather than
  * after. `await res.text()` would buffer the whole thing first, so a cap applied
@@ -938,6 +994,7 @@ interface Server {
   egg?: number;
   allocation?: number;
   limits?: Record<string, unknown>;
+  feature_limits?: Record<string, unknown>;
   [k: string]: unknown;
 }
 interface Schedule {
@@ -1117,6 +1174,33 @@ export function assertCronField(name: string, value: string): void {
 }
 
 /** Pelican client bound to one target. */
+/** The build fields `update_server_build` can change, by the panel's names. */
+const BUILD_LIMIT_KEYS = ["memory", "swap", "disk", "io", "cpu", "threads"] as const;
+const BUILD_FEATURE_KEYS = ["databases", "allocations", "backups"] as const;
+type BuildLimitsInput = { memory?: number; swap?: number; disk?: number; io?: number; cpu?: number; threads?: string | null };
+type BuildFeatureLimitsInput = { databases?: number; allocations?: number; backups?: number };
+type UpdateServerBuildInput = { id: number; limits?: BuildLimitsInput; featureLimits?: BuildFeatureLimitsInput; oomKiller?: boolean };
+
+/** Refuse a key this tool doesn't know. The panel would ignore it and the
+ *  caller would believe the change landed. */
+function assertKnownKeys(label: string, obj: unknown, known: readonly string[]): void {
+  if (!obj || typeof obj !== "object") return;
+  const unknown = Object.keys(obj).filter((k) => !known.includes(k));
+  if (unknown.length) {
+    throw new Error(`Unknown ${label} field(s) ${unknown.map((k) => `'${k}'`).join(", ")} — known: ${known.join(", ")}.`);
+  }
+}
+
+/** The `path → value` pairs a build update names, in the panel's field names —
+ *  shared by the confirm text and the prior → new report so they agree. */
+function buildChanges(input: UpdateServerBuildInput): [string, unknown][] {
+  const out: [string, unknown][] = [];
+  for (const [k, v] of Object.entries(input.limits ?? {})) if (v !== undefined) out.push([`limits.${k}`, v]);
+  for (const [k, v] of Object.entries(input.featureLimits ?? {})) if (v !== undefined) out.push([`feature_limits.${k}`, v]);
+  if (input.oomKiller !== undefined) out.push(["oom_killer", input.oomKiller]);
+  return out;
+}
+
 class Pelican {
   constructor(
     private readonly target: Target,
@@ -1154,8 +1238,8 @@ class Pelican {
   private async request(
     api: PelicanApi,
     path: string,
-    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string } = {},
-  ): Promise<{ ok: boolean; status: number; json?: unknown; text: string }> {
+    opts: { method?: string; body?: unknown; rawBody?: string; query?: Record<string, string | number>; contentType?: string; signal?: AbortSignal } = {},
+  ): Promise<PelicanResponse> {
     assertTransportOk(this.base);
     const key = keyFor(this.cred, api);
     if (!key) throw missingKeyError(api);
@@ -1178,7 +1262,7 @@ class Pelican {
     if (payload !== undefined) headers["Content-Type"] = opts.contentType ?? "application/json";
     const res = await tlsFetch(
       `${this.base}/api/${api}${path}${qs}`,
-      { method: opts.method ?? "GET", headers, body: payload },
+      { method: opts.method ?? "GET", headers, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) },
       this.insecure,
     );
     const text = await res.text();
@@ -1188,7 +1272,7 @@ class Pelican {
     } catch {
       /* non-JSON body */
     }
-    return { ok: res.ok, status: res.status, json, text };
+    return { ok: res.ok, status: res.status, json, text, headers: res.headers };
   }
 
   /** Throw on an HTTP error, surfacing Pelican's `{errors:[{detail}]}` envelope
@@ -1236,8 +1320,8 @@ class Pelican {
     }
   }
 
-  private async item<T>(api: PelicanApi, path: string, query: Record<string, string | number> = {}): Promise<T> {
-    const res = await this.request(api, path, { query });
+  private async item<T>(api: PelicanApi, path: string, query: Record<string, string | number> = {}, signal?: AbortSignal): Promise<T> {
+    const res = await this.request(api, path, { query, ...(signal ? { signal } : {}) });
     this.ensureOk(res, path, api);
     return ((res.json as { attributes?: T })?.attributes ?? {}) as T;
   }
@@ -1281,12 +1365,30 @@ class Pelican {
     return JSON.stringify(redactSecrets(s), null, 1).slice(0, 6000);
   }
 
+  /** One server by client ref — its display name and identities, which is how
+   *  its Uptime Kuma monitors are matched (name + `managed:pelican` tag, or a
+   *  tag naming the identifier/uuid). */
+  async clientServer(ref: string): Promise<ServerIdentity> {
+    const s = await this.item<{ name?: string; identifier?: string; uuid?: string }>("client", `/servers/${encodeURIComponent(ref)}`);
+    return { name: s.name ?? ref, identifier: s.identifier, uuid: s.uuid };
+  }
+
+  private resources(ref: string, signal?: AbortSignal): Promise<{ current_state?: string; is_suspended?: boolean; resources?: Record<string, number> }> {
+    return this.item("client", `/servers/${encodeURIComponent(ref)}/resources`, {}, signal);
+  }
+
+  /** Just the power state and process uptime — what a power-action wait polls.
+   *  Bounded by `timeoutMs`: a hung read must not hold paused monitors past the
+   *  caller's own deadline. */
+  async currentState(ref: string, timeoutMs = 15_000): Promise<{ state?: string; uptimeMs?: number }> {
+    const r = await this.resources(ref, AbortSignal.timeout(Math.max(1, timeoutMs)));
+    const up = r.resources?.uptime;
+    return { state: r.current_state, uptimeMs: typeof up === "number" ? up : undefined };
+  }
+
   /** Live resource usage, by client ref (short identifier or full UUID). */
   async serverResources(ref: string): Promise<string> {
-    const r = await this.item<{ current_state?: string; is_suspended?: boolean; resources?: Record<string, number> }>(
-      "client",
-      `/servers/${encodeURIComponent(ref)}/resources`,
-    );
+    const r = await this.resources(ref);
     const u = r.resources ?? {};
     const mb = (b?: number) => (typeof b === "number" ? `${Math.round(b / 1048576)}MiB` : "?");
     return (
@@ -1642,10 +1744,116 @@ class Pelican {
     );
   }
 
+  /** GET one server by NUMERIC id on the application half, turning the panel's
+   *  bare 404 into the "wrong kind of id" message the caller can act on. */
+  private async applicationServer(id: number): Promise<Server> {
+    const path = `/servers/${id}`;
+    const res = await this.request("application", path);
+    const notFound = `No Pelican server with id ${id}. Use list_servers — this tool takes the NUMERIC id, not the identifier.`;
+    if (res.status === 404) throw new Error(notFound);
+    this.ensureOk(res, path, "application");
+    const server = (res.json as { attributes?: Server })?.attributes;
+    if (!server?.id) throw new Error(notFound);
+    return server;
+  }
+
+  /**
+   * Change a server's build — resource limits, feature limits (backups,
+   * databases, allocations) and the OOM killer — through the APPLICATION API,
+   * by NUMERIC id. Pelican's `PATCH /servers/{id}/build` wants the WHOLE build
+   * on every call (verified against the panel's
+   * UpdateServerBuildConfigurationRequest and BuildModificationService on main
+   * and v1.0.0-beta35): `feature_limits` is `required`, each `limits.*` is
+   * `required_with:limits`, and the service writes `database_limit` /
+   * `allocation_limit` / `backup_limit` with a default of 0 — so a request
+   * naming only `backups` would silently ZERO the other two. This reads the
+   * server, merges the caller's fields over the current values and sends the
+   * complete body, then reports prior → new so the change can be reverted. A
+   * current value the panel does not return fails the call closed rather than
+   * being guessed.
+   *
+   * Field names follow the request, not the GET: the OOM switch is a top-level
+   * boolean `oom_killer`; the `limits.oom_disabled` the GET also returns is its
+   * deprecated inverse and is not accepted on write.
+   */
+  async updateServerBuild(input: UpdateServerBuildInput): Promise<string> {
+    // Unknown fields are refused BEFORE any request is made.
+    assertKnownKeys("update_server_build", input, ["id", "limits", "featureLimits", "oomKiller"]);
+    assertKnownKeys("limits", input.limits, BUILD_LIMIT_KEYS);
+    assertKnownKeys("featureLimits", input.featureLimits, BUILD_FEATURE_KEYS);
+    const wanted = buildChanges(input);
+    if (!wanted.length) throw new Error("update_server_build needs at least one field to change: limits.*, featureLimits.* or oomKiller.");
+
+    const server = await this.applicationServer(input.id);
+    const curLimits = (server.limits ?? {}) as Record<string, unknown>;
+    const curFeature = (server.feature_limits ?? {}) as Record<string, unknown>;
+    /** A current numeric value the full payload must carry. Missing ⇒ fail
+     *  closed: the route replaces every limit, and the service writes a missing
+     *  feature limit as 0. */
+    const reported = (path: string, v: unknown): number => {
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+      if (!Number.isFinite(n)) {
+        throw new Error(
+          `The panel did not report '${path}' for server ${input.id}, so the full build cannot be rebuilt safely — refusing to guess, ` +
+            `because the build route replaces every limit and writes a missing feature limit as 0. Check server_details.`,
+        );
+      }
+      return n;
+    };
+
+    const limits: Record<string, number | string | null> = {};
+    for (const k of ["memory", "swap", "disk", "io", "cpu"] as const) limits[k] = input.limits?.[k] ?? reported(`limits.${k}`, curLimits[k]);
+    // threads is CPU pinning ('0-1,3') or null, and null is a real value (clear
+    // the pinning) — so presence, not nullish-ness, decides whether it was set.
+    const curThreads = typeof curLimits.threads === "string" && curLimits.threads !== "" ? curLimits.threads : null;
+    limits.threads = input.limits && "threads" in input.limits ? (input.limits.threads ?? null) : curThreads;
+
+    const feature: Record<string, number> = {};
+    for (const k of BUILD_FEATURE_KEYS) feature[k] = input.featureLimits?.[k] ?? reported(`feature_limits.${k}`, curFeature[k]);
+
+    const curOom =
+      typeof curLimits.oom_killer === "boolean" ? curLimits.oom_killer : typeof curLimits.oom_disabled === "boolean" ? !curLimits.oom_disabled : undefined;
+    const oomKiller = input.oomKiller ?? curOom;
+
+    // The primary allocation is part of the build: re-send the current one so it
+    // never moves. Pelican allows a server with no allocation — then the key is
+    // omitted (its rule is sometimes|nullable) rather than invented.
+    const allocation = typeof server.allocation === "number" ? server.allocation : undefined;
+
+    const body = {
+      ...(allocation !== undefined ? { allocation } : {}),
+      ...(oomKiller !== undefined ? { oom_killer: oomKiller } : {}),
+      limits,
+      feature_limits: feature,
+    };
+    const path = `/servers/${input.id}/build`;
+    const res = await this.request("application", path, { method: "PATCH", body });
+    this.ensureOk(res, path, "application");
+
+    const fmt = (v: unknown): string => (v === undefined ? "?" : v === null ? "null" : String(v));
+    const priorOf = (p: string): unknown =>
+      p === "oom_killer" ? curOom : p === "limits.threads" ? curThreads : p.startsWith("limits.") ? curLimits[p.slice("limits.".length)] : curFeature[p.slice("feature_limits.".length)];
+    const diff = wanted.map(([p, next]) => {
+      const prior = fmt(priorOf(p));
+      return `${p} ${prior} → ${fmt(next)}${prior === fmt(next) ? " (unchanged)" : ""}`;
+    });
+    const sent =
+      `allocation=${allocation ?? "none"}, oom_killer=${fmt(oomKiller)}, ` +
+      `limits ${Object.entries(limits).map(([k, v]) => `${k}=${fmt(v)}`).join(" ")}, ` +
+      `feature_limits ${Object.entries(feature).map(([k, v]) => `${k}=${v}`).join(" ")}`;
+    return (
+      `Updated build on Pelican server '${server.name ?? input.id}' [${input.id}] via the admin API: ${diff.join("; ")}. ` +
+      `Revert by calling update_server_build with the prior values above. ` +
+      `The full build was re-sent so nothing else moved: ${sent}. ` +
+      `Feature limits apply at once — a scheduled backup task rotates out the oldest backup once the limit is reached, and lowering it deletes nothing by itself. ` +
+      `Resource limits are synced to Wings, which adjusts a running container in place where Docker allows; restart if server_resources still shows the old limit.`
+    );
+  }
+
   /** Send a power signal via the Client API. */
   async powerAction(ref: string, signal: string): Promise<string> {
     const path = `/servers/${encodeURIComponent(ref)}/power`;
-    const res = await this.request("client", path, { method: "POST", body: { signal } });
+    const res = await this.request("client", path, { method: "POST", body: { signal }, signal: AbortSignal.timeout(30_000) });
     this.ensureOk(res, path);
     return (
       `Sent '${signal}'${signal === "kill" ? " (UNGRACEFUL — the process was terminated, not asked to stop)" : ""} to Pelican server '${ref}' on ${this.target.name}. ` +
@@ -1896,7 +2104,9 @@ class Pelican {
    * daemon timeout (see `looksLikeDaemonTimeout`), in which case the listing is
    * polled until the size matches `expectedBytes` — or, without one, stops
    * changing. The size check doubles as an integrity check when the caller knows
-   * the exact byte count of what it expects.
+   * the exact byte count of what it expects. A 429 is the panel's per-user
+   * pull throttle and is reported as such (`filePullThrottleMessage`) rather
+   * than as a bare status — nothing was downloaded, so there is no file to watch.
    */
   async pullFile(input: { server: string; url: string; directory?: string; filename: string; expectedBytes?: number }): Promise<string> {
     const url = assertPullUrl(input.url);
@@ -1911,6 +2121,7 @@ class Pelican {
     let how = "completed within the call";
     let panelError: string | undefined;
     if (!res.ok) {
+      if (res.status === 429) throw new Error(filePullThrottleMessage(res, path));
       if (!looksLikeDaemonTimeout(res)) this.ensureOk(res, path, "client");
       panelError = scrubSecrets(res.text).slice(0, 300);
       how = "outlived the panel's 15s daemon timeout, so the listing was watched until it landed";
@@ -2169,6 +2380,232 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
     `${notes.length ? `Notes — ${notes.join("; ")}. ` : ""}` +
     `Verify with panel_version and by loading the panel; if anything looks wrong, the backup above is the rollback point.`
   );
+}
+
+// --- White-glove power actions ---------------------------------------------------
+//
+// The owner's game servers are watched by Uptime Kuma monitors that post
+// "X is DOWN / UP" to Discord. A deliberate bounce (test boot, mod install,
+// world swap) therefore pages the channel unless the monitors are paused first.
+// The **white-glove rule**: a MANUAL power action on a monitored server pauses
+// its monitors, acts, waits until the server reports the expected state, and
+// resumes them — in every case, including failure, because a monitor left
+// paused is a blind spot nobody asked for. Scheduled starts/stops (Pelican
+// schedules) run inside the panel, never through this tool, and must not be
+// suppressed: those alerts are the feature. See docs/ARCHITECTURE.md.
+
+/** Poll cadence/bounds for confirming a power action's end state. Exported (mutable) for testing. */
+export const POWER_WAIT = { intervalMs: 3000, defaultSeconds: 180, maxSeconds: 900 };
+
+/** The state server_resources should report once a signal has taken effect. */
+export function expectedStateFor(signal: string): "running" | "offline" {
+  return signal === "start" || signal === "restart" ? "running" : "offline";
+}
+
+export interface PowerWaitOutcome {
+  reached: boolean;
+  state?: string;
+  elapsedMs: number;
+  /** Distinct states seen, in order — the result shows the path taken. */
+  observed: string[];
+}
+
+/**
+ * Wait for the expected state. A restart is the subtle one: the server is
+ * `running` both before and after, so "running" alone proves nothing — it must
+ * either have been seen leaving `running` (stopping/starting/offline) or come
+ * back with a process uptime shorter than this wait, which only a fresh process
+ * has. Read errors are treated as transient and polling continues until the
+ * deadline. Exported for testing.
+ */
+export async function waitForPowerState(
+  read: (remainingMs: number) => Promise<{ state?: string; uptimeMs?: number }>,
+  signal: string,
+  seconds: number,
+): Promise<PowerWaitOutcome> {
+  const want = expectedStateFor(signal);
+  const started = Date.now();
+  const deadline = started + seconds * 1000;
+  const observed: string[] = [];
+  let sawTransition = false;
+  for (;;) {
+    let cur: { state?: string; uptimeMs?: number } = {};
+    try {
+      cur = await read(Math.max(1, deadline - Date.now()));
+    } catch {
+      /* transient — keep polling until the deadline */
+    }
+    const st = cur.state;
+    if (st && observed[observed.length - 1] !== st) observed.push(st);
+    if (st && st !== "running") sawTransition = true;
+    const elapsedMs = Date.now() - started;
+    if (st === want) {
+      const fresh = cur.uptimeMs !== undefined && cur.uptimeMs < elapsedMs;
+      if (signal !== "restart" || sawTransition || fresh) return { reached: true, state: st, elapsedMs, observed };
+    }
+    if (Date.now() >= deadline) return { reached: false, state: st, elapsedMs, observed };
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(POWER_WAIT.intervalMs, deadline - Date.now()))));
+  }
+}
+
+/**
+ * The Uptime Kuma target whose monitors watch this panel's servers. An explicit
+ * `monitorsTarget` option wins; otherwise the ONE registered uptime-kuma target
+ * is used, and several is an error asking the operator to choose — never a
+ * silent pick. Fails closed when nothing is registered: the rule is "no pause,
+ * no test", so the action is refused rather than run noisily.
+ */
+async function monitorsTargetFor(ctx: ToolContext): Promise<{ target: Target; cred: Credential }> {
+  const opts = options(ctx.target);
+  if (!ctx.resolveCredential) throw new Error("This call site cannot resolve other targets' credentials, so suppressMonitors is unavailable here.");
+  let t: Target | undefined;
+  if (opts.monitorsTarget) {
+    if (!ctx.resolveTarget) throw new Error("This call site cannot resolve other targets, so suppressMonitors is unavailable here.");
+    t = ctx.resolveTarget(opts.monitorsTarget);
+    if (!t) throw new Error(`This Pelican target's monitorsTarget is '${opts.monitorsTarget}', but no target by that name is registered. Check list_targets.`);
+  } else {
+    if (!ctx.targetsOfType) throw new Error("This call site cannot look up targets by type, so suppressMonitors is unavailable here.");
+    const all = ctx.targetsOfType("uptime-kuma");
+    if (all.length === 0) {
+      throw new Error(
+        `suppressMonitors was requested but no uptime-kuma target is registered, so nothing could be silenced. The white-glove rule says a monitored game server is ` +
+          `not bounced without suppression, so this refuses rather than proceeding noisily. Register the Uptime Kuma instance (register_target type 'uptime-kuma'), ` +
+          `or — only if this server is genuinely unmonitored — run power_action without suppressMonitors.`,
+      );
+    }
+    if (all.length > 1) {
+      throw new Error(
+        `Several uptime-kuma targets are registered (${all.map((x) => x.name).join(", ")}) — set this Pelican target's 'monitorsTarget' option (update_target) to the one that watches its servers.`,
+      );
+    }
+    t = all[0]!;
+  }
+  if (t.type !== "uptime-kuma") {
+    throw new Error(`This Pelican target's monitorsTarget is '${t.name}', which is a '${t.type}' target, not 'uptime-kuma'. Refusing to log in to it.`);
+  }
+  if (!t.credentialRef) throw new Error(`The uptime-kuma target '${t.name}' has no credential attached, so its monitors cannot be paused.`);
+  return { target: t, cred: await ctx.resolveCredential(t.credentialRef) };
+}
+
+type Named = { id: number; name: string };
+type ResumeReport = Awaited<ReturnType<typeof resumeExactly>>;
+
+/** Resume on a FRESH session (the pause session is long closed and the wait may
+ *  have outlived a connection). Never throws: a failure is reported as monitors
+ *  still paused, which the result then puts first. */
+async function safeResume(kopts: ReturnType<typeof kumaConnectOptions>, paused: Named[]): Promise<ResumeReport> {
+  if (!paused.length) return { resumed: [], already: [], missing: [], failed: [] };
+  try {
+    return await withKuma(kopts, (s) => resumeExactly(s, paused));
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    return { resumed: [], already: [], missing: [], failed: paused.map((m) => `[${m.id}] ${m.name}: ${why}`) };
+  }
+}
+
+interface PowerInput {
+  server: string;
+  signal: (typeof POWER_SIGNALS)[number];
+  suppressMonitors?: boolean;
+  waitSeconds?: number;
+}
+
+/** pause → act → verify → ALWAYS resume. Exported for testing. */
+export async function whiteGlovePowerAction(ctx: ToolContext, p: Pelican, input: PowerInput): Promise<ToolResult> {
+  const seconds = Math.min(input.waitSeconds ?? POWER_WAIT.defaultSeconds, POWER_WAIT.maxSeconds);
+  const kuma = await monitorsTargetFor(ctx);
+  const kopts = kumaConnectOptions(kuma.target, kuma.cred);
+  const server = await p.clientServer(input.server);
+  const who = `Pelican server '${server.name}' (${server.identifier ?? input.server}) on ${ctx.target.name}`;
+  const nameOf = (xs: Named[]): string => xs.map((m) => `${m.name} [${m.id}]`).join(", ");
+
+  // 1. Pause. Nothing has happened to the server yet, so a failure here rolls
+  //    back what was paused and refuses — "no pause, no test".
+  const paused: Named[] = [];
+  const alreadyPaused: Named[] = [];
+  await withKuma(kopts, async (s) => {
+    const { matched, unmatchedSameName } = monitorsForServer(await s.monitors(), server);
+    if (!matched.length) {
+      const same = unmatchedSameName[0];
+      const hint = same
+        ? ` A monitor named '${same.name}' [${same.id}] exists but lacks the '${MANAGED_PELICAN_TAG}' tag — add it (or a tag naming this server, e.g. 'server:${server.identifier ?? server.name}') to opt it in.`
+        : ` Name the monitor '${server.name}' and tag it '${MANAGED_PELICAN_TAG}', or tag it with the server identifier (e.g. 'server:${server.identifier ?? server.name}').`;
+      throw new Error(
+        `No monitor on Uptime Kuma target '${kuma.target.name}' matches ${who}, so nothing would be silenced — refusing to send '${input.signal}' with suppressMonitors.${hint} ` +
+          `If this server is genuinely unmonitored, run power_action without suppressMonitors.`,
+      );
+    }
+    for (const m of matched) {
+      if (!m.active) {
+        alreadyPaused.push({ id: m.id, name: m.name });
+        continue;
+      }
+      try {
+        await s.pause(m.id);
+        paused.push({ id: m.id, name: m.name });
+      } catch (e) {
+        // Undo what WE paused, unconditionally — not via the cached list, which
+        // on Kuma 2.x may not yet reflect the pauses — and refuse.
+        const back = await resumeUnconditionally(s, paused);
+        const lead = back.failed.length ? `MONITORS STILL PAUSED on ${kuma.target.name}: ${back.failed.join("; ")}. Resume them now with that target's resume_monitor. ` : "";
+        throw new Error(
+          `${lead}Could not pause monitor '${m.name}' [${m.id}] on ${kuma.target.name}: ${e instanceof Error ? e.message : String(e)}. The '${input.signal}' was NOT sent.` +
+            (back.resumed.length ? ` Rolled back: resumed ${nameOf(back.resumed)}.` : ""),
+        );
+      }
+    }
+  });
+
+  // 2. Act, 3. verify — then 4. ALWAYS resume, whatever happened in 2 or 3.
+  let action = "";
+  let wait: PowerWaitOutcome | undefined;
+  let failure: unknown;
+  let back!: ResumeReport;
+  try {
+    action = await p.powerAction(input.server, input.signal);
+    // Each read is capped at 15 s and never past the deadline, so a hung
+    // panel cannot hold the monitors paused beyond `waitSeconds`.
+    wait = await waitForPowerState((remainingMs) => p.currentState(input.server, Math.min(15_000, remainingMs)), input.signal, seconds);
+  } catch (e) {
+    failure = e;
+  } finally {
+    back = await safeResume(kopts, paused);
+  }
+
+  const stillPaused = back.failed.length > 0;
+  const lines: string[] = [];
+  if (stillPaused) {
+    lines.push(`MONITORS STILL PAUSED on ${kuma.target.name}: ${back.failed.join("; ")}. Resume them now with that target's resume_monitor — never leave them paused.`);
+  }
+  lines.push(`White-glove ${input.signal} of ${who}:`);
+  lines.push(
+    `  1. Paused ${paused.length} Uptime Kuma monitor${paused.length === 1 ? "" : "s"} on ${kuma.target.name}: ${nameOf(paused) || "none (every matching monitor was already paused)"}.` +
+      (alreadyPaused.length ? ` Already paused, left alone: ${nameOf(alreadyPaused)}.` : ""),
+  );
+  if (failure) lines.push(`  2. The action FAILED: ${failure instanceof Error ? failure.message : String(failure)}`);
+  else lines.push(`  2. ${action}`);
+  if (wait) {
+    const path = wait.observed.join(" → ") || "no state read";
+    lines.push(
+      wait.reached
+        ? `  3. Server reached '${wait.state}' after ${Math.round(wait.elapsedMs / 1000)}s (observed: ${path}).`
+        : `  3. WARNING: server did NOT reach '${expectedStateFor(input.signal)}' within ${seconds}s (last state '${wait.state ?? "unknown"}', observed: ${path}). ` +
+            `Do not re-send the power action blindly — check server_resources and the console first.`,
+    );
+  }
+  lines.push(
+    `  4. Resumed: ${nameOf(back.resumed) || "nothing to resume"}.` +
+      (back.already.length ? ` Already active: ${nameOf(back.already)}.` : "") +
+      (back.missing.length ? ` Gone from Kuma: ${nameOf(back.missing)}.` : ""),
+  );
+  if (!failure && wait?.reached && !stillPaused) {
+    lines.push(
+      expectedStateFor(input.signal) === "offline"
+        ? `The server is now intentionally offline with its monitors active again, so Kuma will report it DOWN on the next check. For a planned outage, open a window with the ${kuma.target.name} 'maintenance' tool instead and end it when the server is back.`
+        : "Notifications stayed quiet for the whole bounce.",
+    );
+  }
+  return { text: lines.join("\n"), isError: Boolean(failure) || stillPaused };
 }
 
 async function withClient<T>(ctx: ToolContext, fn: (p: Pelican) => Promise<T>): Promise<T> {
@@ -2473,21 +2910,92 @@ function buildTools(target: Target): ConnectorTool[] {
       run: run((p, i) => p.updateServerStartup(i)),
     },
     {
+      name: "update_server_build",
+      description:
+        `Change a Pelican server's build on ${target.name} through the ADMIN (application) API, by NUMERIC server id: resource limits ` +
+        `(memory, swap, disk, io, cpu, threads), feature limits (how many backups, databases and allocations it may hold) and the OOM ` +
+        `killer. The panel's build route demands the WHOLE build every time and writes any feature limit it isn't sent as 0, so this ` +
+        `is a read-merge-write: the server is read first, only the fields you pass change, everything else is re-sent as it is, and ` +
+        `the result reports prior → new so you can revert. Unknown fields are refused. Lowering the backup limit is how a scheduled ` +
+        `backup is told how many to keep — it rotates out the oldest once the limit is reached — and deletes nothing by itself.`,
+      tier: "execute",
+      inputSchema: z
+        .object({
+          id: z.number().int().positive().describe("Numeric application server id from list_servers (NOT the short identifier)."),
+          limits: z
+            .object({
+              memory: z.number().int().min(0).optional().describe("Memory limit MiB (0 = unlimited)."),
+              swap: z.number().int().min(-1).optional().describe("Swap MiB (0 = none, -1 = unlimited)."),
+              disk: z.number().int().min(0).optional().describe("Disk limit MiB (0 = unlimited)."),
+              io: z.number().int().min(0).max(1000).optional().describe("Block IO weight, 0–1000."),
+              cpu: z.number().int().min(0).optional().describe("CPU limit % (100 = one core; 0 = unlimited)."),
+              threads: z.string().regex(/^[0-9,-]+$/).nullable().optional().describe("CPU pinning, e.g. '0-1,3'; null clears it."),
+            })
+            .strict()
+            .optional()
+            .describe("Resource limits to change. Any you omit keep their current value."),
+          featureLimits: z
+            .object({
+              databases: z.number().int().min(0).optional().describe("How many databases the server may have."),
+              allocations: z.number().int().min(0).optional().describe("How many allocations (ports) the server may hold."),
+              backups: z.number().int().min(0).optional().describe("How many backups the server may keep; a scheduled backup rotates out the oldest once this is reached."),
+            })
+            .strict()
+            .optional()
+            .describe("Feature limits to change. Any you omit keep their current value."),
+          oomKiller: z.boolean().optional().describe("Enable the container's OOM killer. Omit to leave it alone."),
+        })
+        .strict(),
+      confirm: (input, t) => {
+        const i = input as UpdateServerBuildInput;
+        const fields = buildChanges(i).map(([p, v]) => `${p}=${v === null ? "null" : String(v)}`);
+        return `Change build of Pelican server [${i.id}] on ${t.name}: ${fields.join(", ") || "nothing"} (every other build field is re-sent unchanged)`;
+      },
+      run: run((p, i) => p.updateServerBuild(i)),
+    },
+    {
       name: "power_action",
       description:
         `Start, stop, restart or kill a Pelican server on ${target.name}. 'kill' terminates the process ungracefully and can lose ` +
-        `unsaved world state — prefer 'stop'. Power changes are asynchronous; confirm with server_resources.`,
+        `unsaved world state — prefer 'stop'. Power changes are asynchronous; confirm with server_resources. ` +
+        `WHITE-GLOVE RULE — pass suppressMonitors:true for any MANUAL (out-of-schedule) action on a server that Uptime Kuma monitors: it finds the registered ` +
+        `uptime-kuma target, pauses every monitor matching this server (tag '${MANAGED_PELICAN_TAG}' + the server's name, or a tag naming the server), performs the action, ` +
+        `waits up to waitSeconds (default ${POWER_WAIT.defaultSeconds}) for server_resources to report the expected state, and resumes the monitors in every case ` +
+        `including failure — so Discord never gets 'DOWN/UP' posts for a deliberate bounce. It refuses, and sends nothing, when no uptime-kuma target or no matching ` +
+        `monitor exists. Scheduled starts/stops run inside the panel and are never suppressed — those alerts are the feature.`,
       tier: "execute",
       inputSchema: z.object({
         server: SERVER_REF,
         signal: z.enum(POWER_SIGNALS).describe("start | stop | restart | kill"),
+        suppressMonitors: z
+          .boolean()
+          .optional()
+          .describe("White-glove: pause this server's Uptime Kuma monitors around the action and resume them after. Required for manual actions on monitored game servers; never for scheduled ones."),
+        waitSeconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(POWER_WAIT.maxSeconds)
+          .optional()
+          .describe(`With suppressMonitors: how long to wait for the expected state before resuming the monitors anyway (default ${POWER_WAIT.defaultSeconds}).`),
       }),
       confirm: (input, t) => {
-        const i = input as { server: string; signal: string };
+        const i = input as PowerInput;
         const label = i.signal === "kill" ? "KILL (ungraceful — may lose unsaved state)" : i.signal.toUpperCase();
-        return `${label} Pelican server '${i.server}' on ${t.name}`;
+        const glove = i.suppressMonitors
+          ? ` — white-glove: pause its matching Uptime Kuma monitors first, resume them once it reports '${expectedStateFor(i.signal)}' (or on failure)`
+          : "";
+        return `${label} Pelican server '${i.server}' on ${t.name}${glove}`;
       },
-      run: run((p, i) => p.powerAction(i.server, i.signal)),
+      run: async (input, ctx) => {
+        const i = input as PowerInput;
+        if (!i.suppressMonitors) return run((p, x) => p.powerAction(x.server, x.signal))(input, ctx);
+        try {
+          return await withClient(ctx, (p) => whiteGlovePowerAction(ctx, p, i));
+        } catch (e) {
+          return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+        }
+      },
     },
     {
       name: "update_startup_variables",
@@ -2671,7 +3179,10 @@ function buildTools(target: Target): ConnectorTool[] {
         `own user. Only public https sources are accepted (the daemon fetches from inside your LAN, so a private address is ` +
         `refused). The call waits for the download; pass 'expectedBytes' (the exact size of the file you expect, e.g. from ` +
         `downloading it yourself first) and the result is only reported as success when the landed size matches. Then ` +
-        `decompress_file to unpack it and rename_files to move pieces into place.`,
+        `decompress_file to unpack it and rename_files to move pieces into place. The panel throttles this route to ` +
+        `${FILE_PULL_RATE_LIMIT.pulls} pulls per ${FILE_PULL_RATE_LIMIT.minutes} minutes per user by default, and a rejected attempt does ` +
+        `not extend the window — plan a mod install in groups of at most ${FILE_PULL_RATE_LIMIT.pulls} pulls and let the window pass ` +
+        `before the next group (a 429 names the limit and, when the panel sends them, the Retry-After / X-RateLimit-Reset values).`,
       tier: "execute",
       inputSchema: z.object({
         server: SERVER_REF,

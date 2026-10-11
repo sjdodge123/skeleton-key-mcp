@@ -6,6 +6,7 @@ import { unifiConnector } from "./unifi.js";
 import { homeAssistantConnector } from "./home-assistant.js";
 import { proxmoxConnector } from "./proxmox.js";
 import { pelicanConnector } from "./pelican.js";
+import { uptimeKumaConnector } from "./uptime-kuma.js";
 
 /**
  * Registry of available connector *types*. Adding support for a new service
@@ -57,3 +58,4 @@ registerConnector(homeAssistantConnector);
 connectors.set("homeassistant", homeAssistantConnector);
 registerConnector(proxmoxConnector);
 registerConnector(pelicanConnector);
+registerConnector(uptimeKumaConnector);

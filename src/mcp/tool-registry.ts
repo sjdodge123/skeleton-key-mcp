@@ -83,6 +83,10 @@ export function resolveTools(app: AppState): ResolvedTool[] {
             // something its own host can (see ToolContext.resolveTarget). Looked
             // up live, and never the whole list.
             resolveTarget: (name: string) => app.registry.list().find((t) => t.name === name),
+            // Every target of one connector type (see ToolContext.targetsOfType)
+            // — how a Pelican power action finds the Uptime Kuma instance whose
+            // monitors it must silence. Live, and never the whole registry.
+            targetsOfType: (type: string) => app.registry.list().filter((t) => t.type === type),
             fingerprint: (value: string) => app.fingerprint(value),
             // Control-plane hosts no network change may point at (see
             // ToolContext.protectedHosts). Recomputed per call so a target

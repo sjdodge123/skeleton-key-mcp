@@ -93,6 +93,21 @@ export interface ToolContext {
    */
   resolveTarget?: (name: string) => Target | undefined;
   /**
+   * Every registered target of ONE connector type — for a connector that must
+   * find a *service* rather than a name it was told. The motivating case is the
+   * white-glove rule: a manual Pelican power action has to find the registered
+   * Uptime Kuma instance so it can silence that server's monitors around the
+   * bounce, and the operator should not have to wire the two together by hand
+   * when there is exactly one.
+   *
+   * Scoped to a type on purpose: it is not a registry dump. It returns Target
+   * records only (no secrets — credentials still go through
+   * `resolveCredential`), and a caller that gets several must ask the operator
+   * to disambiguate rather than pick one. Optional like `resolveTarget`; a tool
+   * that needs it must fail with a clear error when it is absent.
+   */
+  targetsOfType?: (type: string) => Target[];
+  /**
    * Hosts that a network change must never be pointed at — Skeleton Key's own
    * control plane. Assembled by the tool registry from the LIVE target registry
    * (so moving a host is picked up automatically instead of being hardcoded),

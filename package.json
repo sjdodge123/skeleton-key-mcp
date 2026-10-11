@@ -25,6 +25,7 @@
     "libsodium-wrappers-sumo": "^0.7.15",
     "otplib": "^12.0.1",
     "qrcode": "^1.5.4",
+    "socket.io-client": "^4.8.4",
     "ssh2": "^1.16.0",
     "undici": "^6.27.0",
     "zod": "^3.24.1",
@@ -38,6 +39,7 @@
     "@types/node": "^22.10.5",
     "@types/qrcode": "^1.5.5",
     "@types/ssh2": "^1.15.1",
+    "socket.io": "^4.8.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.0"
