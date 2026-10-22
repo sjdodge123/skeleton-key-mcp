@@ -2,7 +2,7 @@
 
 Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
 
-_Last updated: 2026-10-11._
+_Last updated: 2026-10-22._
 
 ## TL;DR
 
@@ -14,6 +14,7 @@ Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connect
 - **Secrets** — libsodium bootstrap store; scoped-Vaultwarden client over the `bw` CLI with offline cache; secrets kept off argv/logs; `reestablish()` unlock logic.
 - **Vault URL repair + https requirement (#70 → follow-up)** — bumping the bundled Bitwarden CLI (2024.9.0 → 2026.9.1, needed because Vaultwarden 2026.x rejects item creates without `encryptedFor`) surfaced a second CLI change: it refuses plain-http vault servers, so the stored LAN `http://nas:5555` URL stopped unlocking after the deploy. Added `AppState.changeVaultServer` + TOTP-gated `POST /api/vault/server` (logout → reestablish on the new https URL → sync → persist, fails closed), `vaultError` on `/api/status` (URLs redacted), a non-fatal `/store/unlock` that reports the vault state instead of bouncing the user to the passphrase box, an admin-page "Vault connection" repair card, and https validation in the wizard. Lesson recorded: the pinned `bw` CLI must track the Vaultwarden version Watchtower ships.
 - **Generic SSH connector** — read tools + gated execute with a command deny-list; generic HTTP connector.
+- **`run_readonly` hardening** — the read-only allowlist only checked a command's first word, so a no-approval read tool could run `ls; systemctl stop x` or `cat f | tee /etc/…`. Allowlist mode now vets every command of a compound line (quote-aware split), refuses substitution/subshells/backgrounding/file redirects, refuses the write modes of allowlisted commands (`find -delete`, `ip l s`, `date -s`, `dmesg -c`, `smartctl -t`, `env CMD`, …), and adds read-only PVE/hardware inspection (`qm config`, `pvesm status`, `pvesh get`, `lsblk`, `lspci`, `findmnt`, …). Found during the proxmox32 stale `nvme` storage investigation (2026-10-22). Also tightens target `allowPatterns` the same way.
 - **First-run wizard** — passphrase, vault connect + scoping/durability checks, LAN discovery, TOTP, connect-Claude step; clickable steps, submit spinners.
 - **OAuth 2.1 auth** — discovery, dynamic client registration, PKCE, TOTP-gated consent, rotating refresh tokens, per-client revocation; static bearer retained as fallback.
 - **Conversational onboarding tools** — `get_started`, `network_scan`, `vault_generate_ssh_key`, `vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`, `register_target`, `list_targets`.
