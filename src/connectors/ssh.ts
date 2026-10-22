@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Connector, ConnectorTool, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { runSsh, shellQuote, MAX_SSH_TIMEOUT_MS, firstWord, looksLikeSudoPasswordFailure, sudoHint } from "./ssh-exec.js";
-import { checkCommand, READONLY_ALLOW, type CommandPolicyOptions } from "./command-policy.js";
+import { checkCommand, checkReadonly, type CommandPolicyOptions } from "./command-policy.js";
 
 const optionsSchema = z
   .object({
@@ -134,13 +134,13 @@ function buildTools(target: Target): ConnectorTool[] {
     },
     {
       name: "run_readonly",
-      description: `Run a read-only inspection command on ${target.name} (allowlisted: cat, ls, ps, systemctl status, ip, ss, docker ps/logs, ...).`,
+      description: `Run a read-only inspection command on ${target.name} (allowlisted: cat, ls, grep, ps, journalctl, systemctl status, ip, ss, lsblk, lspci, docker ps/logs, read-only qm/pct/pvesm/pvesh get, ...; every command of a pipeline or ;/&& chain must be allowlisted, and $(…), subshells and file redirects are refused).`,
       tier: "read",
       inputSchema: z.object({ command: z.string() }),
       run: (input, ctx) => {
         const { command } = input as { command: string };
         // Policy runs on the RAW command; the PATH/sudo wrapping happens inside runSsh afterwards.
-        const verdict = checkCommand(command, { allow: READONLY_ALLOW });
+        const verdict = checkReadonly(command);
         if (!verdict.allowed) {
           return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
         }
