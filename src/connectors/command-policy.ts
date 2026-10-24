@@ -187,6 +187,10 @@ export const READONLY_ALLOW: string[] = [
   "^\\s*pct\\s+(config|status|list|listsnapshot|pending)\\b",
   "^\\s*pvecm\\s+(status|nodes)\\b",
   "^\\s*pvesh\\s+get\\b",
+  // UPS status (NUT client / apcupsd). `upsc` only queries upsd; `\b` keeps the
+  // state-changing `upscmd` (beeper, battery test, shutdown) and `upsrw` off.
+  "^\\s*upsc\\b",
+  "^\\s*apcaccess\\b",
 ];
 
 /** State-changing forms of commands that READONLY_ALLOW admits by name. Checked
