@@ -96,6 +96,17 @@ describe("read-only policy: every command of a compound line is vetted", () => {
     ]) ok(cmd);
   });
 
+  it("allows UPS status queries but not the NUT commands that change state", () => {
+    for (const cmd of [
+      "upsc ups@localhost", "upsc ups@localhost ups.status", "upsc -l", "upsc -L 192.168.0.229", "upsc -c ups",
+      "upsc ups 2>&1 | grep -E 'battery|ups.(status|load)'", "apcaccess", "apcaccess status",
+    ]) ok(cmd);
+    for (const cmd of [
+      "upscmd ups beeper.disable", "upscmd -u admin ups shutdown.return", "upsrw -s ups.delay.shutdown=20 ups",
+      "upsc ups; upscmd ups test.battery.start", "upsmon -c fsd", "upsdrvctl stop",
+    ]) no(cmd);
+  });
+
   it("refuses mutating subcommands of the Proxmox / hardware tools", () => {
     for (const cmd of [
       "pvesm remove nvme", "pvesm set nvme --disable 1", "qm set 100 --delete unused0", "qm stop 100",
