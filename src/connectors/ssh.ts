@@ -134,7 +134,7 @@ function buildTools(target: Target): ConnectorTool[] {
     },
     {
       name: "run_readonly",
-      description: `Run a read-only inspection command on ${target.name} (allowlisted: cat, ls, grep, ps, journalctl, systemctl status, ip, ss, lsblk, lspci, docker ps/logs, read-only qm/pct/pvesm/pvesh get, upsc/apcaccess, ...; every command of a pipeline or ;/&& chain must be allowlisted, and $(…), subshells and file redirects are refused).`,
+      description: `Run a read-only inspection command on ${target.name} (allowlisted: cat, ls, grep, ps, journalctl, systemctl status, ip, ss, lsblk, lspci, docker ps/logs, read-only qm/pct/pvesm/pvesh get, pve8to9/pve7to8 [--full], systemctl --failed, modinfo, dkms status, upsc/apcaccess, ...; every command of a pipeline or ;/&& chain must be allowlisted, and $(…), subshells and file redirects are refused).`,
       tier: "read",
       inputSchema: z.object({ command: z.string() }),
       run: (input, ctx) => {

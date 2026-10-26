@@ -33,6 +33,10 @@ import {
   runtimeReport,
   sshUserOf,
   compareVersions,
+  phpPackagePolicyCommand,
+  parseAptPolicy,
+  upstreamPhpVersion,
+  servingPhpMinor,
 } from "./pelican-host.js";
 import { checkCommand, DEFAULT_DENY } from "./command-policy.js";
 import type { Credential, Target, ToolContext } from "./types.js";
@@ -67,7 +71,21 @@ const PREPARE_CMD = helperCommand("php-prepare", "8.4");
 const WINGS_CMD = helperCommand("wings-update", "v1.0.0-rc.1");
 const UPGRADE_CMD = helperCommand("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.1");
 const UPGRADE_CMD_PINNED_SKIP = helperCommand("panel-upgrade", "1.0.0-beta35", "v1.0.0-rc.2", true);
-const EXPECTED_COMMANDS = new Set([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD, PREPARE_CMD, WINGS_CMD, UPGRADE_CMD, UPGRADE_CMD_PINNED_SKIP]);
+const PREPARE_CMD_83 = helperCommand("php-prepare", "8.3");
+const APT_83_CMD = phpPackagePolicyCommand("8.3");
+const APT_84_CMD = phpPackagePolicyCommand("8.4");
+const EXPECTED_COMMANDS = new Set([
+  VERSION_CMD,
+  HOST_STATUS_COMMAND,
+  COMPOSER_CMD,
+  PREPARE_CMD,
+  PREPARE_CMD_83,
+  APT_83_CMD,
+  APT_84_CMD,
+  WINGS_CMD,
+  UPGRADE_CMD,
+  UPGRADE_CMD_PINNED_SKIP,
+]);
 
 type Reply = { stdout?: string; stderr?: string; code?: number };
 let sent: string[] = [];
@@ -106,6 +124,11 @@ const status = (over: Record<string, string> = {}) =>
     .join("\n") + "\n";
 const STATUS_83 = { stdout: status() };
 const STATUS_84 = { stdout: status({ php_cli: "8.4.1", php_default: "8.4", php_installed: "8.3 8.4", php_fpm_active: "8.3 8.4", nginx_socket: "/run/php/php8.4-fpm.sock" }) };
+const aptPolicy = (pkg: string, installed: string, candidate: string) => ({
+  stdout: `${pkg}:\n  Installed: ${installed}\n  Candidate: ${candidate}\n  Version table:\n *** ${installed} 500\n        500 https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble/main amd64 Packages\n`,
+});
+const APT_83_CURRENT = aptPolicy("php8.3-fpm", "8.3.6-1+ubuntu24.04.1+deb.sury.org+1", "8.3.6-1+ubuntu24.04.1+deb.sury.org+1");
+const APT_84_BEHIND = aptPolicy("php8.4-fpm", "8.4.26-1+ubuntu24.04.1+deb.sury.org+1", "8.4.27-1+ubuntu24.04.1+deb.sury.org+1");
 const STATUS_NO_HELPER = { stdout: "helper=0\nphp_cli=8.3.6\n" };
 const STATUS_SUDO_DENIED = { stdout: "helper=1\nhelper_rc=1\nphp_cli=8.3.6\n", stderr: "sudo: a password is required\n", code: 0 };
 
@@ -167,7 +190,7 @@ describe("helper arguments and the fixed commands", () => {
   });
 
   it("every fixed command survives the destructive-command deny list", () => {
-    for (const cmd of [HOST_STATUS_COMMAND, PREPARE_CMD, WINGS_CMD, UPGRADE_CMD, UPGRADE_CMD_PINNED_SKIP, COMPOSER_CMD, helperCommand("status")]) {
+    for (const cmd of [HOST_STATUS_COMMAND, PREPARE_CMD, WINGS_CMD, UPGRADE_CMD, UPGRADE_CMD_PINNED_SKIP, COMPOSER_CMD, APT_84_CMD, helperCommand("status")]) {
       expect(checkCommand(cmd).allowed, cmd).toBe(true);
     }
   });
@@ -213,6 +236,21 @@ describe("helper output parsing", () => {
     expect(bad).toMatchObject({ failedStep: "composer-install", maintenance: true, dbBackup: "skipped", stepsDone: ["download-release", "download-checksum"] });
     expect(parseUpgradeResult("panel_before=1.0.0-rc.1\npanel_after=1.0.0-rc.1\nalready_current=1\n").alreadyCurrent).toBe(true);
     expect(parseUpgradeResult("").maintenance).toBeUndefined();
+  });
+
+  it("parses apt-cache policy, the upstream PHP version, and which PHP serves the panel", () => {
+    expect(parseAptPolicy(APT_84_BEHIND.stdout)).toEqual({ installed: "8.4.26-1+ubuntu24.04.1+deb.sury.org+1", candidate: "8.4.27-1+ubuntu24.04.1+deb.sury.org+1" });
+    expect(parseAptPolicy("php8.4-fpm:\n  Installed: (none)\n  Candidate: 8.4.27-1\n")).toEqual({ installed: undefined, candidate: "8.4.27-1" });
+    expect(parseAptPolicy("")).toEqual({ installed: undefined, candidate: undefined });
+    expect(upstreamPhpVersion("8.4.27-1+ubuntu24.04.1+deb.sury.org+1")).toBe("8.4.27");
+    expect(upstreamPhpVersion("1:8.4.27-2")).toBe("8.4.27");
+    expect(servingPhpMinor(parseHostStatus(STATUS_84.stdout))).toBe("8.4");
+    // The nginx socket wins over the CLI default: it is what the panel's requests hit.
+    expect(servingPhpMinor(parseHostStatus(status({ php_default: "8.4", nginx_socket: "/run/php/php8.3-fpm.sock" })))).toBe("8.3");
+    expect(servingPhpMinor(parseHostStatus(STATUS_NO_HELPER.stdout))).toBe("8.3");
+    expect(servingPhpMinor(parseHostStatus("helper=0\n"))).toBeUndefined();
+    expect(phpPackagePolicyCommand("8.4")).toBe("LC_ALL=C apt-cache policy php8.4-fpm 2>/dev/null");
+    expect(() => phpPackagePolicyCommand("8.4; id")).toThrow(/major\.minor/);
   });
 
   it("reads the version out of `wings version` output", () => {
@@ -352,6 +390,17 @@ describe("runtimeReport", () => {
     expect(text).toContain("that is the latest Wings release.");
   });
 
+  it("reports the php-fpm package against its apt candidate", () => {
+    const base = { status: parseHostStatus(STATUS_84.stdout) };
+    const behind = runtimeReport({ ...base, phpPackage: { phpVersion: "8.4", policy: parseAptPolicy(APT_84_BEHIND.stdout) } });
+    expect(behind).toMatch(/Package php8.4-fpm is BEHIND: .* PHP 8.4.26 → 8.4.27 .* patchUpdate: true\./);
+    const same = runtimeReport({ ...base, phpPackage: { phpVersion: "8.4", policy: { installed: "8.4.27-1", candidate: "8.4.27-1" } } });
+    expect(same).toContain("Package php8.4-fpm 8.4.27-1 matches the apt candidate");
+    expect(runtimeReport({ ...base, phpPackage: { phpVersion: "8.4", policy: {} } })).toContain("Package php8.4-fpm: not installed according to apt");
+    expect(runtimeReport({ ...base, phpPackage: { phpVersion: "8.4", policy: { installed: "8.4.27-1" } } })).toContain("apt reports no candidate");
+    expect(runtimeReport(base)).not.toContain("Package php");
+  });
+
   it("reports an unusable helper instead of guessing the Wings version", () => {
     const text = runtimeReport({ status: parseHostStatus(STATUS_NO_HELPER.stdout), helperProblem: "the host helper is not installed (…)" });
     expect(text).toContain("Wings version: unknown — it is read by the host helper");
@@ -436,7 +485,7 @@ describe("scripts/host/skeleton-key-pelican-host.sh", () => {
 describe("panel_version reports the whole upgrade story in one read", () => {
   it("installed/latest + PHP vs requirement + Wings vs latest + helper state", async () => {
     mockGithub();
-    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_83, [COMPOSER_CMD]: COMPOSER_LINE });
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_83, [COMPOSER_CMD]: COMPOSER_LINE, [APT_83_CMD]: APT_83_CURRENT });
     const res = await tool("panel_version").run({}, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("installed **1.0.0-beta35**, latest released **v1.0.0-rc.1**. An upgrade is available");
@@ -445,12 +494,24 @@ describe("panel_version reports the whole upgrade story in one read", () => {
     expect(res.text).toContain("requires PHP ^8.4 || ^8.5 — NOT met by 8.3.6. Run panel_prepare_runtime (phpVersion '8.4')");
     expect(res.text).toContain("Wings 1.0.0-beta22 (service active); latest Wings release v1.0.0-rc.1 — behind");
     expect(res.text).toContain("Host helper: installed (v1), sudo rule works.");
-    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD]);
+    expect(res.text).toContain("Package php8.3-fpm 8.3.6-1+ubuntu24.04.1+deb.sury.org+1 matches the apt candidate");
+    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD, APT_83_CMD]);
+  });
+
+  it("flags a php-fpm package behind its apt candidate and names the patchUpdate call", async () => {
+    mockGithub();
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_84, [COMPOSER_CMD]: COMPOSER_LINE, [APT_84_CMD]: APT_84_BEHIND });
+    const res = await tool("panel_version").run({}, ctx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("Package php8.4-fpm is BEHIND: installed 8.4.26-1+ubuntu24.04.1+deb.sury.org+1, apt candidate 8.4.27-1+ubuntu24.04.1+deb.sury.org+1");
+    expect(res.text).toContain("PHP 8.4.26 → 8.4.27 is a same-minor patch release");
+    expect(res.text).toContain("Run panel_prepare_runtime with phpVersion '8.4' and patchUpdate: true.");
+    expect(sent).toEqual([VERSION_CMD, HOST_STATUS_COMMAND, COMPOSER_CMD, APT_84_CMD]);
   });
 
   it("still answers when the helper is not installed, with the install steps", async () => {
     mockGithub();
-    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_NO_HELPER, [COMPOSER_CMD]: COMPOSER_LINE });
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_NO_HELPER, [COMPOSER_CMD]: COMPOSER_LINE, [APT_83_CMD]: APT_83_CURRENT });
     const res = await tool("panel_version").run({}, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("installed **1.0.0-beta35**");
@@ -462,7 +523,7 @@ describe("panel_version reports the whole upgrade story in one read", () => {
 
   it("names the one sudoers line when the helper is installed but sudo refuses", async () => {
     mockGithub();
-    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_SUDO_DENIED, [COMPOSER_CMD]: COMPOSER_LINE });
+    host({ [VERSION_CMD]: VERSION_LINE, [HOST_STATUS_COMMAND]: STATUS_SUDO_DENIED, [COMPOSER_CMD]: COMPOSER_LINE, [APT_83_CMD]: APT_83_CURRENT });
     const res = await tool("panel_version").run({}, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toMatch(/Host helper: sudo refused to run the host helper without a password for SSH user 'skeleton'/);
@@ -565,6 +626,76 @@ describe("panel_prepare_runtime", () => {
     expect(res.text).toContain("Next: panel_upgrade");
     expect(sent).toEqual([HOST_STATUS_COMMAND, COMPOSER_CMD, PREPARE_CMD]);
     expect(vi.mocked(runSsh).mock.calls.find((c) => c[2] === PREPARE_CMD)![3]).toEqual({ timeoutMs: 600_000 });
+  });
+
+  describe("patchUpdate (same-minor security patch)", () => {
+    const STATUS_84_PATCHED = { stdout: `PHP 8.4.27 (cli)\n${status({ php_cli: "8.4.27", php_default: "8.4", php_installed: "8.3 8.4", php_fpm_active: "8.3 8.4", nginx_socket: "/run/php/php8.4-fpm.sock" })}` };
+    const STATUS_84_26 = { stdout: status({ php_cli: "8.4.26", php_default: "8.4", php_installed: "8.3 8.4", php_fpm_active: "8.3 8.4", nginx_socket: "/run/php/php8.4-fpm.sock" }) };
+
+    it("runs php-prepare even though the requirement is met, and reports the patch", async () => {
+      host({ [HOST_STATUS_COMMAND]: STATUS_84_26, [APT_84_CMD]: APT_84_BEHIND, [PREPARE_CMD]: STATUS_84_PATCHED });
+      const res = await prepare({ phpVersion: "8.4", patchUpdate: true });
+      expect(res.isError).toBeFalsy();
+      expect(res.text).toContain("Patch-updated PHP 8.4 on host 'panel-host': PHP CLI **8.4.26 → 8.4.27**");
+      expect(res.text).not.toContain("did not change");
+      expect(sent).toEqual([HOST_STATUS_COMMAND, APT_84_CMD, PREPARE_CMD]);
+      expect(vi.mocked(runSsh).mock.calls.find((c) => c[2] === PREPARE_CMD)![3]).toEqual({ timeoutMs: 600_000 });
+    });
+
+    it("needs no GitHub read — a patch is independent of the next panel release", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+      host({ [HOST_STATUS_COMMAND]: STATUS_84_26, [APT_84_CMD]: APT_84_BEHIND, [PREPARE_CMD]: STATUS_84_PATCHED });
+      const res = await prepare({ phpVersion: "8.4", patchUpdate: true });
+      expect(res.isError).toBeFalsy();
+      expect(vi.mocked(fetch as unknown as (...a: unknown[]) => unknown)).not.toHaveBeenCalled();
+    });
+
+    it("says so when apt had nothing newer", async () => {
+      host({ [HOST_STATUS_COMMAND]: STATUS_84, [APT_84_CMD]: APT_84_BEHIND, [PREPARE_CMD]: STATUS_84 });
+      const res = await prepare({ phpVersion: "8.4", patchUpdate: true });
+      expect(res.isError).toBeFalsy();
+      expect(res.text).toContain("PHP CLI **8.4.1 → 8.4.1**");
+      expect(res.text).toContain("The version did not change");
+    });
+
+    it("refuses a phpVersion other than the one serving the panel — a patch never switches the runtime", async () => {
+      host({ [HOST_STATUS_COMMAND]: STATUS_83 });
+      const res = await prepare({ phpVersion: "8.4", patchUpdate: true });
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/patchUpdate only patches the PHP release already serving the panel, which is 8.3 on 'panel-host', not 8.4/);
+      expect(sent).toEqual([HOST_STATUS_COMMAND]);
+    });
+
+    it("still patches an older minor that the next release would not accept", async () => {
+      host({ [HOST_STATUS_COMMAND]: STATUS_83, [APT_83_CMD]: APT_83_CURRENT, [PREPARE_CMD_83]: { stdout: status({ php_cli: "8.3.7" }) } });
+      const res = await prepare({ phpVersion: "8.3", patchUpdate: true });
+      expect(res.isError).toBeFalsy();
+      expect(res.text).toContain("PHP CLI **8.3.6 → 8.3.7**");
+      expect(sent).toEqual([HOST_STATUS_COMMAND, APT_83_CMD, PREPARE_CMD_83]);
+    });
+
+    it("refuses patchUpdate combined with a release, and stops on a helper problem before php-prepare", async () => {
+      host({});
+      let res = await prepare({ phpVersion: "8.4", patchUpdate: true, release: "v1.0.0-rc.1" });
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/'release' does not apply/);
+      expect(sent).toEqual([]);
+
+      host({ [HOST_STATUS_COMMAND]: STATUS_SUDO_DENIED });
+      res = await prepare({ phpVersion: "8.3", patchUpdate: true });
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/Cannot patch the runtime: sudo refused/);
+      expect(res.text).toContain(sudoersLine("skeleton"));
+      expect(sent.some((c) => c.includes("php-prepare"))).toBe(false);
+    });
+
+    it("confirm says patch update, names the host, the minor and the helper", () => {
+      const text = tool("panel_prepare_runtime").confirm!({ phpVersion: "8.4", patchUpdate: true }, panelTarget);
+      expect(text).toContain("PATCH-UPDATE PHP 8.4 on Pelican host 'panel-host'");
+      expect(text).toContain("newest 8.4.x");
+      expect(text).toContain("restart php8.4-fpm + nginx");
+      expect(text).toContain(`${HELPER_PATH} via sudo -n and nothing else`);
+    });
   });
 
   it("honours an explicit release tag and reports a helper refusal verbatim", async () => {
