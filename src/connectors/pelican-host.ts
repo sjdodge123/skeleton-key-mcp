@@ -118,6 +118,49 @@ export const HOST_STATUS_COMMAND =
   `if [ "$rc" -ne 0 ]; then echo helper=1; echo "helper_rc=$rc"; ${PHP_CLI_PROBE}; fi; ` +
   `else echo helper=0; ${PHP_CLI_PROBE}; fi`;
 
+/**
+ * Unprivileged apt read of the php<8.N>-fpm package: installed version vs the
+ * candidate apt would install. It reads the host's cached package lists (only
+ * root can refresh them), so "current" means "as of the last apt update" — the
+ * helper's `php-prepare` refreshes the lists itself before installing.
+ */
+export function phpPackagePolicyCommand(phpVersion: string): string {
+  return `LC_ALL=C apt-cache policy php${assertPhpVersionArg(phpVersion)}-fpm 2>/dev/null`;
+}
+
+export interface AptPolicy {
+  /** Undefined when the package is not installed (`Installed: (none)`). */
+  installed?: string;
+  candidate?: string;
+}
+
+/** `apt-cache policy` output → installed / candidate versions. */
+export function parseAptPolicy(stdout: string): AptPolicy {
+  const field = (name: string): string | undefined => {
+    const v = new RegExp(`^\\s*${name}:\\s*(\\S+)`, "m").exec(stdout)?.[1];
+    return v && v !== "(none)" ? v : undefined;
+  };
+  return { installed: field("Installed"), candidate: field("Candidate") };
+}
+
+/** "8.4.27" out of a Debian package version like "8.4.27-1+ubuntu24.04.1+deb.sury.org+1". */
+export function upstreamPhpVersion(debVersion: string): string {
+  return /^(?:\d+:)?(\d+\.\d+\.\d+)/.exec(debVersion)?.[1] ?? debVersion;
+}
+
+/**
+ * The PHP major.minor actually serving the panel: the nginx fastcgi socket's
+ * version first (that is what php-fpm requests hit), then the CLI default, then
+ * the CLI version itself.
+ */
+export function servingPhpMinor(s: HostStatus): string | undefined {
+  const fromSocket = /\/php(8\.\d{1,2})-fpm\.sock$/.exec(s.nginxSocket ?? "")?.[1];
+  if (fromSocket) return fromSocket;
+  if (s.phpDefault && /^8\.\d{1,2}$/.test(s.phpDefault)) return s.phpDefault;
+  const cli = /^(8\.\d{1,2})\./.exec(s.phpCli ?? "")?.[1];
+  return cli;
+}
+
 /** The installed panel's own `require.php` line — one line, never the whole file. */
 export function currentPhpRequirementCommand(panelPath: string): string {
   return `grep -m1 -E '^[[:space:]]*"php"[[:space:]]*:' ${panelPath}/composer.json`;
@@ -551,6 +594,8 @@ export interface RuntimeReportInput {
   releaseRequirementError?: string;
   latestWingsTag?: string;
   latestWingsError?: string;
+  /** The PHP minor serving the panel and its php<ver>-fpm apt picture. */
+  phpPackage?: { phpVersion: string; policy: AptPolicy };
 }
 
 /** Human text: PHP picture, the requirement verdict, Wings, and the helper state. */
@@ -568,6 +613,24 @@ export function runtimeReport(i: RuntimeReportInput): string {
     lines.push(`PHP ${s.phpCli}${extras.length ? ` (${extras.join("; ")})` : ""}${nginx}.`);
   } else {
     lines.push("PHP version: unknown — the host did not answer the php probe.");
+  }
+
+  if (i.phpPackage) {
+    const { phpVersion: v, policy: p } = i.phpPackage;
+    const pkg = `php${v}-fpm`;
+    if (!p.installed) {
+      lines.push(`Package ${pkg}: not installed according to apt (or apt-cache could not be read).`);
+    } else if (!p.candidate) {
+      lines.push(`Package ${pkg} ${p.installed}: apt reports no candidate, so pending patch releases are unknown.`);
+    } else if (p.installed !== p.candidate) {
+      // apt never offers a downgrade as the candidate, so a differing candidate is an upgrade.
+      lines.push(
+        `Package ${pkg} is BEHIND: installed ${p.installed}, apt candidate ${p.candidate} — PHP ${upstreamPhpVersion(p.installed)} → ${upstreamPhpVersion(p.candidate)} ` +
+          `is a same-minor patch release (this is how PHP security fixes ship). Run panel_prepare_runtime with phpVersion '${v}' and patchUpdate: true.`,
+      );
+    } else {
+      lines.push(`Package ${pkg} ${p.installed} matches the apt candidate (as of the host's last package-list refresh).`);
+    }
   }
 
   if (i.releaseTag) {

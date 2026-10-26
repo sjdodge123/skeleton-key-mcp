@@ -107,6 +107,20 @@ describe("read-only policy: every command of a compound line is vetted", () => {
     ]) no(cmd);
   });
 
+  it("allows the PVE upgrade checklists, failed-unit listing and kernel-module reads", () => {
+    for (const cmd of [
+      "pve8to9", "pve8to9 --full", "pve7to8 --full", "pve8to9 --full 2>&1 | grep -E 'FAIL|WARN'",
+      "systemctl --failed", "systemctl --failed --no-pager --no-legend", "systemctl --failed --plain | wc -l", "pve8to9 >/dev/null 2>&1", "systemctl --failed 2>/dev/null",
+      "modinfo r8125", "modinfo -F version r8169", "modinfo -k 7.0.14-pve r8125", "dkms status", "dkms status -m r8125",
+    ]) ok(cmd);
+    for (const cmd of [
+      "pve8to9 --fix", "pve8to9 2>&1 --force", "pve8to9 >/dev/null --force", "pve8to9 --full --force", "pve8to9; apt dist-upgrade", "pve9to10",
+      "systemctl --failed restart pvestatd", "systemctl --failed --now stop pvestatd", "systemctl --failed; systemctl reset-failed",
+      "systemctl reset-failed", "dkms install r8125/9.016.01", "dkms remove r8125/9.016.01 --all", "dkms build r8125",
+      "modprobe -r r8169", "insmod r8125.ko", "rmmod r8169", "depmod -a",
+    ]) no(cmd);
+  });
+
   it("refuses mutating subcommands of the Proxmox / hardware tools", () => {
     for (const cmd of [
       "pvesm remove nvme", "pvesm set nvme --disable 1", "qm set 100 --delete unused0", "qm stop 100",

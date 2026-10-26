@@ -367,6 +367,16 @@ export function assertForwardAllowed(rule: ForwardIntent, protectedList: Protect
   }
 }
 
+/**
+ * True when an update_port_forward patch can only reduce exposure: it sets
+ * `enabled: false` and every other supplied field equals the stored value, so
+ * the merged rule is the stored rule, switched off. Exported for testing.
+ */
+export function isDisableOnlyPatch(current: Record<string, unknown>, patch: Record<string, unknown>): boolean {
+  if (patch.enabled !== false) return false;
+  return Object.entries(patch).every(([k, v]) => k === "enabled" || JSON.stringify(current[k]) === JSON.stringify(v));
+}
+
 /** UniFi client bound to one target — resolves auth + API prefix lazily, once. */
 class UniFi {
   private cookie: string | null = null;
@@ -903,7 +913,12 @@ class UniFi {
     if (!Object.keys(patch).length) throw new Error("update_port_forward needs at least one field to change.");
 
     const updated: UniFiPortForward = { ...current, ...patch };
-    assertForwardAllowed(updated, protectedList);
+    // Disabling a rule only ever removes exposure, so a patch whose sole effect
+    // is enabled → false skips the screen — otherwise a forward that predates the
+    // deny-list (e.g. WAN 443 → the reverse proxy) could never be switched off.
+    // Anything else, re-enabling included, is screened as before.
+    const disableOnly = isDisableOnlyPatch(current, patch);
+    if (!disableOnly) assertForwardAllowed(updated, protectedList);
 
     const path = `/rest/portforward/${current._id}`;
     const res = await this.api(path, { method: "PUT", body: updated });
@@ -916,6 +931,7 @@ class UniFi {
       .join(", ");
     return (
       `Updated UniFi port-forward [${current._id}] on ${this.target.name}: ${before} → ${after}. Changed ${fields}. ` +
+      `${disableOnly ? "Disable-only change, so the forward guardrails were not applied; re-enabling it is screened as usual. " : ""}` +
       `${UniFi.PROVISION_NOTE} Revert by calling update_port_forward with the prior values above.`
     );
   }
@@ -1214,7 +1230,9 @@ function buildTools(target: Target): ConnectorTool[] {
         `Change an existing WAN port-forward on ${target.name} — retarget it, change ports/protocol, or enable/disable it. ` +
         `Identify the rule by the id from list_port_forwards (or its exact name). Only the fields you pass change; the rest of ` +
         `the rule is preserved by a server-side read-modify-write, and the result reports prior → new state so you can revert. ` +
-        `${GUARDRAIL_HINT} The guardrails are checked against the MERGED rule, so a partial change can't sidestep them. ` +
+        `${GUARDRAIL_HINT} The guardrails are checked against the MERGED rule, so a partial change can't sidestep them — except a ` +
+        `change whose only effect is enabled → false, which is always allowed because disabling a forward only removes exposure ` +
+        `(re-enabling is screened as usual). ` +
         `${ALLOCATION_HINT} Run force_provision afterwards.`,
       tier: "execute",
       inputSchema: z.object({

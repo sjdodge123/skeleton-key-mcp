@@ -28,6 +28,10 @@ import {
   runtimeReport,
   sshUserOf,
   compareVersions,
+  phpPackagePolicyCommand,
+  parseAptPolicy,
+  servingPhpMinor,
+  type AptPolicy,
   type HostStatus,
 } from "./pelican-host.js";
 export { compareVersions } from "./pelican-host.js";
@@ -2242,6 +2246,14 @@ async function readCurrentPhpRequirement(host: PanelHost): Promise<string | unde
   return res.code === 0 ? composerPhpRequirement(res.stdout) : undefined;
 }
 
+/** The apt picture of the php-fpm package serving the panel (best-effort, unprivileged). */
+async function readPhpPackagePolicy(host: PanelHost, status: HostStatus): Promise<{ phpVersion: string; policy: AptPolicy } | undefined> {
+  const phpVersion = servingPhpMinor(status);
+  if (!phpVersion) return undefined;
+  const res = await runOnPanelHost(host, phpPackagePolicyCommand(phpVersion));
+  return { phpVersion, policy: parseAptPolicy(res.stdout) };
+}
+
 /**
  * Installed version + latest release + the host runtime picture (PHP, the nginx
  * socket, Wings, the helper) so the whole upgrade story is one read. The runtime
@@ -2273,11 +2285,13 @@ async function panelVersion(ctx: ToolContext): Promise<string> {
 
   const { status, problem } = await readHostStatus(host);
   const current = await readCurrentPhpRequirement(host);
+  const phpPackage = await readPhpPackagePolicy(host, status);
   const release = latest.tag ? await fetchReleasePhpRequirement(latest.tag) : { error: "latest release unknown" };
   const wingsLatest = await latestWingsRelease();
   const runtime = runtimeReport({
     status,
     helperProblem: problem,
+    phpPackage,
     installedPanel: installed,
     currentPhpRequirement: current,
     releaseTag: latest.tag,
@@ -2403,8 +2417,12 @@ async function panelUpgrade(ctx: ToolContext, input: { expectVersion: string; sk
  * at panel_upgrade — and (3) the helper is installed and sudo-able. Only then is
  * the single fixed command `sudo -n <helper> php-prepare '<8.N>'` sent.
  */
-async function panelPrepareRuntime(ctx: ToolContext, input: { phpVersion: string; release?: string }): Promise<string> {
+async function panelPrepareRuntime(ctx: ToolContext, input: { phpVersion: string; release?: string; patchUpdate?: boolean }): Promise<string> {
   const phpVersion = assertPhpVersionArg(input.phpVersion);
+  if (input.patchUpdate) {
+    if (input.release) throw new Error(`patchUpdate patches the PHP release already serving the panel; 'release' does not apply to it — pass one or the other.`);
+    return panelPatchRuntime(ctx, phpVersion);
+  }
   const host = await panelHost(ctx);
   const user = sshUserOf(host.cred);
 
@@ -2461,6 +2479,44 @@ async function panelPrepareRuntime(ctx: ToolContext, input: { phpVersion: string
     `${after.phpDefault ? ` (default php${after.phpDefault})` : ""}, nginx fastcgi socket ${after.nginxSocket ?? "(unreadable)"}` +
     `${after.phpFpmActive.length ? `, php-fpm active: ${after.phpFpmActive.join(", ")}` : ""}. ` +
     `The previous PHP release stays installed as the rollback point (nginx site backups end in .bak-skeleton-key). Next: panel_upgrade with expectVersion = the installed version.`
+  );
+}
+
+/**
+ * Same-minor PHP patch update (e.g. 8.4.26 → 8.4.27 for a security fix) through
+ * the SAME fixed `php-prepare '<8.N>'` — the helper's `apt-get update` + `apt-get
+ * install php<8.N>-*` upgrades the installed packages, and its CLI-default /
+ * nginx-socket steps are no-ops when nothing switches. Refused unless <8.N> is
+ * the release already serving the panel: a patch never switches the runtime, so
+ * the release-requirement gates of a switch do not apply.
+ */
+async function panelPatchRuntime(ctx: ToolContext, phpVersion: string): Promise<string> {
+  const host = await panelHost(ctx);
+  const user = sshUserOf(host.cred);
+  const { status, problem } = await readHostStatus(host);
+  if (problem) throw new Error(`Cannot patch the runtime: ${problem}`);
+  const serving = servingPhpMinor(status);
+  if (!serving) throw new Error(`Refusing: could not tell which PHP release serves the panel on '${host.target.name}' (no nginx socket, CLI default or CLI version read).`);
+  if (serving !== phpVersion) {
+    throw new Error(
+      `Refusing: patchUpdate only patches the PHP release already serving the panel, which is ${serving} on '${host.target.name}', not ${phpVersion}. ` +
+        `Switching releases is a runtime change — run panel_prepare_runtime without patchUpdate for that.`,
+    );
+  }
+  const before = await readPhpPackagePolicy(host, status);
+
+  const res = await runOnPanelHost(host, helperCommand("php-prepare", phpVersion), 600_000);
+  if (res.code !== 0) {
+    throw new Error(`php-prepare ${phpVersion} (patch update) FAILED on '${host.target.name}' — ${helperFailureText(classifyHelperFailure(res), user, res, "php-prepare")}`);
+  }
+  const after = parseHostStatus(res.stdout);
+  const was = status.phpCli ?? before?.policy.installed ?? "(unreadable)";
+  const now = after.phpCli ?? "(unreadable)";
+  return (
+    `Patch-updated PHP ${phpVersion} on host '${host.target.name}': PHP CLI **${was} → ${now}**` +
+    `${after.phpFpmActive.length ? `, php-fpm active: ${after.phpFpmActive.join(", ")}` : ""}, nginx fastcgi socket ${after.nginxSocket ?? "(unreadable)"}. ` +
+    `${was === now ? `The version did not change — after apt-get update there was no newer php${phpVersion} package in the configured sources. ` : ""}` +
+    `php${phpVersion}-fpm and nginx were restarted; run panel_version to confirm the package now matches the apt candidate.`
   );
 }
 
@@ -2914,7 +2970,8 @@ function buildTools(target: Target): ConnectorTool[] {
         `never general sudo; a missing helper or a denied sudo returns the exact install steps. Run panel_version first: it reports the ` +
         `release's PHP requirement and the phpVersion to pass. This tool fetches the release's composer.json, refuses a phpVersion that does ` +
         `not satisfy it, refuses if the INSTALLED panel could not run on that PHP (the runtime switches now, the code only at panel_upgrade), ` +
-        `and is a no-op when the host already meets it. On the host: ppa:ondrej/php if missing, php<ver> + fpm/cli/gd/mysql/mbstring/bcmath/` +
+        `and is a no-op when the host already meets it — unless patchUpdate is set, which re-runs the helper on the PHP release already ` +
+        `serving the panel to pull a same-minor patch (security) release. On the host: ppa:ondrej/php if missing, php<ver> + fpm/cli/gd/mysql/mbstring/bcmath/` +
         `xml/curl/zip/intl/sqlite3, the CLI default, the panel site's fastcgi_pass socket (only in nginx files that mention the panel root), ` +
         `nginx -t, then restart php-fpm + nginx. The previous PHP release stays installed as the rollback point.`,
       tier: "execute",
@@ -2927,10 +2984,24 @@ function buildTools(target: Target): ConnectorTool[] {
           .string()
           .optional()
           .describe("Panel release tag to prepare for, e.g. 'v1.0.0-rc.1'. Default: the latest release, which is what panel_upgrade installs."),
+        patchUpdate: z
+          .boolean()
+          .optional()
+          .describe(
+            "Apply a same-minor PHP patch release (e.g. 8.4.26 → 8.4.27, how PHP security fixes ship) even though the requirement is already met. " +
+              "phpVersion must be the release already serving the panel; 'release' does not apply. panel_version says when the php-fpm package is behind apt.",
+          ),
       }),
       confirm: (input, t) => {
-        const i = input as { phpVersion: string; release?: string };
+        const i = input as { phpVersion: string; release?: string; patchUpdate?: boolean };
         const o = options(t);
+        if (i.patchUpdate) {
+          return (
+            `PATCH-UPDATE PHP ${i.phpVersion} on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}': apt-get update, then upgrade php${i.phpVersion} ` +
+            `and Pelican's extensions to the newest ${i.phpVersion}.x in the configured sources, and restart php${i.phpVersion}-fpm + nginx ` +
+            `(no runtime switch); runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
+          );
+        }
         return (
           `PREPARE the PHP runtime on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}': install PHP ${i.phpVersion} (ppa:ondrej/php + ` +
           `Pelican's extensions), make it the CLI default, switch the panel's nginx fastcgi socket to php${i.phpVersion}-fpm and restart ` +
@@ -2939,7 +3010,7 @@ function buildTools(target: Target): ConnectorTool[] {
       },
       run: async (input, ctx) => {
         try {
-          return ok(await panelPrepareRuntime(ctx, input as { phpVersion: string; release?: string }));
+          return ok(await panelPrepareRuntime(ctx, input as { phpVersion: string; release?: string; patchUpdate?: boolean }));
         } catch (e) {
           return { text: `Pelican error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
         }

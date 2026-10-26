@@ -12,6 +12,7 @@ import {
   describePortForward,
   summarizePortForwards,
   assertForwardAllowed,
+  isDisableOnlyPatch,
 } from "./unifi.js";
 import type { Credential, ProtectedHost, Target, ToolContext } from "./types.js";
 
@@ -1321,6 +1322,56 @@ describe("update_port_forward", () => {
     expect(res2.isError).toBe(true);
     expect(res2.text).toContain("destination port 22 (SSH)");
     expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("allows DISABLING a rule that touches a deny-listed port (WAN 443 → the reverse proxy)", async () => {
+    const { calls, state } = mockPf();
+    const res = await tool("update_port_forward").run({ rule: "npm", enabled: false }, pfCtx());
+    expect(res.isError).toBeFalsy();
+    expect(res.text).toContain("Changed enabled: true → false");
+    expect(res.text).toContain("Disable-only change, so the forward guardrails were not applied");
+    const put = writes(calls).find((c) => c.init.method === "PUT")!;
+    expect(put.url).toMatch(/\/rest\/portforward\/pf1$/);
+    // The stored rule, switched off — nothing else moves.
+    expect(JSON.parse(put.init.body)).toEqual({ ...RULES[0], enabled: false });
+    expect(state[0].enabled).toBe(false);
+  });
+
+  it("allows a disable that restates unchanged fields, but screens any other change riding along", async () => {
+    const { calls } = mockPf();
+    const ok = await tool("update_port_forward").run({ rule: "pf1", enabled: false, wanPort: "443", destination: "192.168.0.230" }, pfCtx());
+    expect(ok.isError).toBeFalsy();
+    expect(writes(calls)).toHaveLength(1);
+
+    for (const extra of [{ name: "npm-off" }, { log: false }, { destinationPort: "4444" }, { source: "203.0.113.0/24" }]) {
+      const res = await tool("update_port_forward").run({ rule: "pf1", enabled: false, ...extra }, pfCtx());
+      expect(res.isError, JSON.stringify(extra)).toBe(true);
+      expect(res.text).toContain("WAN port 443 (HTTPS admin / reverse proxy)");
+    }
+    // A disable that also points the rule at a protected host is still refused.
+    const res = await tool("update_port_forward").run({ rule: "pf2", enabled: false, destination: "192.168.0.1" }, pfCtx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("the UniFi gateway itself");
+    expect(writes(calls)).toHaveLength(1);
+  });
+
+  it("still refuses RE-enabling a deny-listed rule", async () => {
+    const { calls } = mockPf([{ ...RULES[0], enabled: false }, RULES[1]]);
+    const res = await tool("update_port_forward").run({ rule: "npm", enabled: true }, pfCtx());
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("Refusing to forward WAN port 443");
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it("isDisableOnlyPatch: enabled:false plus only unchanged fields", () => {
+    const cur = { enabled: true, fwd: "192.168.0.230", dst_port: "443" };
+    expect(isDisableOnlyPatch(cur, { enabled: false })).toBe(true);
+    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.0.230" })).toBe(true);
+    expect(isDisableOnlyPatch({ fwd: "x" }, { enabled: false })).toBe(true); // enabled missing = on
+    expect(isDisableOnlyPatch(cur, { enabled: true })).toBe(false);
+    expect(isDisableOnlyPatch(cur, { fwd: "192.168.0.230" })).toBe(false);
+    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.0.231" })).toBe(false);
+    expect(isDisableOnlyPatch(cur, { enabled: false, log: true })).toBe(false); // a field the rule lacks
   });
 
   it("FAILS CLOSED without a protected-host list", async () => {

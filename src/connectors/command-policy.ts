@@ -165,6 +165,10 @@ export function checkCommand(command: string, opts: CommandPolicyOptions = {}): 
   return { allowed: true };
 }
 
+/** Trailing redirections an end-anchored allow pattern admits — exactly the
+ *  forms `splitCompound` lets through (fd duplication, /dev/null). */
+const TRAILING_REDIRECTS = "(\\s+(\\d*|&)>{1,2}(&\\d+|&-|\\s*/dev/null))*";
+
 /** Read-only allowlist for the `run_readonly` tool: safe inspection commands.
  *  Every command of a compound line must match (see `splitCompound`). */
 export const READONLY_ALLOW: string[] = [
@@ -172,6 +176,8 @@ export const READONLY_ALLOW: string[] = [
   "^\\s*(wc|cut|tr|column|sort)\\b",
   "^\\s*(ps|top|htop|journalctl|dmesg|who|w|id|env|date)\\b",
   "^\\s*systemctl\\s+(status|list-units|list-unit-files|list-timers|is-active|is-enabled|is-failed|show|cat)\\b",
+  // `systemctl --failed` is `list-units --failed`; anchored so no verb can follow.
+  `^\\s*systemctl\\s+--failed(\\s+--(no-pager|no-legend|plain|full|all))*${TRAILING_REDIRECTS}\\s*$`,
   // `ip` takes abbreviated subcommands (`ip l s` = link set), so only an object
   // followed by nothing or an explicit show/list/get is admitted.
   "^\\s*ip(\\s+-\\S+)*\\s+(a|addr|address|r|route|l|link|n|neigh|neighbor|rule|maddr)(\\s+(show|list|lst|ls|get)\\b.*)?\\s*$",
@@ -180,8 +186,14 @@ export const READONLY_ALLOW: string[] = [
   // Hardware / block devices
   "^\\s*(lspci|lsusb|lsblk|lscpu|lsmod|findmnt|blkid|pvs|vgs|lvs)\\b",
   "^\\s*nvme\\s+(list|smart-log|id-ctrl|id-ns|error-log)\\b",
+  // Kernel modules: modinfo only reads module metadata; `dkms status` lists
+  // out-of-tree module builds per kernel (install/build/remove stay out).
+  "^\\s*modinfo\\b",
+  "^\\s*dkms\\s+status\\b",
   // Proxmox VE (read-only subcommands only)
   "^\\s*pveversion\\b",
+  // Major-upgrade checklists: read-only checks; `--full` is their only option.
+  `^\\s*pve(7to8|8to9)(\\s+--full)?${TRAILING_REDIRECTS}\\s*$`,
   "^\\s*pvesm\\s+(status|list|path)\\b",
   "^\\s*qm\\s+(config|status|list|listsnapshot|pending|showcmd)\\b",
   "^\\s*pct\\s+(config|status|list|listsnapshot|pending)\\b",
