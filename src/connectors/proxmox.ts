@@ -40,7 +40,7 @@ const optionsSchema = z
      *  Scoped per-request via an undici dispatcher, never process-global. */
     insecureTLS: z.boolean().default(true),
   })
-  .default({});
+  .prefault({});
 
 type Options = z.infer<typeof optionsSchema>;
 

@@ -50,7 +50,7 @@ const optionsSchema = z
     /** Connect / per-request timeout. */
     timeoutMs: z.number().int().min(1000).max(120_000).default(15_000),
   })
-  .default({});
+  .prefault({});
 
 type Options = z.infer<typeof optionsSchema>;
 

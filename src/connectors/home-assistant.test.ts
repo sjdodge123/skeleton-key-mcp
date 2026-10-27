@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { toolInputJsonSchema } from "../mcp/server.js";
 import {
   homeAssistantConnector,
   baseUrl,
@@ -223,12 +223,12 @@ describe("service-data schema (the double-encoding fix)", () => {
   it("advertises data as a JSON-schema object so clients transmit an object, not a string", () => {
     // The root cause of the old 400: an untyped ({}) schema made clients send the
     // structured value as a JSON string, which then got double-encoded.
-    const js = zodToJsonSchema(z.object({ data: serviceData }) as any, { $refStrategy: "none" }) as any;
+    const js = toolInputJsonSchema(z.object({ data: serviceData })) as any;
     expect(js.properties.data.type).toBe("object");
   });
 
   it("the ha_call_service tool schema exposes data as type:object", () => {
-    const js = zodToJsonSchema(tool("ha_call_service").inputSchema, { $refStrategy: "none" }) as any;
+    const js = toolInputJsonSchema(tool("ha_call_service").inputSchema) as any;
     expect(js.properties.data.type).toBe("object");
   });
 

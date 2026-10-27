@@ -22,7 +22,7 @@ const optionsSchema = z
      *  never mutates the process-global TLS setting. */
     insecureTLS: z.boolean().default(false),
   })
-  .default({});
+  .prefault({});
 
 function baseUrl(target: Target): string {
   return deriveBaseUrl(target, { baseUrl: optionsSchema.parse(target.options ?? {}).baseUrl });

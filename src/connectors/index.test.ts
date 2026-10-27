@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { registerableType, getConnector } from "./index.js";
+import { registerableType, getConnector, listConnectors } from "./index.js";
 
 describe("registerableType", () => {
   it("routes a fingerprint-confirmed detection to its bespoke connector", () => {
@@ -38,5 +38,17 @@ describe("registerableType", () => {
 
   it("proxmox is a registered connector", () => {
     expect(getConnector("proxmox")?.type).toBe("proxmox");
+  });
+});
+
+describe("connector configSchema defaults", () => {
+  it("an absent options block gets the same inner defaults as an empty one", () => {
+    // zod 4's `.default({})` returns `{}` without parsing it, which would drop
+    // e.g. proxmox's `insecureTLS: true`; the config schemas use `.prefault({})`.
+    for (const c of listConnectors()) {
+      expect(c.configSchema.parse(undefined), c.type).toEqual(c.configSchema.parse({}));
+    }
+    expect(getConnector("proxmox")!.configSchema.parse(undefined)).toMatchObject({ insecureTLS: true });
+    expect(getConnector("unifi")!.configSchema.parse(undefined)).toMatchObject({ site: "default", insecureTLS: true });
   });
 });

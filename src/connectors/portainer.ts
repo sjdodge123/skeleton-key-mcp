@@ -48,7 +48,7 @@ const optionsSchema = z
     /** If set, `exec_container` only runs commands matching one of these. */
     allowPatterns: z.array(z.string()).optional(),
   })
-  .default({});
+  .prefault({});
 
 type Options = z.infer<typeof optionsSchema>;
 
