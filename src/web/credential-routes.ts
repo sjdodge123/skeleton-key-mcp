@@ -340,36 +340,45 @@ export function buildCredentialRouter(app: AppState): Router {
     // value never lands. Audited as host + status only.
     let verification: VerificationOutcome = "skipped";
     if (request.verify) {
-      const templateValues: Record<string, string> = multi ? Object.fromEntries(values.map((v) => [v.name, v.value])) : { value: secret };
-      const result = await runVerifyProbe(request.verify, templateValues);
-      for (const k of Object.keys(templateValues)) delete templateValues[k];
-      const storeAnyway = firstStr(body.storeAnyway) === "1";
-      app.audit.record({
-        ts: new Date().toISOString(),
-        tool: "credential.verify",
-        target: result.host,
-        tier: "execute",
-        args: { name: request.name, host: result.host, status: result.status ?? null, storeAnyway },
-        status: result.ok ? "ok" : "error",
-        detail: result.ok
-          ? `verification probe passed (HTTP ${result.status}) for '${request.name}'`
-          : `verification probe failed for '${request.name}': ${result.reason}${storeAnyway ? " — stored anyway by user override" : ""}`,
-      });
-      if (result.ok) {
-        verification = "passed";
-      } else if (storeAnyway) {
-        verification = "failed";
-      } else {
+      // An unexpected throw past the claim (e.g. the audit write) must not strand
+      // the link as claimed with nothing stored: release it, then let it surface.
+      try {
+        const templateValues: Record<string, string> = multi ? Object.fromEntries(values.map((v) => [v.name, v.value])) : { value: secret };
+        const result = await runVerifyProbe(request.verify, templateValues);
+        for (const k of Object.keys(templateValues)) delete templateValues[k];
+        const storeAnyway = firstStr(body.storeAnyway) === "1";
+        app.audit.record({
+          ts: new Date().toISOString(),
+          tool: "credential.verify",
+          target: result.host,
+          tier: "execute",
+          args: { name: request.name, host: result.host, status: result.status ?? null, storeAnyway },
+          status: result.ok ? "ok" : "error",
+          detail: result.ok
+            ? `verification probe passed (HTTP ${result.status}) for '${request.name}'`
+            : `verification probe failed for '${request.name}': ${result.reason}${storeAnyway ? " — stored anyway by user override" : ""}`,
+        });
+        if (result.ok) {
+          verification = "passed";
+        } else if (storeAnyway) {
+          verification = "failed";
+        } else {
+          app.credentialRequests.release(request.id);
+          values = [];
+          secret = "";
+          res.status(400).type("html").send(
+            formPage(request, {
+              error: `Verification failed: ${result.reason}. Nothing was stored — double-check the value, or tick "store anyway" to override.`,
+              offerStoreAnyway: true,
+            }),
+          );
+          return;
+        }
+      } catch (err) {
         app.credentialRequests.release(request.id);
         values = [];
         secret = "";
-        res.status(400).type("html").send(
-          formPage(request, {
-            error: `Verification failed: ${result.reason}. Nothing was stored — double-check the value, or tick "store anyway" to override.`,
-            offerStoreAnyway: true,
-          }),
-        );
-        return;
+        throw err;
       }
     }
 

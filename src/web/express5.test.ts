@@ -7,7 +7,7 @@ import type { Server } from "node:http";
 import type { Request } from "express";
 import { authenticator } from "otplib";
 import type { AppState } from "../app.js";
-import { bodyOf, paramStr } from "./http-util.js";
+import { bodyOf, errorHandler, paramStr } from "./http-util.js";
 
 /**
  * The full HTTP app (buildHttpApp) under Express 5: the OAuth 2.1 flow end to
@@ -293,6 +293,30 @@ describe("Express 5: the final error handler", () => {
   });
 });
 
+describe("Express 5: errors past the credential claim", () => {
+  it("an unexpected throw after the claim releases the link instead of stranding it", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    const createLoginItem = vi.fn();
+    app.vault.createLoginItem = createLoginItem;
+    const req = app.credentialRequests.create({
+      name: "bot", host: "h", kind: "token", reason: "r",
+      verify: { method: "GET", url: "http://127.0.0.1:9/probe", headers: { Authorization: "Bot {{value}}" }, timeoutMs: 1000 },
+    });
+    const record = app.audit.record.bind(app.audit);
+    app.audit.record = (e) => {
+      if (e.tool === "credential.verify") throw new Error("SQLITE_FULL");
+      return record(e);
+    };
+    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: "tok-value" }));
+    expect(r.status).toBe(500);
+    expect(await r.text()).not.toContain("tok-value");
+    expect(createLoginItem).not.toHaveBeenCalled();
+    // Still claimable: the retry reaches the form again rather than "Already provided".
+    expect(app.credentialRequests.claim(req.id)).toBe(true);
+  });
+});
+
 describe("http-util narrowing helpers", () => {
   const req = (over: Partial<Request>): Request => over as Request;
 
@@ -309,5 +333,31 @@ describe("http-util narrowing helpers", () => {
     expect(bodyOf(req({ body: ["x"] }))).toEqual({});
     expect(bodyOf(req({ body: "x" }))).toEqual({});
     expect(bodyOf(req({ body: { a: "1" } }))).toEqual({ a: "1" });
+  });
+});
+
+describe("errorHandler", () => {
+  function run(err: unknown): { status: number; body: unknown } {
+    const out = { status: 0, body: undefined as unknown };
+    const res = {
+      headersSent: false,
+      status(code: number) { out.status = code; return res; },
+      json(b: unknown) { out.body = b; return res; },
+    };
+    errorHandler(err, {} as Request, res as never, () => {});
+    return out;
+  }
+
+  it("keeps an exposed client error's status (body-parser)", () => {
+    expect(run(Object.assign(new Error("Unexpected token"), { status: 400, expose: true, type: "entity.parse.failed" })))
+      .toEqual({ status: 400, body: { error: "Bad request." } });
+  });
+
+  it("treats an upstream error carrying a status as a server fault", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // Relaying a 401 would send MCP clients back into the OAuth flow.
+    expect(run(Object.assign(new Error("vault said no"), { status: 401 }))).toEqual({ status: 500, body: { error: "Internal server error." } });
+    expect(run(Object.assign(new Error("x"), { statusCode: 404 })).status).toBe(500);
+    expect(run("a string").status).toBe(500);
   });
 });

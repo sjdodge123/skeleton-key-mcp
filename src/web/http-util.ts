@@ -66,9 +66,14 @@ export function paramStr(req: Request, name: string): string | null {
  * body, oversized payload) are not, since their message may quote that body.
  */
 export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
-  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; name?: unknown; message?: unknown };
+  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; expose?: unknown; name?: unknown; message?: unknown };
+  // Only a client error raised by Express itself (http-errors from body-parser:
+  // malformed or oversized body) keeps its status. Anything else is a server
+  // fault, even if it carries a `status` from an upstream call — relaying, say,
+  // an upstream 401 would read as an auth failure and send MCP clients back
+  // into the OAuth flow.
   const raw = typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 500;
-  const status = raw >= 400 && raw < 600 ? raw : 500;
+  const status = e.expose === true && raw >= 400 && raw < 500 ? raw : 500;
   if (status >= 500) {
     console.error(`[skeleton-key] request failed: ${String(e.name ?? "Error")}: ${String(e.message ?? err)}`);
   }
