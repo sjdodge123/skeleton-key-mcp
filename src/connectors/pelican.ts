@@ -1,5 +1,5 @@
 import { z } from "zod";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "./types.js";
 import { deriveBaseUrl, tlsFetch, isPrivateIPv4 } from "./net.js";
 import { runSsh, MAX_SSH_TIMEOUT_MS, type SshExecResult } from "./ssh-exec.js";
