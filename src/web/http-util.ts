@@ -62,20 +62,25 @@ export function paramStr(req: Request, name: string): string | null {
  * stack outside production. The response carries only a fixed reason for the
  * status: never `err.message` (a body-parser JSON error quotes the request body,
  * which may be a passphrase or TOTP), never a stack, never the request `Host`.
- * Only server faults are logged, by name and message; client errors (malformed
- * body, oversized payload) are not, since their message may quote that body.
+ * Only server faults are logged, and only by error name and code: a message can
+ * quote request input (a body, a one-time link id) or a value from upstream.
+ * Client errors (malformed body or route param, oversized payload) are not
+ * logged at all.
  */
 export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
-  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; expose?: unknown; name?: unknown; message?: unknown };
-  // Only a client error raised by Express itself (http-errors from body-parser:
-  // malformed or oversized body) keeps its status. Anything else is a server
-  // fault, even if it carries a `status` from an upstream call — relaying, say,
-  // an upstream 401 would read as an auth failure and send MCP clients back
-  // into the OAuth flow.
+  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; expose?: unknown; name?: unknown; code?: unknown };
+  // Only a client error raised by Express itself keeps its status: http-errors
+  // from body-parser (malformed or oversized body, marked `expose`) and the
+  // router's URIError for a malformed percent-encoded route param (status 400,
+  // no `expose`). Anything else is a server fault, even if it carries a
+  // `status` from an upstream call — relaying, say, an upstream 401 would read
+  // as an auth failure and send MCP clients back into the OAuth flow.
   const raw = typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 500;
-  const status = e.expose === true && raw >= 400 && raw < 500 ? raw : 500;
+  const fromExpress = e.expose === true || (err instanceof URIError && raw === 400);
+  const status = fromExpress && raw >= 400 && raw < 500 ? raw : 500;
   if (status >= 500) {
-    console.error(`[skeleton-key] request failed: ${String(e.name ?? "Error")}: ${String(e.message ?? err)}`);
+    const code = typeof e.code === "string" || typeof e.code === "number" ? ` (${e.code})` : "";
+    console.error(`[skeleton-key] request failed: ${typeof e.name === "string" ? e.name : "Error"}${code}`);
   }
   if (res.headersSent) {
     next(err);

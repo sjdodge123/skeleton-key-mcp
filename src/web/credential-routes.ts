@@ -335,13 +335,23 @@ export function buildCredentialRouter(app: AppState): Router {
       res.type("html").send(messagePage("Already provided", "This credential was just stored. You can close this tab."));
       return;
     }
+    // Release at most once, and only while this request still holds the claim:
+    // once released, a concurrent submit may re-claim the link, and releasing
+    // again would drop THAT claim mid-write and reopen the race.
+    let ownsClaim = true;
+    const releaseClaim = (): void => {
+      if (!ownsClaim) return;
+      ownsClaim = false;
+      app.credentialRequests.release(request.id);
+    };
 
     // Optional verification probe — runs BEFORE the vault write so a wrong
     // value never lands. Audited as host + status only.
     let verification: VerificationOutcome = "skipped";
     if (request.verify) {
       // An unexpected throw past the claim (e.g. the audit write) must not strand
-      // the link as claimed with nothing stored: release it, then let it surface.
+      // the link as claimed with nothing stored: release it (if still ours), then
+      // let it surface.
       try {
         const templateValues: Record<string, string> = multi ? Object.fromEntries(values.map((v) => [v.name, v.value])) : { value: secret };
         const result = await runVerifyProbe(request.verify, templateValues);
@@ -363,7 +373,7 @@ export function buildCredentialRouter(app: AppState): Router {
         } else if (storeAnyway) {
           verification = "failed";
         } else {
-          app.credentialRequests.release(request.id);
+          releaseClaim();
           values = [];
           secret = "";
           res.status(400).type("html").send(
@@ -375,7 +385,7 @@ export function buildCredentialRouter(app: AppState): Router {
           return;
         }
       } catch (err) {
-        app.credentialRequests.release(request.id);
+        releaseClaim();
         values = [];
         secret = "";
         throw err;
@@ -417,7 +427,7 @@ export function buildCredentialRouter(app: AppState): Router {
       if (!multi && request.kind === "password") fingerprints.password = await app.fingerprint(secret);
     } catch (err) {
       // Roll the claim back so the user can retry the same link.
-      app.credentialRequests.release(request.id);
+      releaseClaim();
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${message}` }));
       return;

@@ -143,6 +143,15 @@ describe("OAuth 2.1 flow end to end into the MCP endpoint", () => {
     const names = (parseSse(await list.text()).result?.tools ?? []).map((t: { name: string }) => t.name);
     expect(names).toContain("get_started");
 
+    // Terminating the session needs auth too; with it, the session is gone.
+    const anonDel = await fetch(`${root}/mcp`, { method: "DELETE", headers: { ...MCP_H, "mcp-session-id": sid! } });
+    expect(anonDel.status).toBe(401);
+    const del = await fetch(`${root}/mcp`, { method: "DELETE", headers: SH });
+    expect(del.status).toBe(200);
+    const stale = await fetch(`${root}/mcp`, { method: "POST", headers: SH, body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }) });
+    expect(stale.status).toBe(404);
+    expect((await stale.json()).error.code).toBe(-32001);
+
     // Refresh rotates the pair; the old access token is then revocable.
     const refreshed = await fetch(`${root}/oauth/token`, form({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id }));
     expect(refreshed.status).toBe(200);
@@ -158,8 +167,63 @@ describe("OAuth 2.1 flow end to end into the MCP endpoint", () => {
     });
     expect(after.status).toBe(401);
 
-    const del = await fetch(`${root}/mcp`, { method: "DELETE", headers: SH });
-    expect(del.status).toBeLessThan(500);
+  });
+
+  describe("negative paths", () => {
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const decide = (client_id: string, over: Record<string, string>) =>
+      fetch(
+        `${root}/oauth/authorize/decision`,
+        form({ client_id, redirect_uri: REDIRECT, state: "s1", code_challenge: challenge, totp: authenticator.generate(TOTP_SECRET), action: "approve", ...over }),
+      );
+    const codeFor = async (client_id: string): Promise<string> =>
+      new URL((await decide(client_id, {})).headers.get("location")!).searchParams.get("code")!;
+    const redeem = (client_id: string, code: string, code_verifier: string) =>
+      fetch(`${root}/oauth/token`, form({ grant_type: "authorization_code", code, client_id, redirect_uri: REDIRECT, code_verifier }));
+
+    it("a wrong TOTP re-renders the consent screen and issues no code", async () => {
+      const client_id = await registerClient();
+      const totp = authenticator.generate(TOTP_SECRET) === "000000" ? "111111" : "000000";
+      const r = await decide(client_id, { totp });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("location")).toBeNull();
+      expect(await r.text()).toContain("Invalid authenticator code");
+    });
+
+    it("deny redirects with access_denied and echoes the state", async () => {
+      const client_id = await registerClient();
+      const r = await decide(client_id, { action: "deny" });
+      expect(r.status).toBe(302);
+      const loc = new URL(r.headers.get("location")!);
+      expect(loc.searchParams.get("error")).toBe("access_denied");
+      expect(loc.searchParams.get("state")).toBe("s1");
+      expect(loc.searchParams.get("code")).toBeNull();
+    });
+
+    it("an unregistered redirect_uri on the decision is a 400, never a redirect", async () => {
+      const client_id = await registerClient();
+      const r = await decide(client_id, { redirect_uri: "http://127.0.0.1:9/elsewhere" });
+      expect(r.status).toBe(400);
+      expect(r.headers.get("location")).toBeNull();
+    });
+
+    it("a PKCE verifier mismatch is invalid_grant", async () => {
+      const client_id = await registerClient();
+      const code = await codeFor(client_id);
+      const r = await redeem(client_id, code, randomBytes(32).toString("base64url"));
+      expect(r.status).toBe(400);
+      expect((await r.json()).error).toBe("invalid_grant");
+    });
+
+    it("a code cannot be redeemed twice", async () => {
+      const client_id = await registerClient();
+      const code = await codeFor(client_id);
+      expect((await redeem(client_id, code, verifier)).status).toBe(200);
+      const again = await redeem(client_id, code, verifier);
+      expect(again.status).toBe(400);
+      expect((await again.json()).error).toBe("invalid_grant");
+    });
   });
 
   it("takes the first value of a duplicated query parameter on the consent screen", async () => {
@@ -279,7 +343,22 @@ describe("Express 5: the final error handler", () => {
     const text = await r.text();
     expect(JSON.parse(text)).toEqual({ error: "Internal server error." });
     expectNoLeak(text);
-    expect(logged).toHaveBeenCalled(); // server faults are logged server-side
+    // Server faults are logged by name only; the message can quote anything.
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(String(logged.mock.calls[0]![0])).toBe("[skeleton-key] request failed: Error");
+    expect(logged.mock.calls.flat().join(" ")).not.toContain(SECRET);
+  });
+
+  it("a malformed percent-encoded route param is a quiet 400 (router URIError), not a logged 500", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const link = app.credentialRequests.create({ name: "n", host: "h", kind: "token", reason: "r" });
+    for (const [method, p] of [["GET", `/credential/${link.id}%ZZ`], ["GET", "/credential/%ZZ"], ["DELETE", "/api/targets/%ZZ"]] as const) {
+      const r = await fetch(`${root}${p}`, { method });
+      expect(r.status, p).toBe(400);
+      expect(await r.json()).toEqual({ error: "Bad request." });
+    }
+    // The raw param (here a live one-time link id) must not reach the log.
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("a rejected MCP auth check answers 500 instead of hanging the request", async () => {
@@ -317,6 +396,36 @@ describe("Express 5: errors past the credential claim", () => {
   });
 });
 
+describe("credential claim ownership", () => {
+  it("a throw after this request released its claim never drops a concurrent submit's claim", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    const req = app.credentialRequests.create({
+      name: "bot", host: "h", kind: "token", reason: "r",
+      verify: { method: "GET", url: "http://127.0.0.1:9/probe", headers: { Authorization: "Bot {{value}}" }, timeoutMs: 1000 },
+    });
+    // The probe fails, so the handler releases its claim and renders the form.
+    // Simulate the race: right after that release a concurrent submit claims
+    // the link, and rendering this request's response then throws.
+    const store = app.credentialRequests;
+    const release = store.release.bind(store);
+    let releases = 0;
+    store.release = (id: string) => {
+      releases++;
+      const out = release(id);
+      if (releases === 1) {
+        expect(store.claim(id)).toBe(true); // the concurrent submit
+        throw new Error("render failed");
+      }
+      return out;
+    };
+    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: "tok-value" }));
+    expect(r.status).toBe(500);
+    expect(releases).toBe(1); // the catch did not release a second time
+    expect(store.claim(req.id)).toBe(false); // the concurrent claim still stands
+  });
+});
+
 describe("http-util narrowing helpers", () => {
   const req = (over: Partial<Request>): Request => over as Request;
 
@@ -351,6 +460,12 @@ describe("errorHandler", () => {
   it("keeps an exposed client error's status (body-parser)", () => {
     expect(run(Object.assign(new Error("Unexpected token"), { status: 400, expose: true, type: "entity.parse.failed" })))
       .toEqual({ status: 400, body: { error: "Bad request." } });
+  });
+
+  it("keeps the router's 400 for a malformed route param (URIError, no expose)", () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(run(Object.assign(new URIError("Failed to decode param '%ZZ'"), { status: 400 }))).toEqual({ status: 400, body: { error: "Bad request." } });
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("treats an upstream error carrying a status as a server fault", () => {
