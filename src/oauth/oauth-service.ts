@@ -6,6 +6,16 @@ import path from "node:path";
 import { paths } from "../config/paths.js";
 
 /**
+ * A refused grant (RFC 6749 `invalid_grant`). The message says which check
+ * failed, for tests and the code's own readers; the token endpoint answers
+ * every one of these with the same fixed description, so a client can't
+ * tell, say, a live code issued to another client from an unknown one.
+ */
+export class InvalidGrantError extends Error {
+  override readonly name = "InvalidGrantError";
+}
+
+/**
  * Minimal OAuth 2.1 authorization server for the MCP endpoint.
  *
  * Implements what the MCP authorization spec needs: dynamic client registration
@@ -128,16 +138,16 @@ export class OAuthService {
     const row = this.db.prepare(`SELECT * FROM auth_codes WHERE code_hash = ?`).get(sha256(input.code)) as
       | { code_hash: string; client_id: string; redirect_uri: string; code_challenge: string; scope: string; expires_at: number; used: number }
       | undefined;
-    if (!row) throw new Error("invalid_grant: unknown code");
+    if (!row) throw new InvalidGrantError("invalid_grant: unknown code");
     // Always burn the code on any redemption attempt.
     this.db.prepare(`UPDATE auth_codes SET used = 1 WHERE code_hash = ?`).run(row.code_hash);
-    if (row.used) throw new Error("invalid_grant: code already used");
-    if (row.expires_at < nowS()) throw new Error("invalid_grant: code expired");
-    if (row.client_id !== input.client_id) throw new Error("invalid_grant: client mismatch");
-    if (row.redirect_uri !== input.redirect_uri) throw new Error("invalid_grant: redirect_uri mismatch");
+    if (row.used) throw new InvalidGrantError("invalid_grant: code already used");
+    if (row.expires_at < nowS()) throw new InvalidGrantError("invalid_grant: code expired");
+    if (row.client_id !== input.client_id) throw new InvalidGrantError("invalid_grant: client mismatch");
+    if (row.redirect_uri !== input.redirect_uri) throw new InvalidGrantError("invalid_grant: redirect_uri mismatch");
     // PKCE S256 verification.
     const challenge = createHash("sha256").update(input.code_verifier).digest("base64url");
-    if (challenge !== row.code_challenge) throw new Error("invalid_grant: PKCE verification failed");
+    if (challenge !== row.code_challenge) throw new InvalidGrantError("invalid_grant: PKCE verification failed");
     return this.issueTokens(row.client_id, row.scope);
   }
 
@@ -164,9 +174,9 @@ export class OAuthService {
     const row = this.db.prepare(`SELECT * FROM tokens WHERE token_hash = ? AND type = 'refresh'`).get(hash) as
       | { client_id: string; scope: string; expires_at: number }
       | undefined;
-    if (!row) throw new Error("invalid_grant: unknown refresh token");
-    if (row.expires_at < nowS()) throw new Error("invalid_grant: refresh token expired");
-    if (clientId && row.client_id !== clientId) throw new Error("invalid_grant: client mismatch");
+    if (!row) throw new InvalidGrantError("invalid_grant: unknown refresh token");
+    if (row.expires_at < nowS()) throw new InvalidGrantError("invalid_grant: refresh token expired");
+    if (clientId && row.client_id !== clientId) throw new InvalidGrantError("invalid_grant: client mismatch");
     // Rotate: burn the presented refresh token before issuing the new pair.
     this.db.prepare(`DELETE FROM tokens WHERE token_hash = ?`).run(hash);
     return this.issueTokens(row.client_id, row.scope);
