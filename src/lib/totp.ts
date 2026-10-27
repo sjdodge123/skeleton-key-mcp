@@ -47,7 +47,15 @@ export function totpKeyUri(accountLabel: string, issuer: string, secret: string)
 export function verifyTotpCode(token: string, secret: string): boolean {
   try {
     return verifySync({ ...OPTIONS, token, secret, epochTolerance: 0 }).valid;
-  } catch {
+  } catch (err) {
+    // A malformed token (wrong length, non-digits) is just a wrong code. Anything
+    // else — a secret the library rejects, a guardrail tightened by an upgrade —
+    // would lock the admin out with no trace, so log it (the error name only:
+    // otplib messages can quote the input).
+    const name = err instanceof Error ? err.name : "unknown error";
+    if (!/^Token\w*Error$/.test(name)) {
+      console.warn(`[skeleton-key] TOTP verification failed with ${name}; refusing the code.`);
+    }
     return false;
   }
 }

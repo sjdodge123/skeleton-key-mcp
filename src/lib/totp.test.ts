@@ -179,3 +179,21 @@ describe("TOTP secret entropy (fixed in the otplib 13 migration)", () => {
     expect(Math.max(...bytes)).toBeGreaterThanOrEqual(0x80);
   });
 });
+
+describe("TOTP verification failures are diagnosable", () => {
+  it("logs a non-token failure (by error name, never the secret) but stays quiet on a mistyped code", () => {
+    at(NOW);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(verifyTotpCode("12345", ENROLLED)).toBe(false);
+      expect(verifyTotpCode("abcdef", ENROLLED)).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+
+      expect(verifyTotpCode("123456", "not base32!")).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).not.toContain("not base32!");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
