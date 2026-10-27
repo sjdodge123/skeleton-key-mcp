@@ -10,6 +10,7 @@ import { buildCredentialRouter } from "./credential-routes.js";
 import { buildAdminRouter } from "./admin-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
+import { errorHandler } from "./http-util.js";
 
 interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -212,6 +213,9 @@ export function buildHttpApp(app: AppState, opts: { tlsCertPem?: string | null }
   });
 
   server.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+  // Last: a rejected async handler or a malformed body lands here (see errorHandler).
+  server.use(errorHandler);
 
   return server;
 }

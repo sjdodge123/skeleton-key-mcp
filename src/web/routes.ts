@@ -10,6 +10,7 @@ import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
+import { paramStr } from "./http-util.js";
 
 /** Strip URLs from a vault error before it leaves on the unauthenticated status
  *  endpoint — the vault's address is not something a LAN client should learn. */
@@ -75,7 +76,7 @@ export function buildApiRouter(app: AppState): Router {
         res.status(409).json({ error: "Store already exists; unlock instead." });
         return;
       }
-      const { passphrase } = z.object({ passphrase: z.string().min(8) }).parse(req.body);
+      const { passphrase } = z.object({ passphrase: z.string().min(8) }).parse(req.body ?? {});
       await app.store.initialize(passphrase);
       res.json({ ok: true });
     }),
@@ -84,7 +85,7 @@ export function buildApiRouter(app: AppState): Router {
   router.post(
     "/store/unlock",
     h(async (req, res) => {
-      const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body);
+      const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body ?? {});
       await app.store.unlock(passphrase);
       // Re-establish the saved vault session, keep the bearer hash current, and
       // nudge locked sessions to re-list tools — shared with the boot paths.
@@ -253,7 +254,7 @@ export function buildApiRouter(app: AppState): Router {
           masterPassword: z.string().min(1),
           collectionName: z.string().optional(),
         })
-        .parse(req.body);
+        .parse(req.body ?? {});
       const checks = await setup.connectVault(input);
       res.json({ checks });
     }),
@@ -296,7 +297,7 @@ export function buildApiRouter(app: AppState): Router {
     "/setup/totp/verify",
     h(async (req, res) => {
       if (!(await guardSetup(res))) return;
-      const { token } = z.object({ token: z.string().min(6) }).parse(req.body);
+      const { token } = z.object({ token: z.string().min(6) }).parse(req.body ?? {});
       res.json({ valid: setup.verifyTotp(token) });
     }),
   );
@@ -339,7 +340,7 @@ export function buildApiRouter(app: AppState): Router {
           credentialRef: z.string().optional(),
           options: z.record(z.string(), z.unknown()).optional(),
         })
-        .parse(req.body);
+        .parse(req.body ?? {});
       const connector = getConnector(body.type);
       if (!connector) {
         res.status(400).json({ error: `Unknown connector type: ${body.type}` });
@@ -360,7 +361,12 @@ export function buildApiRouter(app: AppState): Router {
     "/targets/:name",
     h(async (req, res) => {
       if (!(await guardSetup(res))) return;
-      const removed = await app.registry.remove(req.params.name!);
+      const name = paramStr(req, "name");
+      if (!name) {
+        res.status(400).json({ error: "Invalid target name." });
+        return;
+      }
+      const removed = await app.registry.remove(name);
       res.json({ ok: removed });
     }),
   );
@@ -406,14 +412,19 @@ export function buildApiRouter(app: AppState): Router {
   router.post(
     "/oauth/clients/:id/revoke",
     h(async (req, res) => {
-      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body);
+      const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
       if (!app.verifyTotp(totp)) {
         res.status(403).json({ error: "Invalid authenticator code." });
         return;
       }
-      const ok = app.oauth.revokeClient(req.params.id!);
+      const id = paramStr(req, "id");
+      if (!id) {
+        res.status(400).json({ error: "Invalid client id." });
+        return;
+      }
+      const ok = app.oauth.revokeClient(id);
       app.audit.record({
-        ts: new Date().toISOString(), tool: "oauth.revoke", target: req.params.id!,
+        ts: new Date().toISOString(), tool: "oauth.revoke", target: id,
         tier: "execute", args: {}, status: ok ? "ok" : "error", detail: "agent access revoked",
       });
       res.json({ ok });
@@ -480,8 +491,8 @@ export function buildApiRouter(app: AppState): Router {
         res.status(403).json({ error: "Invalid authenticator code." });
         return;
       }
-      const id = req.params.id!;
-      if (!/^[0-9A-Za-z._-]+$/.test(id)) {
+      const id = paramStr(req, "id");
+      if (!id || !/^[0-9A-Za-z._-]+$/.test(id)) {
         res.status(400).json({ error: "Invalid skeleton id." });
         return;
       }

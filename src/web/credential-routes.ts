@@ -3,7 +3,7 @@ import type { AppState } from "../app.js";
 import type { CredentialField, CredentialRequest, FieldConstraints, VerificationOutcome } from "./credential-requests.js";
 import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
-import { firstStr } from "./http-util.js";
+import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
 
 /**
@@ -220,7 +220,8 @@ export function buildCredentialRouter(app: AppState): Router {
       res.status(404).type("html").send(messagePage("Not available", "Skeleton Key setup isn't complete yet."));
       return;
     }
-    const request = app.credentialRequests.get(req.params.id!);
+    const id = paramStr(req, "id");
+    const request = id ? app.credentialRequests.get(id) : undefined;
     if (!request) {
       res.status(404).type("html").send(messagePage("Unknown link", "This credential link is not valid."));
       return;
@@ -234,7 +235,8 @@ export function buildCredentialRouter(app: AppState): Router {
   });
 
   router.post("/credential/:id", async (req, res) => {
-    const request = app.credentialRequests.get(req.params.id!);
+    const id = paramStr(req, "id");
+    const request = id ? app.credentialRequests.get(id) : undefined;
     if (!request) {
       res.status(404).type("html").send(messagePage("Unknown link", "This credential link is not valid."));
       return;
@@ -244,15 +246,16 @@ export function buildCredentialRouter(app: AppState): Router {
       res.type("html").send(terminal);
       return;
     }
+    const body = bodyOf(req);
 
     // CSRF: the form token is only present in the same-origin rendered page, so
     // a blind cross-site POST (which can't read the page) can't act on the link.
-    if (firstStr(req.body.formToken) !== request.formToken) {
+    if (firstStr(body.formToken) !== request.formToken) {
       res.status(403).type("html").send(messagePage("Expired form", "This form is stale — reopen the link and try again."));
       return;
     }
 
-    if (firstStr(req.body.action) === "decline") {
+    if (firstStr(body.action) === "decline") {
       app.credentialRequests.decline(request.id);
       res.type("html").send(messagePage("Cancelled", "No credential was stored. You can close this tab."));
       return;
@@ -264,7 +267,7 @@ export function buildCredentialRouter(app: AppState): Router {
       return;
     }
 
-    const totp = firstStr(req.body.totp);
+    const totp = firstStr(body.totp);
     if (!app.verifyTotp(totp)) {
       res.status(403).type("html").send(formPage(request, { error: "Invalid authenticator code — try again." }));
       return;
@@ -279,7 +282,7 @@ export function buildCredentialRouter(app: AppState): Router {
     if (multi) {
       const missing: string[] = [];
       for (const f of multi) {
-        const value = firstStr(req.body[FIELD_INPUT_PREFIX + f.name]);
+        const value = firstStr(body[FIELD_INPUT_PREFIX + f.name]);
         if (!value) missing.push(f.name);
         else values.push({ name: f.name, value, hidden: f.secret });
       }
@@ -288,13 +291,13 @@ export function buildCredentialRouter(app: AppState): Router {
         return;
       }
     } else {
-      secret = firstStr(req.body.secret);
+      secret = firstStr(body.secret);
       if (!secret) {
         res.status(400).type("html").send(formPage(request, { error: "Enter the credential value." }));
         return;
       }
     }
-    const username = firstStr(req.body.username) || request.username;
+    const username = firstStr(body.username) || request.username;
 
     // Per-field shape constraints, server-side — the browser check is a
     // convenience, this is the gate. Names the failing field(s) and their
@@ -332,41 +335,60 @@ export function buildCredentialRouter(app: AppState): Router {
       res.type("html").send(messagePage("Already provided", "This credential was just stored. You can close this tab."));
       return;
     }
+    // Release at most once, and only while this request still holds the claim:
+    // once released, a concurrent submit may re-claim the link, and releasing
+    // again would drop THAT claim mid-write and reopen the race.
+    let ownsClaim = true;
+    const releaseClaim = (): void => {
+      if (!ownsClaim) return;
+      ownsClaim = false;
+      app.credentialRequests.release(request.id);
+    };
 
     // Optional verification probe — runs BEFORE the vault write so a wrong
     // value never lands. Audited as host + status only.
     let verification: VerificationOutcome = "skipped";
     if (request.verify) {
-      const templateValues: Record<string, string> = multi ? Object.fromEntries(values.map((v) => [v.name, v.value])) : { value: secret };
-      const result = await runVerifyProbe(request.verify, templateValues);
-      for (const k of Object.keys(templateValues)) delete templateValues[k];
-      const storeAnyway = firstStr(req.body.storeAnyway) === "1";
-      app.audit.record({
-        ts: new Date().toISOString(),
-        tool: "credential.verify",
-        target: result.host,
-        tier: "execute",
-        args: { name: request.name, host: result.host, status: result.status ?? null, storeAnyway },
-        status: result.ok ? "ok" : "error",
-        detail: result.ok
-          ? `verification probe passed (HTTP ${result.status}) for '${request.name}'`
-          : `verification probe failed for '${request.name}': ${result.reason}${storeAnyway ? " — stored anyway by user override" : ""}`,
-      });
-      if (result.ok) {
-        verification = "passed";
-      } else if (storeAnyway) {
-        verification = "failed";
-      } else {
-        app.credentialRequests.release(request.id);
+      // An unexpected throw past the claim (e.g. the audit write) must not strand
+      // the link as claimed with nothing stored: release it (if still ours), then
+      // let it surface.
+      try {
+        const templateValues: Record<string, string> = multi ? Object.fromEntries(values.map((v) => [v.name, v.value])) : { value: secret };
+        const result = await runVerifyProbe(request.verify, templateValues);
+        for (const k of Object.keys(templateValues)) delete templateValues[k];
+        const storeAnyway = firstStr(body.storeAnyway) === "1";
+        app.audit.record({
+          ts: new Date().toISOString(),
+          tool: "credential.verify",
+          target: result.host,
+          tier: "execute",
+          args: { name: request.name, host: result.host, status: result.status ?? null, storeAnyway },
+          status: result.ok ? "ok" : "error",
+          detail: result.ok
+            ? `verification probe passed (HTTP ${result.status}) for '${request.name}'`
+            : `verification probe failed for '${request.name}': ${result.reason}${storeAnyway ? " — stored anyway by user override" : ""}`,
+        });
+        if (result.ok) {
+          verification = "passed";
+        } else if (storeAnyway) {
+          verification = "failed";
+        } else {
+          releaseClaim();
+          values = [];
+          secret = "";
+          res.status(400).type("html").send(
+            formPage(request, {
+              error: `Verification failed: ${result.reason}. Nothing was stored — double-check the value, or tick "store anyway" to override.`,
+              offerStoreAnyway: true,
+            }),
+          );
+          return;
+        }
+      } catch (err) {
+        releaseClaim();
         values = [];
         secret = "";
-        res.status(400).type("html").send(
-          formPage(request, {
-            error: `Verification failed: ${result.reason}. Nothing was stored — double-check the value, or tick "store anyway" to override.`,
-            offerStoreAnyway: true,
-          }),
-        );
-        return;
+        throw err;
       }
     }
 
@@ -405,7 +427,7 @@ export function buildCredentialRouter(app: AppState): Router {
       if (!multi && request.kind === "password") fingerprints.password = await app.fingerprint(secret);
     } catch (err) {
       // Roll the claim back so the user can retry the same link.
-      app.credentialRequests.release(request.id);
+      releaseClaim();
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${message}` }));
       return;
