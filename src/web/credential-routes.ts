@@ -5,6 +5,7 @@ import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
 import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
+import { lockoutMessage, refuseLockedOut, totpAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
  * Secure credential hand-off (issue #18). The agent creates a request via the
@@ -215,6 +216,18 @@ function terminalPage(req: CredentialRequest): string | null {
 export function buildCredentialRouter(app: AppState): Router {
   const router = Router();
 
+  // While locked out, a submit is answered 429 before the TOTP — or the
+  // secret — is read. "Decline" carries no code, so it is always let through.
+  const credentialLimit = totpRateLimit(app, {
+    skip: (req) => firstStr(bodyOf(req).action) === "decline",
+    render: (req, res, message) => {
+      const id = paramStr(req, "id");
+      const request = id ? app.credentialRequests.get(id) : undefined;
+      const page = request && !terminalPage(request) ? formPage(request, { error: message }) : messagePage("Try again later", message);
+      res.type("html").send(page);
+    },
+  });
+
   router.get("/credential/:id", async (req, res) => {
     if (!(await app.isSetupComplete())) {
       res.status(404).type("html").send(messagePage("Not available", "Skeleton Key setup isn't complete yet."));
@@ -234,7 +247,7 @@ export function buildCredentialRouter(app: AppState): Router {
     res.type("html").send(formPage(request));
   });
 
-  router.post("/credential/:id", async (req, res) => {
+  router.post("/credential/:id", credentialLimit, async (req, res) => {
     const id = paramStr(req, "id");
     const request = id ? app.credentialRequests.get(id) : undefined;
     if (!request) {
@@ -268,8 +281,13 @@ export function buildCredentialRouter(app: AppState): Router {
     }
 
     const totp = firstStr(body.totp);
-    if (!app.verifyTotp(totp)) {
-      res.status(403).type("html").send(formPage(request, { error: "Invalid authenticator code — try again." }));
+    const check = app.checkTotp(totp, totpAttempt(req));
+    if (!check.ok) {
+      if (check.retryAfterSeconds) {
+        refuseLockedOut(res, check.retryAfterSeconds).type("html").send(formPage(request, { error: lockoutMessage(check.retryAfterSeconds) }));
+      } else {
+        res.status(403).type("html").send(formPage(request, { error: "Invalid authenticator code — try again." }));
+      }
       return;
     }
 

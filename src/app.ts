@@ -8,9 +8,25 @@ import { CredentialRequestStore } from "./web/credential-requests.js";
 import { loadPublicUrl } from "./config/public-url.js";
 import { hashBearer, loadBearerHash, saveBearerHash } from "./config/bearer-hash.js";
 import { verifyTotpCode } from "./lib/totp.js";
+import { AttemptLimiter, TOTP_LIMITS, type Lockout, type Refusal } from "./lib/attempt-limiter.js";
 import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
 import { fingerprintValue } from "./lib/fingerprint.js";
+
+/** Outcome of a TOTP check. `retryAfterSeconds` is set when the caller is
+ *  locked out (send 429 + Retry-After); a plain failure is a wrong code. */
+export type TotpCheck = { ok: true } | { ok: false; retryAfterSeconds?: number };
+
+/** Who is presenting a code, and where: the limiter's client key (see
+ *  `clientKey`) and the route pattern, for the audit log. */
+export interface TotpAttempt {
+  client: string;
+  via: string;
+}
+
+/** Refusals during a lockout are coalesced to one audit entry per window, so a
+ *  flood against a locked gate can't bloat audit.sqlite (cf. server.ts). */
+const TOTP_REFUSAL_LOG_THROTTLE_MS = 10_000;
 
 /**
  * Shared runtime state for the whole process: the encrypted bootstrap store, the
@@ -211,14 +227,72 @@ export class AppState {
     for (const cb of this.toolChangeListeners) cb();
   }
 
+  /** Brute-force limiter in front of every TOTP verification (in-memory; see TOTP_LIMITS). */
+  readonly totpLimiter = new AttemptLimiter(TOTP_LIMITS);
+  private totpRefusalsPending = 0;
+  private lastTotpRefusalLogAt = 0;
+
   /**
-   * Single source of truth for admin TOTP verification. Fails closed if the
-   * store is locked (no secret available). Used by every 2FA-gated action.
+   * Seconds until `attempt.client` may present a code again, or null when it
+   * may now. Never looks at a code. Gates check this before parsing the body;
+   * `checkTotp` checks it again before evaluating.
    */
-  verifyTotp(token: string): boolean {
+  totpLockout(attempt: TotpAttempt): number | null {
+    const refusal = this.totpLimiter.blocked(attempt.client);
+    if (!refusal) return null;
+    this.auditTotpRefusal(attempt, refusal);
+    return Math.max(1, Math.ceil(refusal.retryAfterMs / 1000));
+  }
+
+  /**
+   * Single source of truth for admin TOTP verification. Used by every
+   * 2FA-gated action. While the client (or everyone) is locked out the code is
+   * refused WITHOUT being evaluated, so a lockout reveals nothing about it.
+   * Fails closed if the store is locked (no secret available); that, and an
+   * empty code, are refused without counting — there was nothing to guess.
+   */
+  checkTotp(token: string, attempt: TotpAttempt): TotpCheck {
+    const retryAfterSeconds = this.totpLockout(attempt);
+    if (retryAfterSeconds !== null) return { ok: false, retryAfterSeconds };
     const secret = this.store.locked ? undefined : this.store.get().totpSecret;
-    if (!secret || !token) return false;
-    return verifyTotpCode(token.trim(), secret);
+    const code = token ? token.trim() : "";
+    if (!secret || !code) return { ok: false };
+    if (verifyTotpCode(code, secret)) {
+      this.totpLimiter.succeed(attempt.client);
+      return { ok: true };
+    }
+    const lockouts = this.totpLimiter.fail(attempt.client);
+    this.auditTotp("auth.totp_failed", attempt, `wrong authenticator code via ${attempt.via}`);
+    for (const l of lockouts) this.auditTotp("auth.totp_lockout", attempt, lockoutDetail(l, attempt));
+    if (lockouts.length === 0) return { ok: false };
+    return { ok: false, retryAfterSeconds: Math.ceil(Math.max(...lockouts.map((l) => l.durationMs)) / 1000) };
+  }
+
+  /** Coalesced record of attempts refused during a lockout (see TOTP_REFUSAL_LOG_THROTTLE_MS). */
+  private auditTotpRefusal(attempt: TotpAttempt, refusal: Refusal): void {
+    this.totpRefusalsPending++;
+    const now = Date.now();
+    if (now - this.lastTotpRefusalLogAt < TOTP_REFUSAL_LOG_THROTTLE_MS) return;
+    const n = this.totpRefusalsPending;
+    this.totpRefusalsPending = 0;
+    this.lastTotpRefusalLogAt = now;
+    const scope = refusal.scope === "global" ? "global" : "per-client";
+    this.auditTotp(
+      "auth.totp_refused",
+      attempt,
+      `${n} attempt(s) refused during a ${scope} lockout since the last entry; latest via ${attempt.via}, ` +
+        `${Math.ceil(refusal.retryAfterMs / 1000)} s left`,
+    );
+  }
+
+  /** Never carries the code: `args` is digested, and a digest of a 6-digit
+   *  code is trivially reversible, so it stays empty. */
+  private auditTotp(tool: string, attempt: TotpAttempt, detail: string): void {
+    try {
+      this.audit.record({ ts: new Date().toISOString(), tool, target: attempt.client, tier: "auth", args: {}, status: "denied", detail });
+    } catch {
+      /* audit is best-effort; the refusal stands either way */
+    }
   }
 
   /**
@@ -239,6 +313,12 @@ export class AppState {
     }
     return this.vault.getCredential(credentialRef, opts);
   }
+}
+
+function lockoutDetail(l: Lockout, attempt: TotpAttempt): string {
+  const mins = Math.round(l.durationMs / 60_000);
+  const who = l.scope === "global" ? "ALL clients" : `client ${attempt.client}`;
+  return `${who} locked out of TOTP for ${mins} min after ${l.failures} wrong codes (last via ${attempt.via})`;
 }
 
 /** Constant-time string compare (avoids leaking length/prefix via timing). */

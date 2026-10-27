@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { generateTotpSecret, totpKeyUri } from "../lib/totp.js";
 import QRCode from "qrcode";
-import type { AppState } from "../app.js";
+import type { AppState, TotpAttempt, TotpCheck } from "../app.js";
 import { paths } from "../config/paths.js";
 import { verifyScoping, type CheckResult } from "./verify.js";
 
@@ -59,8 +59,8 @@ export class SetupService {
     return { secret, otpauth, qrDataUrl };
   }
 
-  verifyTotp(token: string): boolean {
-    return this.app.verifyTotp(token);
+  verifyTotp(token: string, attempt: TotpAttempt): TotpCheck {
+    return this.app.checkTotp(token, attempt);
   }
 
   /** Step: generate (or rotate) the MCP bearer token clients must present. */
