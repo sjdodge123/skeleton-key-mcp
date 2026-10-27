@@ -21,7 +21,13 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 # Drop dev deps; the compiled native modules stay in place for the runtime stage.
-RUN npm prune --omit=dev
+# better-sqlite3 bundles prebuilds for every OS/arch (~17 MB); keep only the one
+# it resolves for this platform (none if it compiled from source), then prove
+# it still loads so a bad strip fails the build rather than the container.
+RUN npm prune --omit=dev \
+  && keep="$(node -p "require('./node_modules/better-sqlite3/lib/binding.js').getPrebuildPath()")" \
+  && find /app/node_modules/better-sqlite3/prebuilds -name '*.node' ! -path "$keep" -delete \
+  && node -e "require('better-sqlite3')(':memory:').prepare('select 1').get()"
 
 # --- runtime stage ---
 FROM node:22-bookworm-slim AS runtime
