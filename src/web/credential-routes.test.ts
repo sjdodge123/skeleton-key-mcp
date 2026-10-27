@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createServer, type Server, type Server as HttpServer } from "node:http";
-import { authenticator } from "otplib";
+import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 
 /**
  * The credential hand-off form (#18) over real HTTP, with the vault write
@@ -20,7 +20,7 @@ let httpServer: Server;
 let root: string;
 let created: any[];
 
-const TOTP_SECRET = authenticator.generateSecret();
+const TOTP_SECRET = generateTotpSecret();
 
 beforeEach(async () => {
   vi.resetModules();
@@ -103,7 +103,7 @@ describe("credential hand-off — multi-field mode", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: "discord-value",
       f_SXM_USERNAME: "sxm-user",
       f_SXM_PASSWORD: "sxm-pass",
@@ -147,7 +147,7 @@ describe("credential hand-off — multi-field mode", () => {
     await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_username: "svc-account",
       f_API_KEY: "k1",
     });
@@ -160,7 +160,7 @@ describe("credential hand-off — multi-field mode", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: "discord-value",
       f_SXM_USERNAME: "sxm-user",
     });
@@ -174,7 +174,7 @@ describe("credential hand-off — multi-field mode", () => {
     const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
     const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
 
-    const noCsrf = await postForm(req.id, { formToken: "wrong", action: "submit", totp: authenticator.generate(TOTP_SECRET), ...values });
+    const noCsrf = await postForm(req.id, { formToken: "wrong", action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values });
     expect(noCsrf.status).toBe(403);
 
     const badTotp = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: "000000", ...values });
@@ -187,7 +187,7 @@ describe("credential hand-off — multi-field mode", () => {
   it("is single-use — a replay of the same link cannot write a second item", async () => {
     const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
     const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
-    const body = { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), ...values };
+    const body = { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values };
     expect((await postForm(req.id, body)).status).toBe(200);
     const replay = await postForm(req.id, body);
     expect(await replay.text()).toContain("Already provided");
@@ -205,7 +205,7 @@ describe("credential hand-off — single-secret mode (unchanged)", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       username: "root",
       secret: "hunter2",
     });
@@ -219,7 +219,7 @@ describe("credential hand-off — single-secret mode (unchanged)", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       secret: "PVEAPIToken=x!y=z",
     });
     expect(res.status).toBe(200);
@@ -268,7 +268,7 @@ describe("credential hand-off — per-field validation", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: CLIENT_SECRET,
       f_GUILD_ID: "123456789012345678",
     });
@@ -288,7 +288,7 @@ describe("credential hand-off — per-field validation", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: GOOD_TOKEN,
       f_GUILD_ID: "123456789012345678",
     });
@@ -305,14 +305,14 @@ describe("credential hand-off — per-field validation", () => {
       constraints: { pattern: BOT_TOKEN_PATTERN, hint: "Bot token, two dots" },
       reason: "migrate",
     });
-    const bad = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: CLIENT_SECRET });
+    const bad = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: CLIENT_SECRET });
     expect(bad.status).toBe(400);
     const html = await bad.text();
     expect(html).toContain("Bot token, two dots");
     expect(html).not.toContain(CLIENT_SECRET);
     expect(created).toHaveLength(0);
 
-    const good = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: GOOD_TOKEN });
+    const good = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: GOOD_TOKEN });
     expect(good.status).toBe(200);
     expect(created[0].fields).toEqual([{ name: "token", value: GOOD_TOKEN, hidden: true }]);
   });
@@ -348,7 +348,7 @@ describe("credential hand-off — pre-store verification probe", () => {
 
   it("passes: probes with the templated secret, then stores and records verification=passed", async () => {
     const req = app.credentialRequests.create({ name: "bot", host: "discord", kind: "token", reason: "migrate", verify: verify() });
-    const res = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: GOOD_TOKEN });
+    const res = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: GOOD_TOKEN });
     expect(res.status).toBe(200);
     expect(seen).toEqual([{ method: "GET", auth: `Bot ${GOOD_TOKEN}`, path: "/api/v10/users/@me" }]);
     expect(created).toHaveLength(1);
@@ -366,7 +366,7 @@ describe("credential hand-off — pre-store verification probe", () => {
   it("fails: does NOT store, shows 'Verification failed: HTTP 401 from <host>', offers storeAnyway, stays claimable", async () => {
     respondWith = 401;
     const req = app.credentialRequests.create({ name: "bot", host: "discord", kind: "token", reason: "migrate", verify: verify() });
-    const res = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: CLIENT_SECRET });
+    const res = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: CLIENT_SECRET });
     expect(res.status).toBe(400);
     const html = await res.text();
     expect(html).toContain("Verification failed: HTTP 401 from 127.0.0.1");
@@ -386,7 +386,7 @@ describe("credential hand-off — pre-store verification probe", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       secret: CLIENT_SECRET,
       storeAnyway: "1",
     });
@@ -407,7 +407,7 @@ describe("credential hand-off — pre-store verification probe", () => {
     await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: GOOD_TOKEN,
       f_GUILD_ID: "42",
     });
@@ -436,7 +436,7 @@ describe("credential hand-off — overwrite an existing item in place", () => {
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: GOOD_TOKEN,
     });
     expect(res.status).toBe(200);
@@ -461,7 +461,7 @@ describe("credential hand-off — fingerprints", () => {
     await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
-      totp: authenticator.generate(TOTP_SECRET),
+      totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: GOOD_TOKEN,
       f_GUILD_ID: "42",
     });
@@ -482,7 +482,7 @@ describe("credential hand-off — fingerprints", () => {
 
   it("fingerprints the password in single-secret password mode", async () => {
     const req = app.credentialRequests.create({ name: "nas1", host: "10.0.0.5", kind: "password", username: "root", reason: "onboard" });
-    await postForm(req.id, { formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), username: "root", secret: "hunter2" });
+    await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), username: "root", secret: "hunter2" });
     expect(app.credentialRequests.get(req.id).fingerprints.password).toMatch(/^len=7 fp=[0-9a-f]{8}$/);
   });
 });
@@ -505,7 +505,7 @@ describe("POST /api/credential-requests (pending links)", () => {
     const ok = await fetch(`${root}/api/credential-requests`, {
       method: "POST",
       headers: { "content-type": "application/json", host: "evil.example" },
-      body: JSON.stringify({ totp: authenticator.generate(TOTP_SECRET) }),
+      body: JSON.stringify({ totp: generateTotpCode(TOTP_SECRET) }),
     });
     expect(ok.status).toBe(200);
     const body = await ok.json();

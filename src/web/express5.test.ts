@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import type { Request } from "express";
-import { authenticator } from "otplib";
+import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 import type { AppState } from "../app.js";
 import { bodyOf, errorHandler, paramStr } from "./http-util.js";
 
@@ -22,7 +22,7 @@ let app: AppState;
 let httpServer: Server;
 let root: string;
 
-const TOTP_SECRET = authenticator.generateSecret();
+const TOTP_SECRET = generateTotpSecret();
 const REDIRECT = "http://127.0.0.1:9/callback";
 
 beforeEach(async () => {
@@ -103,7 +103,7 @@ describe("OAuth 2.1 flow end to end into the MCP endpoint", () => {
 
     const decision = await fetch(
       `${root}/oauth/authorize/decision`,
-      form({ client_id, redirect_uri: REDIRECT, state: "xyz", code_challenge: challenge, totp: authenticator.generate(TOTP_SECRET), action: "approve" }),
+      form({ client_id, redirect_uri: REDIRECT, state: "xyz", code_challenge: challenge, totp: generateTotpCode(TOTP_SECRET), action: "approve" }),
     );
     expect(decision.status).toBe(302);
     const location = new URL(decision.headers.get("location")!);
@@ -175,7 +175,7 @@ describe("OAuth 2.1 flow end to end into the MCP endpoint", () => {
     const decide = (client_id: string, over: Record<string, string>) =>
       fetch(
         `${root}/oauth/authorize/decision`,
-        form({ client_id, redirect_uri: REDIRECT, state: "s1", code_challenge: challenge, totp: authenticator.generate(TOTP_SECRET), action: "approve", ...over }),
+        form({ client_id, redirect_uri: REDIRECT, state: "s1", code_challenge: challenge, totp: generateTotpCode(TOTP_SECRET), action: "approve", ...over }),
       );
     const codeFor = async (client_id: string): Promise<string> =>
       new URL((await decide(client_id, {})).headers.get("location")!).searchParams.get("code")!;
@@ -184,7 +184,7 @@ describe("OAuth 2.1 flow end to end into the MCP endpoint", () => {
 
     it("a wrong TOTP re-renders the consent screen and issues no code", async () => {
       const client_id = await registerClient();
-      const totp = authenticator.generate(TOTP_SECRET) === "000000" ? "111111" : "000000";
+      const totp = generateTotpCode(TOTP_SECRET) === "000000" ? "111111" : "000000";
       const r = await decide(client_id, { totp });
       expect(r.status).toBe(200);
       expect(r.headers.get("location")).toBeNull();
@@ -387,7 +387,7 @@ describe("Express 5: errors past the credential claim", () => {
       if (e.tool === "credential.verify") throw new Error("SQLITE_FULL");
       return record(e);
     };
-    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: "tok-value" }));
+    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: "tok-value" }));
     expect(r.status).toBe(500);
     expect(await r.text()).not.toContain("tok-value");
     expect(createLoginItem).not.toHaveBeenCalled();
@@ -419,7 +419,7 @@ describe("credential claim ownership", () => {
       }
       return out;
     };
-    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: authenticator.generate(TOTP_SECRET), secret: "tok-value" }));
+    const r = await fetch(`${root}/credential/${req.id}`, form({ formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: "tok-value" }));
     expect(r.status).toBe(500);
     expect(releases).toBe(1); // the catch did not release a second time
     expect(store.claim(req.id)).toBe(false); // the concurrent claim still stands

@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
-import { authenticator } from "otplib";
+import { generateTotpCode } from "../lib/totp.js";
 
 /**
  * Exercises `POST /api/vault/server` (re-pointing the Vaultwarden client at a
@@ -108,7 +108,7 @@ describe("POST /api/vault/server", () => {
     const seen = stubVault();
     expect((await post("/vault/server", { serverUrl: NEW_URL })).status).toBe(400); // no totp → zod
     expect((await post("/vault/server", { serverUrl: NEW_URL, totp: "000000" })).status).toBe(403);
-    const bad = await post("/vault/server", { serverUrl: "http://192.168.1.20:5556", totp: authenticator.generate(TOTP_SECRET) });
+    const bad = await post("/vault/server", { serverUrl: "http://192.168.1.20:5556", totp: generateTotpCode(TOTP_SECRET) });
     expect(bad.status).toBe(400);
     expect(bad.json.error).toMatch(/https/);
     expect(seen.reestablish).toEqual([]);
@@ -120,7 +120,7 @@ describe("POST /api/vault/server", () => {
     await markSetupComplete();
     const seen = stubVault();
     app.vaultError = "bw unlock failed: Insecure URL not allowed.";
-    const r = await post("/vault/server", { serverUrl: NEW_URL, totp: authenticator.generate(TOTP_SECRET) });
+    const r = await post("/vault/server", { serverUrl: NEW_URL, totp: generateTotpCode(TOTP_SECRET) });
     expect(r.status).toBe(200);
     expect(r.json.ok).toBe(true);
     expect(r.json.vaultUnlocked).toBe(true);
@@ -143,7 +143,7 @@ describe("POST /api/vault/server", () => {
     await initConnectedStore();
     await markSetupComplete();
     stubVault(/vault-broken/);
-    const r = await post("/vault/server", { serverUrl: "https://vault-broken.example.net", totp: authenticator.generate(TOTP_SECRET) });
+    const r = await post("/vault/server", { serverUrl: "https://vault-broken.example.net", totp: generateTotpCode(TOTP_SECRET) });
     expect(r.status).toBe(400);
     expect(r.json.error).toMatch(/Insecure URL not allowed/);
     expect(app.store.get().bwServerUrl).toBe(OLD_URL);

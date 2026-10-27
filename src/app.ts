@@ -7,7 +7,7 @@ import { OAuthService } from "./oauth/oauth-service.js";
 import { CredentialRequestStore } from "./web/credential-requests.js";
 import { loadPublicUrl } from "./config/public-url.js";
 import { hashBearer, loadBearerHash, saveBearerHash } from "./config/bearer-hash.js";
-import { authenticator } from "otplib";
+import { verifyTotpCode } from "./lib/totp.js";
 import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
 import { fingerprintValue } from "./lib/fingerprint.js";
@@ -218,7 +218,7 @@ export class AppState {
   verifyTotp(token: string): boolean {
     const secret = this.store.locked ? undefined : this.store.get().totpSecret;
     if (!secret || !token) return false;
-    return authenticator.verify({ token: token.trim(), secret });
+    return verifyTotpCode(token.trim(), secret);
   }
 
   /**
