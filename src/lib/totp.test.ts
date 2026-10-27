@@ -168,3 +168,14 @@ describe("TOTP enrollment URI", () => {
     );
   });
 });
+
+// Not a characterisation test: otplib 12 cleared the high bit of every secret
+// byte (its encoder round-tripped through an 'ascii' string), leaving 70 bits of
+// entropy in a 10-byte secret. otplib 13 uses all 80. Existing enrollments are
+// unaffected — they still verify above — only new secrets get the full range.
+describe("TOTP secret entropy (fixed in the otplib 13 migration)", () => {
+  it("uses the full byte range, not just 0x00–0x7f", () => {
+    const bytes = Array.from({ length: 200 }, () => [...base32Decode(generateTotpSecret())]).flat();
+    expect(Math.max(...bytes)).toBeGreaterThanOrEqual(0x80);
+  });
+});
