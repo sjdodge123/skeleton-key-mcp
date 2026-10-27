@@ -385,7 +385,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         host: z.string(),
         port: z.number().int().positive().optional(),
         credentialRef: z.string().optional().describe("Vault item name holding this target's credentials."),
-        options: z.record(z.unknown()).optional(),
+        options: z.record(z.string(), z.unknown()).optional(),
       }),
       confirm: (input) => {
         const i = input as { name: string; type: string; host: string };
@@ -487,7 +487,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         credentialRef: z.string().optional().describe("New vault item name to use for this target."),
         host: z.string().optional(),
         port: z.number().int().positive().optional(),
-        options: z.record(z.unknown()).optional(),
+        options: z.record(z.string(), z.unknown()).optional(),
       }),
       confirm: (input) => {
         const i = input as { name: string; credentialRef?: string };

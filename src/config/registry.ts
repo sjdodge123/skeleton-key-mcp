@@ -15,7 +15,7 @@ const targetSchema = z.object({
   // rename / recreate under the same name can't silently re-point the target.
   // Not a secret (it's an opaque UUID); the name stays the human-facing ref.
   credentialId: z.string().uuid().optional(),
-  options: z.record(z.unknown()).optional(),
+  options: z.record(z.string(), z.unknown()).optional(),
 });
 
 const fileSchema = z.object({

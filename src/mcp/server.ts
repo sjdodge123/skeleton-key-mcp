@@ -4,7 +4,7 @@ import {
   ListToolsRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { z } from "zod";
 import type { AppState } from "../app.js";
 import { resolveTools, findTool } from "./tool-registry.js";
 import { annotationsFor, confirmationText, EXECUTE_DISABLED } from "./approval.js";
@@ -47,6 +47,28 @@ const SERVER_INSTRUCTIONS = [
  */
 export const PROGRESS_HEARTBEAT_MS = 5_000;
 
+/**
+ * The JSON Schema a client sees for a tool's input. `io: "input"` describes what
+ * the caller sends, so a field with a `.default()` stays optional (the output
+ * view would mark it required). draft-07 is the dialect the MCP SDK itself emits.
+ *
+ * In input mode zod leaves `additionalProperties` off a plain (strip) object,
+ * because it would accept and drop unknown keys. We advertise such objects as
+ * closed, as zod-to-json-schema did, so a client is told not to invent
+ * parameters; a `.passthrough()`/`.catchall()` object keeps its own value.
+ */
+export function toolInputJsonSchema(schema: z.ZodType): Tool["inputSchema"] {
+  return z.toJSONSchema(schema, {
+    target: "draft-07",
+    io: "input",
+    override: (ctx) => {
+      if (ctx.zodSchema._zod.def.type === "object" && ctx.jsonSchema.additionalProperties === undefined) {
+        ctx.jsonSchema.additionalProperties = false;
+      }
+    },
+  }) as Tool["inputSchema"];
+}
+
 export function buildMcpServer(app: AppState, opts: { heartbeatMs?: number } = {}): Server {
   const heartbeatMs = opts.heartbeatMs ?? PROGRESS_HEARTBEAT_MS;
   const server = new Server(
@@ -65,9 +87,7 @@ export function buildMcpServer(app: AppState, opts: { heartbeatMs?: number } = {
       return {
         name: resolved.qualifiedName,
         description: resolved.description,
-        inputSchema: zodToJsonSchema(resolved.inputSchema, {
-          $refStrategy: "none",
-        }) as Tool["inputSchema"],
+        inputSchema: toolInputJsonSchema(resolved.inputSchema),
         annotations: {
           title: resolved.targetName ? `${resolved.targetName}: ${resolved.qualifiedName}` : resolved.qualifiedName,
           readOnlyHint: ann.readOnlyHint,

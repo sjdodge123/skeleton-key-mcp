@@ -36,7 +36,7 @@ const optionsSchema = z
      *  process-global. Default off (the common case is plain http on :8123). */
     insecureTLS: z.boolean().default(false),
   })
-  .default({});
+  .prefault({});
 
 type Options = z.infer<typeof optionsSchema>;
 

@@ -105,7 +105,7 @@ const optionsSchema = z
     /** Skip TLS verification for THIS target only (self-signed LAN panel). */
     insecureTLS: z.boolean().default(false),
   })
-  .default({});
+  .prefault({});
 
 type Options = z.infer<typeof optionsSchema>;
 
@@ -3133,7 +3133,7 @@ function buildTools(target: Target): ConnectorTool[] {
         backups: z.number().int().min(0).optional().describe("Backup limit (default 1)."),
         allocations: z.number().int().min(1).optional().describe("Max allocations this server may hold (default: 1 + additionalAllocations)."),
         environment: z
-          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
           .optional()
           .describe("Egg variables to override, e.g. {SERVER_NAME:'x'}. Anything you omit takes the EGG'S DEFAULT — you do not need to list them all, and an unknown name is refused."),
         secretEnvironment: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),
@@ -3166,7 +3166,7 @@ function buildTools(target: Target): ConnectorTool[] {
       inputSchema: z.object({
         id: z.number().int().positive().describe("Numeric application server id from list_servers (NOT the short identifier)."),
         variables: z
-          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
           .optional()
           .describe("Variable name → value. Unknown names are refused. Omitted variables keep their current value."),
         secretVariables: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),
@@ -3285,7 +3285,7 @@ function buildTools(target: Target): ConnectorTool[] {
       inputSchema: z.object({
         server: SERVER_REF,
         variables: z
-          .record(z.union([z.string(), z.number(), z.boolean()]))
+          .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
           .optional()
           .describe("Non-secret variable name → value, e.g. {SERVER_NAME:'x', MAX_PLAYERS:10}."),
         secretVariables: z.array(secretVariableSchema).optional().describe(SECRET_VARS_DOC),

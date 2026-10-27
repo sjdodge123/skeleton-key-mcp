@@ -27,7 +27,7 @@ const optionsSchema = z
      *  to `run_command`, `run_readonly`, and the snapshot's `docker ps` profile. */
     sudoPrefixes: z.array(z.string().regex(/^[A-Za-z0-9._\/-]+$/, "a plain command name, e.g. docker")).optional(),
   })
-  .default({});
+  .prefault({});
 
 /** Target `sudoPrefixes` (or undefined). */
 function sudoPrefixesFor(target: Target): string[] | undefined {

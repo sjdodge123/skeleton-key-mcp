@@ -337,7 +337,7 @@ export function buildApiRouter(app: AppState): Router {
           host: z.string().min(1),
           port: z.number().int().positive().optional(),
           credentialRef: z.string().optional(),
-          options: z.record(z.unknown()).optional(),
+          options: z.record(z.string(), z.unknown()).optional(),
         })
         .parse(req.body);
       const connector = getConnector(body.type);
