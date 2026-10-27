@@ -1,0 +1,49 @@
+name: Bug report
+description: Something in Skeleton Key isn't working as documented.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issue?** Stop and use *Report a vulnerability* instead. See SECURITY.md.
+        **Never paste credentials, tokens, private keys, real hostnames, or real IPs.** Redact them (`nas1`, `192.168.1.x`).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The image tag or commit you are running.
+      placeholder: "v0.2.0 / sha-abc1234"
+    validations:
+      required: true
+  - type: input
+    id: area
+    attributes:
+      label: Connector or area
+      description: Connector type (e.g. `ssh`, `unifi`) or core area (`web`, `oauth`, `secrets`, `mcp`).
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Register a `proxmox` target with ...\n2. Call `list_guests` ...\n3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or tool output
+      render: text
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it deployed?
+      options: ["Docker (GHCR image)", "Docker (built from source)", "npm run dev", "Other"]
+    validations:
+      required: true

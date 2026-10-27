@@ -6,6 +6,7 @@ dist/
 data/
 *.sqlite
 *.sqlite3
+*.db
 bootstrap.store
 .bw-cache/
 config.local.yaml

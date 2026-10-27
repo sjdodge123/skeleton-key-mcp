@@ -1,0 +1,35 @@
+name: OpenSSF Scorecard
+
+# Grades the repo's supply-chain hygiene (branch protection, pinned actions,
+# token permissions, ...) and publishes the result to the Security tab.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 7 * * 1" # weekly, Monday 07:41 UTC
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write # publish_results: signs the result for the public API
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: results.sarif
+          category: scorecard

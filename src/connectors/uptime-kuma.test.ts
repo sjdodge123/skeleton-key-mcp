@@ -20,10 +20,10 @@ import type { Credential, Target, ToolContext } from "./types.js";
 
 /** The owner's shape: game-server monitors tagged managed:pelican and named after the server. */
 const MONITORS: FakeMonitor[] = [
-  { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
-  { id: 13, name: "Palworld", type: "port", hostname: "192.168.0.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },
-  { id: 14, name: "node", type: "ping", hostname: "192.168.0.48", active: 1, tags: [{ name: "wing", value: "node" }] },
-  { id: 15, name: "Valheim query", type: "port", hostname: "192.168.0.48", port: 2457, active: 0, tags: [{ name: "server", value: "f5eb47ac" }] },
+  { id: 12, name: "Valheim", type: "port", hostname: "192.168.1.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
+  { id: 13, name: "Palworld", type: "port", hostname: "192.168.1.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+  { id: 14, name: "node", type: "ping", hostname: "192.168.1.48", active: 1, tags: [{ name: "wing", value: "node" }] },
+  { id: 15, name: "Valheim query", type: "port", hostname: "192.168.1.48", port: 2457, active: 0, tags: [{ name: "server", value: "f5eb47ac" }] },
   { id: 16, name: "Website", type: "http", url: "https://user:pw@example.com/health?token=abc", active: 1, tags: [] },
 ];
 
@@ -174,8 +174,8 @@ describe("list_monitors", () => {
     const res = await tool("list_monitors").run({}, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("Uptime Kuma monitors on status-kuma: 5 (1 paused)");
-    expect(res.text).toContain("[12] Valheim — port 192.168.0.48:2456 — ACTIVE — tags: managed:pelican, wing:node");
-    expect(res.text).toContain("[15] Valheim query — port 192.168.0.48:2457 — PAUSED — tags: server:f5eb47ac");
+    expect(res.text).toContain("[12] Valheim — port 192.168.1.48:2456 — ACTIVE — tags: managed:pelican, wing:node");
+    expect(res.text).toContain("[15] Valheim query — port 192.168.1.48:2457 — PAUSED — tags: server:f5eb47ac");
     expect(res.text).toContain("[16] Website — http https://example.com/health?token=… — ACTIVE — tags: —");
     expect(res.text).not.toContain("user:pw");
     expect(res.text).not.toContain("token=abc");
@@ -194,7 +194,7 @@ describe("monitor_status", () => {
   it("reads heartbeats via getMonitorBeats and summarises latest / last change / tally", async () => {
     const res = await tool("monitor_status").run({ monitor: "Valheim", hours: 24 }, ctx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("Monitor [12] 'Valheim' (port 192.168.0.48:2456) on status-kuma: ACTIVE");
+    expect(res.text).toContain("Monitor [12] 'Valheim' (port 192.168.1.48:2456) on status-kuma: ACTIVE");
     expect(res.text).toContain('Latest beat: UP at 2026-10-11T01:02:00.000Z 12ms "200 - OK"');
     expect(res.text).toContain("Last status change: UP at 2026-10-11T01:01:00.000Z");
     expect(res.text).toContain("Last 24h: 3 beats — 1 DOWN, 2 UP");

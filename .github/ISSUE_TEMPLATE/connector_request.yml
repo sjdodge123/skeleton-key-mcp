@@ -1,0 +1,58 @@
+name: Connector request / proposal
+description: Propose support for a new service (router, hypervisor, NAS, app, tool...) or new tools on an existing connector.
+labels: ["connector", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the "Adding a connector" section of CONTRIBUTING.md first. Agreeing on tiers and API before code saves everyone a rewrite.
+  - type: input
+    id: product
+    attributes:
+      label: Product and versions
+      placeholder: "OPNsense 24.x / 25.x"
+    validations:
+      required: true
+  - type: input
+    id: type
+    attributes:
+      label: Proposed connector type
+      description: "lowercase kebab-case, named for the product (e.g. `opnsense`)."
+    validations:
+      required: true
+  - type: dropdown
+    id: family
+    attributes:
+      label: Family
+      description: Connectors in the same family share tool names and shapes.
+      options: ["router / firewall", "hypervisor / VM host", "NAS / storage", "container host", "DNS / DHCP", "home automation", "monitoring", "app / other"]
+    validations:
+      required: true
+  - type: textarea
+    id: api
+    attributes:
+      label: API and authentication
+      description: Which API (link the docs), how it authenticates (API token preferred over passwords), and how you confirmed the routes exist.
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: Proposed tools and tiers
+      description: "One per line: `tool_name` — read|execute — what it does. Anything that changes state is `execute`."
+      placeholder: "list_rules — read — list firewall rules\nset_rule_enabled — execute — enable/disable one rule by id"
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Blast radius
+      description: What's the worst an execute tool here could do if misused? Which endpoints are deliberately left out?
+    validations:
+      required: true
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to implement this and help maintain it.

@@ -290,7 +290,7 @@ export function assertAllocationIp(ip: string): string {
   const m = IPV4_RE.exec(trimmed);
   if (!m || [m[1], m[2], m[3], m[4]].some((n) => Number(n) > 255)) {
     throw new Error(
-      `create_allocations takes one literal IPv4 address (e.g. '192.168.0.48'), not '${ip}'. ` +
+      `create_allocations takes one literal IPv4 address (e.g. '192.168.1.48'), not '${ip}'. ` +
         `Pelican also accepts a CIDR block here and expands it across every port, which multiplies into thousands of ` +
         `allocations from a single call — so this tool refuses CIDR. Use the node's own IP, exactly as list_allocations prints it.`,
     );
@@ -3057,7 +3057,7 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "execute",
       inputSchema: z.object({
         node: z.number().int().positive().describe("Node id from list_nodes."),
-        ip: z.string().describe("The node's literal IPv4, exactly as list_allocations prints it (e.g. '192.168.0.48'). CIDR is refused."),
+        ip: z.string().describe("The node's literal IPv4, exactly as list_allocations prints it (e.g. '192.168.1.48'). CIDR is refused."),
         ports: z
           .array(z.string())
           .min(1)

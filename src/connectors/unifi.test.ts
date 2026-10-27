@@ -975,12 +975,12 @@ describe("snapshot (disaster-recovery backup)", () => {
 // ---------------------------------------------------------------------------
 
 /** The control-plane deny-list a real ToolContext supplies (see
- *  tool-registry.protectedHosts). nas229 fronts Portainer, Vaultwarden and the
+ *  tool-registry.protectedHosts). nas1 fronts Portainer, Vaultwarden and the
  *  Skeleton Key container in the reference deployment. */
 const PROTECTED: ProtectedHost[] = [
-  { host: "192.168.0.229", why: "Portainer / container host (target 'nas229pt')" },
+  { host: "192.168.1.20", why: "Portainer / container host (target 'nas1-portainer')" },
   { host: "192.168.0.1", why: "the UniFi gateway itself (target 'unifi')" },
-  { host: "192.168.0.229", why: "the Skeleton Key server itself" },
+  { host: "192.168.1.20", why: "the Skeleton Key server itself" },
 ];
 
 /** ToolContext with the deny-list wired, as the MCP tool registry builds it. */
@@ -989,8 +989,8 @@ function pfCtx(c: Credential = cred({ fields: { api_key: "K" } }), protectedHost
 }
 
 const RULES = [
-  { _id: "pf1", name: "npm", proto: "tcp", dst_port: "443", fwd: "192.168.0.230", fwd_port: "4443", src: "any", enabled: true, pfwd_interface: "wan", log: true, site_id: "s1", destination_ip: "any", destination_ips: [], src_limiting_enabled: false },
-  { _id: "pf2", name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.0.48", fwd_port: "2456", src: "any", enabled: true, pfwd_interface: "wan", log: false, site_id: "s1", destination_ip: "any", destination_ips: [], src_limiting_enabled: false },
+  { _id: "pf1", name: "npm", proto: "tcp", dst_port: "443", fwd: "192.168.1.21", fwd_port: "4443", src: "any", enabled: true, pfwd_interface: "wan", log: true, site_id: "s1", destination_ip: "any", destination_ips: [], src_limiting_enabled: false },
+  { _id: "pf2", name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.1.48", fwd_port: "2456", src: "any", enabled: true, pfwd_interface: "wan", log: false, site_id: "s1", destination_ip: "any", destination_ips: [], src_limiting_enabled: false },
 ];
 
 /** Stateful portforward mock: POST appends, PUT replaces, DELETE removes, so a
@@ -1061,8 +1061,8 @@ describe("port-forward pure helpers", () => {
   });
 
   it("describePortForward renders the plan's canonical identity line", () => {
-    expect(describePortForward({ name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.0.48", fwd_port: "2456" })).toBe(
-      "WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim')",
+    expect(describePortForward({ name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.1.48", fwd_port: "2456" })).toBe(
+      "WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim')",
     );
     // tcp_udp reads as TCP/UDP; a missing fwd_port falls back to the WAN port.
     expect(describePortForward({ name: "web", proto: "tcp_udp", dst_port: "8081", fwd: "192.168.0.50" })).toBe(
@@ -1072,10 +1072,10 @@ describe("port-forward pure helpers", () => {
 
   it("summarizePortForwards whitelists fields and flags disabled / non-default src", () => {
     const out = summarizePortForwards([
-      { _id: "pf2", name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.0.48", fwd_port: "2456", src: "any", enabled: true },
+      { _id: "pf2", name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.1.48", fwd_port: "2456", src: "any", enabled: true },
       { _id: "pf3", name: "old", proto: "tcp", dst_port: "9999", fwd: "192.168.0.7", fwd_port: "80", src: "10.0.0.0/8", enabled: false, pfwd_interface: "wan2" },
     ] as any);
-    expect(out).toContain("- WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim') [pf2]");
+    expect(out).toContain("- WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') [pf2]");
     expect(out).toContain("(disabled)");
     expect(out).toContain("src=10.0.0.0/8");
     expect(out).toContain("iface=wan2");
@@ -1085,7 +1085,7 @@ describe("port-forward pure helpers", () => {
 });
 
 describe("port-forward guardrails (assertForwardAllowed)", () => {
-  const good = { name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.0.48", fwd_port: "2456" };
+  const good = { name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.1.48", fwd_port: "2456" };
 
   it("allows an RFC1918 destination on a non-infra port", () => {
     expect(() => assertForwardAllowed(good, PROTECTED)).not.toThrow();
@@ -1098,7 +1098,7 @@ describe("port-forward guardrails (assertForwardAllowed)", () => {
   });
 
   it("rejects a destination on the control-plane deny-list, naming what it protects", () => {
-    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.0.229" }, PROTECTED)).toThrow(/Portainer \/ container host/);
+    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.1.20" }, PROTECTED)).toThrow(/Portainer \/ container host/);
     expect(() => assertForwardAllowed({ ...good, fwd: "192.168.0.1" }, PROTECTED)).toThrow(/the UniFi gateway itself/);
   });
 
@@ -1114,13 +1114,13 @@ describe("port-forward guardrails (assertForwardAllowed)", () => {
   });
 
   it("defaults the destination port to the WAN port when screening", () => {
-    expect(() => assertForwardAllowed({ name: "x", proto: "tcp", dst_port: "9000", fwd: "192.168.0.48" }, PROTECTED)).toThrow(
+    expect(() => assertForwardAllowed({ name: "x", proto: "tcp", dst_port: "9000", fwd: "192.168.1.48" }, PROTECTED)).toThrow(
       /9000 \(Portainer\)/,
     );
   });
 
   it("an empty deny-list still enforces RFC1918 and the port list", () => {
-    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.0.229" }, [])).not.toThrow(); // host check is deny-list driven
+    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.1.20" }, [])).not.toThrow(); // host check is deny-list driven
     expect(() => assertForwardAllowed({ ...good, fwd: "1.2.3.4" }, [])).toThrow(/private LAN IPv4/);
     expect(() => assertForwardAllowed({ ...good, fwd_port: "443" }, [])).toThrow(/443/);
   });
@@ -1131,8 +1131,8 @@ describe("list_port_forwards", () => {
     const { calls } = mockPf();
     const res = await tool("list_port_forwards").run({}, pfCtx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("WAN TCP 443 → 192.168.0.230:4443 ('npm') [pf1]");
-    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim') [pf2]");
+    expect(res.text).toContain("WAN TCP 443 → 192.168.1.21:4443 ('npm') [pf1]");
+    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') [pf2]");
     expect(calls.some((c) => c.url.includes("/api/s/default/rest/portforward"))).toBe(true);
     expect(writes(calls)).toHaveLength(0);
   });
@@ -1142,11 +1142,11 @@ describe("create_port_forward", () => {
   it("POSTs a rule in the UI's field shape and reminds the caller to force-provision", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "palworld", proto: "udp", wanPort: "8211", destination: "192.168.0.48", destinationPort: "8211" },
+      { name: "palworld", proto: "udp", wanPort: "8211", destination: "192.168.1.48", destinationPort: "8211" },
       pfCtx(),
     );
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("Created UniFi port-forward WAN UDP 8211 → 192.168.0.48:8211 ('palworld') [pfNEW]");
+    expect(res.text).toContain("Created UniFi port-forward WAN UDP 8211 → 192.168.1.48:8211 ('palworld') [pfNEW]");
     expect(res.text).toContain("force_provision");
     const post = writes(calls).find((c) => c.init.method === "POST")!;
     expect(post.url).toMatch(/\/api\/s\/default\/rest\/portforward$/);
@@ -1154,7 +1154,7 @@ describe("create_port_forward", () => {
       name: "palworld",
       proto: "udp",
       dst_port: "8211",
-      fwd: "192.168.0.48",
+      fwd: "192.168.1.48",
       fwd_port: "8211",
       enabled: true,
       pfwd_interface: "wan",
@@ -1167,7 +1167,7 @@ describe("create_port_forward", () => {
 
   it("defaults the destination port to the WAN port", async () => {
     const { calls } = mockPf();
-    await tool("create_port_forward").run({ name: "p2", proto: "tcp", wanPort: "7777", destination: "192.168.0.48" }, pfCtx());
+    await tool("create_port_forward").run({ name: "p2", proto: "tcp", wanPort: "7777", destination: "192.168.1.48" }, pfCtx());
     expect(JSON.parse(writes(calls).find((c) => c.init.method === "POST")!.init.body).fwd_port).toBe("7777");
   });
 
@@ -1185,7 +1185,7 @@ describe("create_port_forward", () => {
   it("rejects a destination on the deny-list before any network call", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "pwn", proto: "tcp", wanPort: "9999", destination: "192.168.0.229" },
+      { name: "pwn", proto: "tcp", wanPort: "9999", destination: "192.168.1.20" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1196,7 +1196,7 @@ describe("create_port_forward", () => {
   it("rejects an infra port before any network call", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "ssh", proto: "tcp", wanPort: "2222", destination: "192.168.0.48", destinationPort: "22" },
+      { name: "ssh", proto: "tcp", wanPort: "2222", destination: "192.168.1.48", destinationPort: "22" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1207,7 +1207,7 @@ describe("create_port_forward", () => {
   it("FAILS CLOSED when the context supplies no protected-host list", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "ok", proto: "udp", wanPort: "8211", destination: "192.168.0.48" },
+      { name: "ok", proto: "udp", wanPort: "8211", destination: "192.168.1.48" },
       ctx(cred({ fields: { api_key: "K" } })), // no protectedHosts
     );
     expect(res.isError).toBe(true);
@@ -1218,7 +1218,7 @@ describe("create_port_forward", () => {
   it("refuses a duplicate rule name", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "valheim", proto: "udp", wanPort: "9999", destination: "192.168.0.48" },
+      { name: "valheim", proto: "udp", wanPort: "9999", destination: "192.168.1.48" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1233,14 +1233,14 @@ describe("create_port_forward", () => {
       pfCtx(),
     );
     expect(res.isError).toBe(true);
-    expect(res.text).toContain("overlaps the existing enabled rule WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim')");
+    expect(res.text).toContain("overlaps the existing enabled rule WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim')");
     expect(writes(calls)).toHaveLength(0);
   });
 
   it("allows the same WAN port on a non-overlapping protocol", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "valheim-tcp", proto: "tcp", wanPort: "2457", destination: "192.168.0.48" },
+      { name: "valheim-tcp", proto: "tcp", wanPort: "2457", destination: "192.168.1.48" },
       pfCtx(),
     );
     expect(res.isError).toBeFalsy();
@@ -1250,7 +1250,7 @@ describe("create_port_forward", () => {
   it("surfaces a meta.rc='error' envelope on the POST as a failure", async () => {
     mockPf(RULES, { json: { meta: { rc: "error", msg: "api.err.InvalidPayload" } } });
     const res = await tool("create_port_forward").run(
-      { name: "p", proto: "udp", wanPort: "8211", destination: "192.168.0.48" },
+      { name: "p", proto: "udp", wanPort: "8211", destination: "192.168.1.48" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1263,16 +1263,16 @@ describe("create_port_forward", () => {
     const schema = tool("create_port_forward").inputSchema;
     for (const wanInterface of ["wan", "wan2", "both", "all"]) {
       expect(
-        schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.0.48", wanInterface }).success,
+        schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.1.48", wanInterface }).success,
       ).toBe(true);
     }
     expect(
-      schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.0.48", wanInterface: "wan9" }).success,
+      schema.safeParse({ name: "x", proto: "udp", wanPort: "8211", destination: "192.168.1.48", wanInterface: "wan9" }).success,
     ).toBe(false);
 
     const { calls } = mockPf();
     await tool("create_port_forward").run(
-      { name: "steamish", proto: "udp", wanPort: "27016", destination: "192.168.0.48", wanInterface: "all" },
+      { name: "steamish", proto: "udp", wanPort: "27016", destination: "192.168.1.48", wanInterface: "all" },
       pfCtx(),
     );
     expect(JSON.parse(writes(calls).find((c) => c.init.method === "POST")!.init.body).pfwd_interface).toBe("all");
@@ -1280,8 +1280,8 @@ describe("create_port_forward", () => {
 
   it("confirm text matches the plan's canonical format exactly", () => {
     const c = tool("create_port_forward").confirm!;
-    expect(c({ name: "valheim", proto: "udp", wanPort: "2456-2458", destination: "192.168.0.48", destinationPort: "2456" }, target())).toBe(
-      "Open WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim') on unifi",
+    expect(c({ name: "valheim", proto: "udp", wanPort: "2456-2458", destination: "192.168.1.48", destinationPort: "2456" }, target())).toBe(
+      "Open WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') on unifi",
     );
   });
 });
@@ -1291,8 +1291,8 @@ describe("update_port_forward", () => {
     const { calls } = mockPf();
     const res = await tool("update_port_forward").run({ rule: "pf2", destination: "192.168.0.50" }, pfCtx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim') → WAN UDP 2456-2458 → 192.168.0.50:2456 ('valheim')");
-    expect(res.text).toContain('fwd: "192.168.0.48" → "192.168.0.50"');
+    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') → WAN UDP 2456-2458 → 192.168.0.50:2456 ('valheim')");
+    expect(res.text).toContain('fwd: "192.168.1.48" → "192.168.0.50"');
     expect(res.text).toContain("force_provision");
     const put = writes(calls).find((c) => c.init.method === "PUT")!;
     expect(put.url).toMatch(/\/rest\/portforward\/pf2$/);
@@ -1339,7 +1339,7 @@ describe("update_port_forward", () => {
 
   it("allows a disable that restates unchanged fields, but screens any other change riding along", async () => {
     const { calls } = mockPf();
-    const ok = await tool("update_port_forward").run({ rule: "pf1", enabled: false, wanPort: "443", destination: "192.168.0.230" }, pfCtx());
+    const ok = await tool("update_port_forward").run({ rule: "pf1", enabled: false, wanPort: "443", destination: "192.168.1.21" }, pfCtx());
     expect(ok.isError).toBeFalsy();
     expect(writes(calls)).toHaveLength(1);
 
@@ -1364,12 +1364,12 @@ describe("update_port_forward", () => {
   });
 
   it("isDisableOnlyPatch: enabled:false plus only unchanged fields", () => {
-    const cur = { enabled: true, fwd: "192.168.0.230", dst_port: "443" };
+    const cur = { enabled: true, fwd: "192.168.1.21", dst_port: "443" };
     expect(isDisableOnlyPatch(cur, { enabled: false })).toBe(true);
-    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.0.230" })).toBe(true);
+    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.1.21" })).toBe(true);
     expect(isDisableOnlyPatch({ fwd: "x" }, { enabled: false })).toBe(true); // enabled missing = on
     expect(isDisableOnlyPatch(cur, { enabled: true })).toBe(false);
-    expect(isDisableOnlyPatch(cur, { fwd: "192.168.0.230" })).toBe(false);
+    expect(isDisableOnlyPatch(cur, { fwd: "192.168.1.21" })).toBe(false);
     expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.0.231" })).toBe(false);
     expect(isDisableOnlyPatch(cur, { enabled: false, log: true })).toBe(false); // a field the rule lacks
   });
@@ -1412,11 +1412,11 @@ describe("delete_port_forward", () => {
   it("deletes the rule after verifying the echoed WAN port + destination", async () => {
     const { calls, state } = mockPf();
     const res = await tool("delete_port_forward").run(
-      { rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.0.48" },
+      { rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.1.48" },
       pfCtx(),
     );
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("Deleted UniFi port-forward WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim') [pf2]");
+    expect(res.text).toContain("Deleted UniFi port-forward WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') [pf2]");
     expect(res.text).toContain("force_provision");
     const del = writes(calls).find((c) => c.init.method === "DELETE")!;
     expect(del.url).toMatch(/\/rest\/portforward\/pf2$/);
@@ -1431,7 +1431,7 @@ describe("delete_port_forward", () => {
     );
     expect(res.isError).toBe(true);
     expect(res.text).toContain("Refusing to delete");
-    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.0.48:2456 ('valheim')");
+    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim')");
     expect(writes(calls)).toHaveLength(0);
   });
 
@@ -1448,8 +1448,8 @@ describe("delete_port_forward", () => {
 
   it("confirm names the rule, WAN port and destination so the prompt needs no lookup", () => {
     const c = tool("delete_port_forward").confirm!;
-    expect(c({ rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.0.48" }, target())).toBe(
-      "Delete UniFi port-forward 'valheim' (WAN 2456-2458 → 192.168.0.48) on unifi — closes that inbound hole",
+    expect(c({ rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.1.48" }, target())).toBe(
+      "Delete UniFi port-forward 'valheim' (WAN 2456-2458 → 192.168.1.48) on unifi — closes that inbound hole",
     );
   });
 });

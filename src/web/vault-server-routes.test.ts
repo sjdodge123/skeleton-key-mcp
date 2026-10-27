@@ -55,7 +55,7 @@ async function getStatus(): Promise<any> {
 }
 
 const TOTP_SECRET = "JBSWY3DPEHPK3PXP";
-const OLD_URL = "http://192.168.0.229:5555";
+const OLD_URL = "http://192.168.1.20:5555";
 const NEW_URL = "https://vault.example.net";
 
 /** Stub the `bw`-backed client: reestablish succeeds unless the URL matches `refuse`. */
@@ -108,7 +108,7 @@ describe("POST /api/vault/server", () => {
     const seen = stubVault();
     expect((await post("/vault/server", { serverUrl: NEW_URL })).status).toBe(400); // no totp → zod
     expect((await post("/vault/server", { serverUrl: NEW_URL, totp: "000000" })).status).toBe(403);
-    const bad = await post("/vault/server", { serverUrl: "http://192.168.0.229:5556", totp: authenticator.generate(TOTP_SECRET) });
+    const bad = await post("/vault/server", { serverUrl: "http://192.168.1.20:5556", totp: authenticator.generate(TOTP_SECRET) });
     expect(bad.status).toBe(400);
     expect(bad.json.error).toMatch(/https/);
     expect(seen.reestablish).toEqual([]);

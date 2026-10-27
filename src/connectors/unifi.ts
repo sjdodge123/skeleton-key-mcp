@@ -240,7 +240,7 @@ export function protoLabel(proto?: string): string {
 
 /** The one-line identity of a port-forward rule, shared by the read summary and
  *  every execute confirmation so an approval prompt reads exactly like the rule
- *  it will touch. Format is fixed: `WAN UDP 2456-2458 → 192.168.0.48:2456
+ *  it will touch. Format is fixed: `WAN UDP 2456-2458 → 192.168.1.48:2456
  *  ('valheim')`. */
 export function describePortForward(r: Partial<UniFiPortForward>): string {
   const wan = r.dst_port ?? "?";
@@ -339,7 +339,7 @@ export function assertForwardAllowed(rule: ForwardIntent, protectedList: Protect
   if (!dest) throw new Error("A port-forward needs a destination IP ('destination').");
   if (!isPrivateIPv4(dest)) {
     throw new Error(
-      `Refusing to forward to '${dest}' — the destination must be a private LAN IPv4 (RFC1918, e.g. 192.168.0.48). ` +
+      `Refusing to forward to '${dest}' — the destination must be a private LAN IPv4 (RFC1918, e.g. 192.168.1.48). ` +
         `A port-forward is an inbound hole from the internet; it may only ever land on the LAN.`,
     );
   }
@@ -1204,7 +1204,7 @@ function buildTools(target: Target): ConnectorTool[] {
         name: z.string().min(1).describe("Rule name, e.g. 'valheim'. Must be unique."),
         proto: PROTO.describe("tcp | udp | tcp_udp"),
         wanPort: z.string().describe("WAN-side port or range, e.g. '2456' or '2456-2458'."),
-        destination: z.string().describe("Destination LAN IPv4, e.g. '192.168.0.48'. Must be RFC1918."),
+        destination: z.string().describe("Destination LAN IPv4, e.g. '192.168.1.48'. Must be RFC1918."),
         destinationPort: z.string().optional().describe("Destination port or range. Defaults to wanPort."),
         source: z.string().optional().describe("Source restriction — 'any' (default) or a CIDR."),
         wanInterface: WAN_INTERFACE.optional().describe("Which WAN the rule listens on. Default 'wan'."),
