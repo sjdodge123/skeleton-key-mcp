@@ -127,15 +127,8 @@ export class AttemptLimiter {
     this.clients.delete(client);
   }
 
-  /** Failures currently counted for a scope (diagnostics and the audit detail). */
-  failures(client: string): { client: number; global: number } {
-    const now = this.now();
-    const inWindow = (b: Bucket | undefined, p: LockoutPolicy) => (b ? b.failures.filter((t) => now - t < p.windowMs).length : 0);
-    return { client: inWindow(this.clients.get(client), this.policy.client), global: inWindow(this.global, this.policy.global) };
-  }
-
   private record(b: Bucket, p: LockoutPolicy, now: number): Omit<Lockout, "scope"> | null {
-    if (b.level > 0 && b.lockedUntil <= now && now - b.lockedUntil >= p.resetAfterMs) b.level = 0;
+    if (b.level > 0 && now - b.lockedUntil >= p.resetAfterMs) b.level = 0;
     b.failures = b.failures.filter((t) => now - t < p.windowMs);
     b.failures.push(now);
     if (b.failures.length < p.maxFailures) return null;

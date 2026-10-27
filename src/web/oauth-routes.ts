@@ -55,7 +55,7 @@ function consentPage(params: {
 }
 
 /** Consent form fields carried through a re-render (error or lockout). */
-function consentFields(body: Record<string, unknown>): Record<string, string> {
+function consentFields(body: Record<string, unknown>) {
   return {
     client_id: firstStr(body.client_id),
     redirect_uri: firstStr(body.redirect_uri),
@@ -81,9 +81,15 @@ export function buildOAuthRouter(app: AppState): Router {
   const consentLimit = totpRateLimit(app, {
     skip: (req) => firstStr(bodyOf(req).action) === "deny",
     render: (req, res, message) => {
-      const client_id = firstStr(bodyOf(req).client_id);
-      const client = client_id ? app.oauth.getClient(client_id) : undefined;
-      res.type("html").send(consentPage({ clientName: client?.client_name ?? "Unknown client", error: message, fields: consentFields(bodyOf(req)) }));
+      const fields = consentFields(bodyOf(req));
+      const client = fields.client_id ? app.oauth.getClient(fields.client_id) : undefined;
+      // Same validation as the handler: never re-render a consent page for an
+      // unknown client or an unregistered redirect_uri.
+      if (!client || !client.redirect_uris.includes(fields.redirect_uri)) {
+        res.type("text").send(message);
+        return;
+      }
+      res.type("html").send(consentPage({ clientName: client.client_name, error: message, fields }));
     },
   });
 

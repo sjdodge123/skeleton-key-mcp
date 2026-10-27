@@ -73,7 +73,7 @@ async function audit(totp: string, base = v4): Promise<{ status: number; retryAf
 }
 
 function form(url: string, body: Record<string, string>): Promise<Response> {
-  for (const k of ["totp"]) if (body[k]) used.push(body[k]);
+  if (body.totp) used.push(body.totp);
   return fetch(url, {
     method: "POST",
     redirect: "manual",
@@ -152,6 +152,34 @@ describe("TOTP attempt limiting", () => {
     expect(r.status).toBe(429);
     expect((await audit(code(), v4)).status).toBe(429);
     expect(app.totpLimiter.blocked("203.0.113.1")?.scope).toBe("global");
+  });
+
+  it("covers the wizard's /setup/totp/verify: 429 instead of {valid}", async () => {
+    const { rm: remove } = await import("node:fs/promises");
+    const { paths } = await import("../config/paths.js");
+    await remove(paths.setupComplete); // the route is setup-only
+    const verify = async (token: string) => {
+      used.push(token);
+      const r = await fetch(`${v4}/api/setup/totp/verify`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      return { status: r.status, json: await r.json() };
+    };
+    for (let i = 1; i <= 4; i++) expect(await verify(wrong(i))).toEqual({ status: 200, json: { valid: false } });
+    expect((await verify(wrong(5))).status).toBe(429);
+    const right = await verify(code());
+    expect(right.status).toBe(429);
+    expect(right.json.valid).toBeUndefined();
+  });
+
+  it("a locked-out consent POST for an unknown client gets no consent page", async () => {
+    await lockOut();
+    const r = await form(`${v4}/oauth/authorize/decision`, { client_id: "bogus", redirect_uri: "https://evil.example/cb", action: "approve", totp: code() });
+    expect(r.status).toBe(429);
+    const body = await r.text();
+    expect(body).not.toMatch(/<form|evil\.example/);
   });
 
   it("covers the OAuth consent screen: 429 page while locked out, Deny still works", async () => {
