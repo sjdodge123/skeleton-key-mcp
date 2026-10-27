@@ -132,6 +132,17 @@ describe("TOTP verification window: current step only (window 0)", () => {
     expect(verifyTotpCode(code, ENROLLED)).toBe(false);
   });
 
+  // Mid-step checks can't see a few seconds of tolerance; the step edges can.
+  it("rejects the next step's code even in the last second of the current step", () => {
+    at(STEP_START + 29);
+    expect(verifyTotpCode(referenceCode(ENROLLED, STEP_START + 30), ENROLLED)).toBe(false);
+  });
+
+  it("rejects the previous step's code even in the first second of the current step", () => {
+    at(STEP_START);
+    expect(verifyTotpCode(referenceCode(ENROLLED, STEP_START - 1), ENROLLED)).toBe(false);
+  });
+
   it("accepts a lowercase rendering of the secret", () => {
     at(NOW);
     expect(verifyTotpCode(referenceCode(ENROLLED, NOW), ENROLLED.toLowerCase())).toBe(true);
@@ -166,6 +177,14 @@ describe("TOTP enrollment URI", () => {
     expect(totpKeyUri("admin@home lab", "Skeleton Key", ENROLLED)).toBe(
       "otpauth://totp/Skeleton%20Key:admin%40home%20lab?secret=JBSWY3DPEHPK3PXP&period=30&digits=6&algorithm=SHA1&issuer=Skeleton%20Key",
     );
+  });
+});
+
+// Not a characterisation test: v12 silently produced a different URI shape for
+// an empty issuer; the wrapper refuses one instead.
+describe("TOTP enrollment URI without an issuer", () => {
+  it("is refused", () => {
+    expect(() => totpKeyUri("skeleton-key", "", ENROLLED)).toThrow(/issuer/);
   });
 });
 

@@ -33,9 +33,11 @@ export function generateTotpSecret(): string {
 /**
  * The `otpauth://` URI an authenticator app scans at enrollment. Built by hand:
  * otplib 13's `generateURI` omits period/digits/algorithm, and this keeps the
- * exact string otplib 12 produced.
+ * exact string otplib 12 produced. An empty issuer is refused rather than
+ * reproducing v12's issuer-less variant, which nothing here needs.
  */
 export function totpKeyUri(accountLabel: string, issuer: string, secret: string): string {
+  if (!issuer) throw new Error("totpKeyUri: issuer is required");
   const label = `${encodeURIComponent(issuer)}:${encodeURIComponent(accountLabel)}`;
   return `otpauth://totp/${label}?secret=${secret}&period=${PERIOD}&digits=${DIGITS}&algorithm=SHA1&issuer=${encodeURIComponent(issuer)}`;
 }
