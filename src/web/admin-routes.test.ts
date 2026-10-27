@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
-import { authenticator } from "otplib";
+import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 
 /**
  * The admin activity view: the TOTP-gated audit endpoint (POST /api/audit/recent)
@@ -64,7 +64,7 @@ async function markSetupComplete(secret: string): Promise<void> {
 describe("admin activity view", () => {
   it("POST /api/audit/recent is TOTP-gated and returns entries without exposing raw args", async () => {
     await initStore();
-    const secret = authenticator.generateSecret();
+    const secret = generateTotpSecret();
     await markSetupComplete(secret);
     app.audit.record({
       ts: new Date().toISOString(), tool: "unifi.unifi.get_settings", target: "unifi",
@@ -80,7 +80,7 @@ describe("admin activity view", () => {
     expect((await post("/audit/recent", {})).status).toBe(400); // missing code
     expect((await post("/audit/recent", { totp: "000000" })).status).toBe(403); // wrong code
 
-    const ok = await post("/audit/recent", { totp: authenticator.generate(secret) });
+    const ok = await post("/audit/recent", { totp: generateTotpCode(secret) });
     expect(ok.status).toBe(200);
     expect(Array.isArray(ok.json.entries)).toBe(true);
     const entry = ok.json.entries.find((e: any) => e.tool === "unifi.unifi.get_settings");
@@ -105,7 +105,7 @@ describe("admin activity view", () => {
     expect((await fetch(root + "/admin/activity")).status).toBe(404); // pre-setup
 
     await initStore();
-    await markSetupComplete(authenticator.generateSecret());
+    await markSetupComplete(generateTotpSecret());
     const r = await fetch(root + "/admin/activity");
     expect(r.status).toBe(200);
     const html = await r.text();
