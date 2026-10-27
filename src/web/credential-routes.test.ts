@@ -532,7 +532,7 @@ describe("POST /api/credential-requests (pending links)", () => {
 
 describe("credential hand-off — implicit submission", () => {
   it("Enter in a field stores the credential rather than cancelling (first submit control is the store action)", async () => {
-    const req = app.credentialRequests.create({ name: "kuma", host: "192.168.0.229:3001", fields: [{ name: "username", secret: false }, { name: "password" }], reason: "white-glove" });
+    const req = app.credentialRequests.create({ name: "kuma", host: "192.168.1.20:3001", fields: [{ name: "username", secret: false }, { name: "password" }], reason: "white-glove" });
     const html = await (await fetch(`${root}/credential/${req.id}`)).text();
     const form = html.slice(html.indexOf("<form"), html.indexOf("</form>"));
     const firstSubmit = /<button[^>]*type="submit"[^>]*>/.exec(form)?.[0] ?? "";

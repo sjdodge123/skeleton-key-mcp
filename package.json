@@ -2,6 +2,15 @@
   "name": "skeleton-key-mcp",
   "version": "0.1.0",
   "description": "MCP server that unlocks your homelab: read logs everywhere, execute changes with approval, backed by a scoped credential vault.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sjdodge123/skeleton-key-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sjdodge123/skeleton-key-mcp/issues"
+  },
+  "homepage": "https://github.com/sjdodge123/skeleton-key-mcp#readme",
   "type": "module",
   "engines": {
     "node": ">=20"

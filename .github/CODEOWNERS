@@ -1,0 +1,38 @@
+# Code owners. The LAST matching pattern wins, so keep the broad default first
+# and the security-critical paths below it.
+#
+# When a contributor maintains a connector, add them as a co-owner of that
+# connector's files here (e.g. `/src/connectors/opnsense* @maintainer @them`).
+# Core paths stay maintainer-only.
+
+# Default: everything needs a maintainer.
+*                               @sjdodge123
+
+# --- Security-critical core: maintainer review always required ---
+/src/app.ts                     @sjdodge123
+/src/server.ts                  @sjdodge123
+/src/mcp/                       @sjdodge123
+/src/secrets/                   @sjdodge123
+/src/oauth/                     @sjdodge123
+/src/web/                       @sjdodge123
+/src/audit/                     @sjdodge123
+/src/lib/                       @sjdodge123
+/src/snapshots/                 @sjdodge123
+/src/config/                    @sjdodge123
+/src/connectors/types.ts        @sjdodge123
+/src/connectors/index.ts        @sjdodge123
+/src/connectors/command-policy* @sjdodge123
+/src/connectors/net.ts          @sjdodge123
+/scripts/host/                  @sjdodge123
+
+# --- Supply chain: dependencies, build, and CI ---
+/package.json                   @sjdodge123
+/package-lock.json              @sjdodge123
+/Dockerfile                     @sjdodge123
+/docker-compose.yml             @sjdodge123
+/.github/                       @sjdodge123
+
+# --- Policy docs ---
+/SECURITY.md                    @sjdodge123
+/LICENSE                        @sjdodge123
+/CLAUDE.md                      @sjdodge123

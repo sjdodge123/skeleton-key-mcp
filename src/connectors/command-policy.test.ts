@@ -98,7 +98,7 @@ describe("read-only policy: every command of a compound line is vetted", () => {
 
   it("allows UPS status queries but not the NUT commands that change state", () => {
     for (const cmd of [
-      "upsc ups@localhost", "upsc ups@localhost ups.status", "upsc -l", "upsc -L 192.168.0.229", "upsc -c ups",
+      "upsc ups@localhost", "upsc ups@localhost ups.status", "upsc -l", "upsc -L 192.168.1.20", "upsc -c ups",
       "upsc ups 2>&1 | grep -E 'battery|ups.(status|load)'", "apcaccess", "apcaccess status",
     ]) ok(cmd);
     for (const cmd of [

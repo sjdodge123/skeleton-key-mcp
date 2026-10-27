@@ -37,7 +37,7 @@ export interface Target {
 /**
  * A host the control plane depends on, which a network change must never be
  * pointed at. `why` is human text naming what it protects, so a refusal reads
- * "…is Portainer (target 'nas229pt')" rather than a bare IP.
+ * "…is Portainer (target 'nas1-portainer')" rather than a bare IP.
  */
 export interface ProtectedHost {
   /** Hostname or IP as registered/configured — compared literally. */

@@ -48,7 +48,7 @@ function fakeReq(token?: string): Request {
   return {
     header: (name: string) => (name.toLowerCase() === "authorization" && token ? `Bearer ${token}` : undefined),
     protocol: "http",
-    get: (name: string) => (name.toLowerCase() === "host" ? "192.168.0.229:8787" : undefined),
+    get: (name: string) => (name.toLowerCase() === "host" ? "192.168.1.20:8787" : undefined),
   } as unknown as Request;
 }
 
@@ -117,7 +117,7 @@ describe("mcpAuth", () => {
     // No public URL pinned → guidance must stay host-agnostic (anti-phishing).
     const app = fakeApp({ storeLocked: true, vaultUnlocked: false });
     const { out } = await run(app, "expired-token");
-    expect(out.body.error).not.toContain("192.168.0.229");
+    expect(out.body.error).not.toContain("192.168.1.20");
   });
 
   it("401s with the discovery hint on a bad token when unlocked", async () => {
@@ -137,6 +137,6 @@ describe("mcpAuth", () => {
     const { out, nexted } = await run(fakeApp({ setupComplete: false }), "anything");
     expect(nexted).toBe(false);
     expect(out.status).toBe(503);
-    expect(out.body.error).not.toContain("192.168.0.229");
+    expect(out.body.error).not.toContain("192.168.1.20");
   });
 });

@@ -47,7 +47,7 @@ const CLI = "pacc_ClientKeySecret456";
 const RCON = "sup3r-secret-rcon";
 
 function target(options: Record<string, unknown> = {}, port?: number): Target {
-  return { name: "pelican-panel", type: "pelican", host: "192.168.0.48", port, credentialRef: "pelican-panel", options };
+  return { name: "pelican-panel", type: "pelican", host: "192.168.1.48", port, credentialRef: "pelican-panel", options };
 }
 function cred(partial: Partial<Credential> = {}): Credential {
   return { ref: "pelican-panel", fields: { application_key: APP, client_key: CLI }, uris: [], ...partial };
@@ -132,12 +132,12 @@ describe("key selection (the two-key trap)", () => {
 describe("transport guard", () => {
   it("allows https anywhere and http only on the LAN", () => {
     expect(() => assertTransportOk("https://panel.example.com")).not.toThrow();
-    expect(() => assertTransportOk("http://192.168.0.48")).not.toThrow();
+    expect(() => assertTransportOk("http://192.168.1.48")).not.toThrow();
     expect(() => assertTransportOk("http://10.1.2.3:8080")).not.toThrow();
     expect(() => assertTransportOk("http://localhost:8080")).not.toThrow();
     expect(() => assertTransportOk("http://panel.example.com")).toThrow(/not a private LAN address/);
     expect(() => assertTransportOk("http://8.8.8.8")).toThrow(/not a private LAN address/);
-    expect(() => assertTransportOk("ftp://192.168.0.48")).toThrow(/Unsupported/);
+    expect(() => assertTransportOk("ftp://192.168.1.48")).toThrow(/Unsupported/);
   });
 
   it("refuses to send a key over plain http to a routable host, before any call", async () => {
@@ -150,9 +150,9 @@ describe("transport guard", () => {
   });
 
   it("baseUrl picks http for the LAN panel and https on 443/8443", () => {
-    expect(baseUrl(target({}, 80))).toBe("http://192.168.0.48:80");
-    expect(baseUrl(target({}, 443))).toBe("https://192.168.0.48:443");
-    expect(baseUrl(target({ baseUrl: "http://192.168.0.48/" }))).toBe("http://192.168.0.48");
+    expect(baseUrl(target({}, 80))).toBe("http://192.168.1.48:80");
+    expect(baseUrl(target({}, 443))).toBe("https://192.168.1.48:443");
+    expect(baseUrl(target({ baseUrl: "http://192.168.1.48/" }))).toBe("http://192.168.1.48");
   });
 });
 
@@ -176,7 +176,7 @@ describe("redaction", () => {
   });
 
   it("isPrivateIPv4 accepts RFC1918 only", () => {
-    for (const ip of ["10.0.0.1", "172.16.0.1", "192.168.0.48"]) expect(isPrivateIPv4(ip)).toBe(true);
+    for (const ip of ["10.0.0.1", "172.16.0.1", "192.168.1.48"]) expect(isPrivateIPv4(ip)).toBe(true);
     for (const ip of ["8.8.8.8", "172.32.0.1", "999.1.1.1", "nope", ""]) expect(isPrivateIPv4(ip)).toBe(false);
   });
 });
@@ -184,11 +184,11 @@ describe("redaction", () => {
 describe("summarizers", () => {
   it("summarizeAllocations puts FREE first and labels assigned ones", () => {
     const out = summarizeAllocations([
-      { id: 1, ip: "192.168.0.48", port: 2456, assigned: true },
-      { id: 2, ip: "192.168.0.48", port: 2457, assigned: false },
+      { id: 1, ip: "192.168.1.48", port: 2456, assigned: true },
+      { id: 2, ip: "192.168.1.48", port: 2457, assigned: false },
     ]);
     expect(out.indexOf("FREE (1)")).toBeLessThan(out.indexOf("ASSIGNED (1)"));
-    expect(out).toContain("[2] 192.168.0.48:2457");
+    expect(out).toContain("[2] 192.168.1.48:2457");
   });
 
   it("summarizeServers prints all three identities", () => {
@@ -275,8 +275,8 @@ describe("reads use the right API half and follow pagination", () => {
 
   it("follows pagination instead of truncating at page 1", async () => {
     const calls = mockFetch([
-      { match: (u) => u.includes("page=1&"), reply: { json: list([{ id: 1, ip: "192.168.0.48", port: 2456, assigned: false }], 1, 2) } },
-      { match: (u) => u.includes("page=2&"), reply: { json: list([{ id: 2, ip: "192.168.0.48", port: 2457, assigned: false }], 2, 2) } },
+      { match: (u) => u.includes("page=1&"), reply: { json: list([{ id: 1, ip: "192.168.1.48", port: 2456, assigned: false }], 1, 2) } },
+      { match: (u) => u.includes("page=2&"), reply: { json: list([{ id: 2, ip: "192.168.1.48", port: 2457, assigned: false }], 2, 2) } },
     ]);
     const res = await tool("list_allocations").run({ node: 1 }, ctx());
     expect(res.text).toContain("FREE (2)");
@@ -349,8 +349,8 @@ describe("create_server", () => {
   const eggs = list([{ id: 5, name: "Valheim" }]);
   const nodes = list([{ id: 1, name: "n1" }]);
   const allocs = list([
-    { id: 11, ip: "192.168.0.48", port: 2456, assigned: false },
-    { id: 12, ip: "192.168.0.48", port: 2500, assigned: true },
+    { id: 11, ip: "192.168.1.48", port: 2456, assigned: false },
+    { id: 12, ip: "192.168.1.48", port: 2500, assigned: true },
   ]);
   /** The egg's variables, with the defaults create_server must fill in. */
   const eggWithVars = item({
@@ -382,7 +382,7 @@ describe("create_server", () => {
 
   it("resolves egg by name and allocation by ip:port, and posts the full required body", async () => {
     const calls = mock();
-    const res = await tool("create_server").run({ name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456" }, ctx());
+    const res = await tool("create_server").run({ name: "valheim", egg: "Valheim", allocation: "192.168.1.48:2456" }, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("identifier=abc123");
     expect(res.text).toContain("owner user 7");
@@ -402,7 +402,7 @@ describe("create_server", () => {
   it("sends EVERY egg variable, filling omitted ones from the egg's defaults", async () => {
     const calls = mock();
     const res = await tool("create_server").run(
-      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", environment: { SERVER_NAME: "Jake's server" } },
+      { name: "valheim", egg: "Valheim", allocation: "192.168.1.48:2456", environment: { SERVER_NAME: "Jake's server" } },
       ctx(),
     );
     expect(res.isError).toBeFalsy();
@@ -422,7 +422,7 @@ describe("create_server", () => {
   it("refuses an unknown variable name rather than letting Pelican silently ignore it", async () => {
     const calls = mock();
     const res = await tool("create_server").run(
-      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", environment: { SREVER_NAME: "typo" } },
+      { name: "valheim", egg: "Valheim", allocation: "192.168.1.48:2456", environment: { SREVER_NAME: "typo" } },
       ctx(),
     );
     expect(res.isError).toBe(true);
@@ -440,7 +440,7 @@ describe("create_server", () => {
       { match: (u) => u.includes("/allocations"), reply: { json: allocs } },
       { match: (u) => u.includes("/nodes"), reply: { json: nodes } },
     ]);
-    const res = await tool("create_server").run({ name: "v", egg: "Valheim", allocation: "192.168.0.48:2456" }, ctx());
+    const res = await tool("create_server").run({ name: "v", egg: "Valheim", allocation: "192.168.1.48:2456" }, ctx());
     expect(res.isError).toBe(true);
     expect(res.text).toMatch(/variables.*include|stored EMPTY/);
     expect(writes(calls)).toHaveLength(0);
@@ -455,15 +455,15 @@ describe("create_server", () => {
         match: (u) => u.includes("/allocations"),
         reply: {
           json: list([
-            { id: 11, ip: "192.168.0.48", port: 2456, assigned: false },
-            { id: 12, ip: "192.168.0.48", port: 2457, assigned: false },
+            { id: 11, ip: "192.168.1.48", port: 2456, assigned: false },
+            { id: 12, ip: "192.168.1.48", port: 2457, assigned: false },
           ]),
         },
       },
       { match: (u) => u.includes("/nodes"), reply: { json: nodes } },
     ]);
     const res = await tool("create_server").run(
-      { name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456", additionalAllocations: ["192.168.0.48:2457"] },
+      { name: "valheim", egg: "Valheim", allocation: "192.168.1.48:2456", additionalAllocations: ["192.168.1.48:2457"] },
       ctx(),
     );
     expect(res.isError).toBeFalsy();
@@ -475,7 +475,7 @@ describe("create_server", () => {
   it("refuses an additional allocation that is also the default", async () => {
     const calls = mock();
     const res = await tool("create_server").run(
-      { name: "v", egg: "Valheim", allocation: "192.168.0.48:2456", additionalAllocations: ["192.168.0.48:2456"] },
+      { name: "v", egg: "Valheim", allocation: "192.168.1.48:2456", additionalAllocations: ["192.168.1.48:2456"] },
       ctx(),
     );
     expect(res.isError).toBe(true);
@@ -485,7 +485,7 @@ describe("create_server", () => {
 
   it("refuses an allocation that is already assigned", async () => {
     const calls = mock();
-    const res = await tool("create_server").run({ name: "x", egg: "5", allocation: "192.168.0.48:2500" }, ctx());
+    const res = await tool("create_server").run({ name: "x", egg: "5", allocation: "192.168.1.48:2500" }, ctx());
     expect(res.isError).toBe(true);
     expect(res.text).toContain("already assigned");
     expect(writes(calls)).toHaveLength(0);
@@ -493,7 +493,7 @@ describe("create_server", () => {
 
   it("errors clearly on an unknown egg, without creating anything", async () => {
     const calls = mock();
-    const res = await tool("create_server").run({ name: "x", egg: "Minecraft", allocation: "192.168.0.48:2456" }, ctx());
+    const res = await tool("create_server").run({ name: "x", egg: "Minecraft", allocation: "192.168.1.48:2456" }, ctx());
     expect(res.isError).toBe(true);
     expect(res.text).toContain("No Pelican egg named 'Minecraft'");
     expect(writes(calls)).toHaveLength(0);
@@ -505,7 +505,7 @@ describe("create_server", () => {
     const res = await pelicanConnector
       .buildTools(t)
       .find((x) => x.name === "create_server")!
-      .run({ name: "x", egg: "Valheim", allocation: "192.168.0.48:2456" }, { target: t, getCredential: async () => cred() });
+      .run({ name: "x", egg: "Valheim", allocation: "192.168.1.48:2456" }, { target: t, getCredential: async () => cred() });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("ownerUserId");
     expect(calls).toHaveLength(0);
@@ -513,8 +513,8 @@ describe("create_server", () => {
 
   it("confirm text matches the plan's canonical format exactly", () => {
     expect(
-      tool("create_server").confirm!({ name: "valheim", egg: "Valheim", allocation: "192.168.0.48:2456" }, target({ ownerUserId: 7 })),
-    ).toBe("Create Pelican server 'valheim' (egg 'Valheim', allocation 192.168.0.48:2456, owner user 7) on pelican-panel");
+      tool("create_server").confirm!({ name: "valheim", egg: "Valheim", allocation: "192.168.1.48:2456" }, target({ ownerUserId: 7 })),
+    ).toBe("Create Pelican server 'valheim' (egg 'Valheim', allocation 192.168.1.48:2456, owner user 7) on pelican-panel");
   });
 });
 
@@ -840,9 +840,9 @@ describe("schedules", () => {
 
 describe("assign_allocation", () => {
   it("POSTs with no body and reports the IP:port the panel chose", async () => {
-    const calls = mockFetch([{ match: (u) => u.includes("/network/allocations"), reply: { json: item({ id: 12, ip: "192.168.0.48", port: 2457 }) } }]);
+    const calls = mockFetch([{ match: (u) => u.includes("/network/allocations"), reply: { json: item({ id: 12, ip: "192.168.1.48", port: 2457 }) } }]);
     const res = await tool("assign_allocation").run({ server: "abc123" }, ctx());
-    expect(res.text).toContain("192.168.0.48:2457");
+    expect(res.text).toContain("192.168.1.48:2457");
     expect(calls[0]!.init.method).toBe("POST");
     expect(calls[0]!.init.body).toBeUndefined();
   });
@@ -885,12 +885,12 @@ describe("port expansion (mirrors the panel's AssignmentService)", () => {
   it("refuses CIDR, which the panel would expand across every port", () => {
     expect(() => assertAllocationIp("192.168.0.0/24")).toThrow(/refuses CIDR/);
     expect(() => assertAllocationIp("192.168.0.999")).toThrow(/one literal IPv4/);
-    expect(assertAllocationIp(" 192.168.0.48 ")).toBe("192.168.0.48");
+    expect(assertAllocationIp(" 192.168.1.48 ")).toBe("192.168.1.48");
   });
 });
 
 describe("create_allocations", () => {
-  const existing = [{ id: 11, ip: "192.168.0.48", port: 2500, assigned: true }];
+  const existing = [{ id: 11, ip: "192.168.1.48", port: 2500, assigned: true }];
 
   it("sends ports as strings and reports the ids it had to re-read (204 returns nothing)", async () => {
     // The POST answers 204 with an empty body, so the allocation list must differ
@@ -907,34 +907,34 @@ describe("create_allocations", () => {
           return { ok: true, status: 204, statusText: "", headers: { get: () => null }, text: async () => "" } as any;
         }
         const rows = posted
-          ? [...existing, { id: 21, ip: "192.168.0.48", port: 2456 }, { id: 22, ip: "192.168.0.48", port: 2457 }]
+          ? [...existing, { id: 21, ip: "192.168.1.48", port: 2456 }, { id: 22, ip: "192.168.1.48", port: 2457 }]
           : existing;
         return { ok: true, status: 200, statusText: "", headers: { get: () => null }, text: async () => JSON.stringify(list(rows)) } as any;
       }),
     );
 
-    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.0.48", ports: ["2456-2457"], alias: "valheim" }, ctx());
+    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.1.48", ports: ["2456-2457"], alias: "valheim" }, ctx());
     expect(res.isError).toBeFalsy();
     const post = writes(calls)[0]!;
     expect(authOn(post)).toBe(`Bearer ${APP}`);
-    expect(JSON.parse(post.init.body)).toEqual({ ip: "192.168.0.48", ports: ["2456", "2457"], alias: "valheim" });
-    expect(res.text).toContain("192.168.0.48:2456 [21]");
-    expect(res.text).toContain("192.168.0.48:2457 [22]");
+    expect(JSON.parse(post.init.body)).toEqual({ ip: "192.168.1.48", ports: ["2456", "2457"], alias: "valheim" });
+    expect(res.text).toContain("192.168.1.48:2456 [21]");
+    expect(res.text).toContain("192.168.1.48:2457 [22]");
     expect(res.text).toMatch(/port-forward/i);
   });
 
   it("refuses a port the node already has, WITHOUT posting (the unique index makes it a 500)", async () => {
     const calls = mockFetch([{ match: (u) => u.includes("/allocations"), reply: { json: list(existing) } }]);
-    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.0.48", ports: ["2500"] }, ctx());
+    const res = await tool("create_allocations").run({ node: 1, ip: "192.168.1.48", ports: ["2500"] }, ctx());
     expect(res.isError).toBe(true);
-    expect(res.text).toContain("192.168.0.48:2500 [11]");
+    expect(res.text).toContain("192.168.1.48:2500 [11]");
     expect(res.text).toMatch(/unique index/);
     expect(writes(calls)).toHaveLength(0);
   });
 
   it("confirm text names the node, address, ports and expanded count", () => {
-    expect(tool("create_allocations").confirm!({ node: 1, ip: "192.168.0.48", ports: ["2456-2458"] }, target({ ownerUserId: 7 }))).toBe(
-      "Create allocations on Pelican node 1 on pelican-panel: 192.168.0.48 ports 2456-2458 (3 port(s))",
+    expect(tool("create_allocations").confirm!({ node: 1, ip: "192.168.1.48", ports: ["2456-2458"] }, target({ ownerUserId: 7 }))).toBe(
+      "Create allocations on Pelican node 1 on pelican-panel: 192.168.1.48 ports 2456-2458 (3 port(s))",
     );
   });
 });
@@ -964,7 +964,7 @@ describe("import_egg", () => {
   // link-local (cloud metadata), CGNAT and IPv6 private space are all local
   // reach, and `::ffff:127.0.0.1` must not smuggle loopback past the v4 check.
   it.each([
-    ["https://192.168.0.48/x", "RFC1918"],
+    ["https://192.168.1.48/x", "RFC1918"],
     ["https://10.0.0.1/x", "RFC1918"],
     ["https://172.16.5.5/x", "RFC1918"],
     ["https://127.0.0.1/x", "loopback"],
@@ -1124,15 +1124,15 @@ describe("import_egg", () => {
 });
 
 describe("panel host resolution (the one place a connector reaches another target)", () => {
-  const sshTarget: Target = { name: "pelican48", type: "ssh", host: "192.168.0.48", credentialRef: "pelican48-ssh" };
-  const panelTarget = (o: Record<string, unknown> = {}) => target({ ownerUserId: 7, sshTarget: "pelican48", ...o });
+  const sshTarget: Target = { name: "panel-host", type: "ssh", host: "192.168.1.48", credentialRef: "panel-host-ssh" };
+  const panelTarget = (o: Record<string, unknown> = {}) => target({ ownerUserId: 7, sshTarget: "panel-host", ...o });
 
   function hostCtx(over: Partial<ToolContext> = {}, t: Target = panelTarget()): ToolContext {
     return {
       target: t,
       getCredential: async () => cred(),
-      resolveTarget: (name: string) => (name === "pelican48" ? sshTarget : undefined),
-      resolveCredential: async () => ({ ref: "pelican48-ssh", username: "jake", password: "pw", fields: {}, uris: [] }),
+      resolveTarget: (name: string) => (name === "panel-host" ? sshTarget : undefined),
+      resolveCredential: async () => ({ ref: "panel-host-ssh", username: "jake", password: "pw", fields: {}, uris: [] }),
       ...over,
     };
   }
@@ -1209,9 +1209,9 @@ describe("panel version comparison", () => {
 
 describe("panel_upgrade confirm (the sequence itself lives in the host helper — see pelican-host.test.ts)", () => {
   it("names the host, the version, the target release, the backup choice and the helper", () => {
-    const t = target({ ownerUserId: 7, sshTarget: "pelican48" });
+    const t = target({ ownerUserId: 7, sshTarget: "panel-host" });
     const confirm = pelicanConnector.buildTools(t).find((x) => x.name === "panel_upgrade")!.confirm!;
-    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself on host 'pelican48'");
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself on host 'panel-host'");
     expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("from 1.0.0-beta35 to the latest release");
     expect(confirm({ expectVersion: "1.0.0-beta35", release: "v1.0.0-rc.1" }, t)).toContain("to v1.0.0-rc.1");
     expect(confirm({ expectVersion: "1.0.0-beta35", skipBackup: true }, t)).toMatch(/SKIPS the database backup/);
@@ -1252,14 +1252,14 @@ describe("vault-backed variables (no secret ever crosses the MCP channel)", () =
       { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9, identifier: "abc123" }) } },
       { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggVars } },
       { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim" }]) } },
-      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.0.48", port: 2456, assigned: false }]) } },
+      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.1.48", port: 2456, assigned: false }]) } },
       { match: (u) => u.includes("/nodes"), reply: { json: list([{ id: 1 }]) } },
     ]);
     const res = await tool("create_server").run(
       {
         name: "valheim",
         egg: "Valheim",
-        allocation: "192.168.0.48:2456",
+        allocation: "192.168.1.48:2456",
         environment: { SERVER_NAME: "Jake's server" },
         secretEnvironment: [{ name: "PASSWORD", credentialRef: "valheim-password" }],
       },
@@ -1279,14 +1279,14 @@ describe("vault-backed variables (no secret ever crosses the MCP channel)", () =
       { match: (u, i) => u.includes("/servers") && i?.method === "POST", reply: { json: item({ id: 9 }) } },
       { match: (u) => /\/eggs\/\d+/.test(u), reply: { json: eggVars } },
       { match: (u) => u.includes("/eggs"), reply: { json: list([{ id: 5, name: "Valheim" }]) } },
-      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.0.48", port: 2456, assigned: false }]) } },
+      { match: (u) => u.includes("/allocations"), reply: { json: list([{ id: 11, ip: "192.168.1.48", port: 2456, assigned: false }]) } },
       { match: (u) => u.includes("/nodes"), reply: { json: list([{ id: 1 }]) } },
     ]);
     await tool("create_server").run(
       {
         name: "v",
         egg: "Valheim",
-        allocation: "192.168.0.48:2456",
+        allocation: "192.168.1.48:2456",
         environment: { PASSWORD: "typed-in-chat" },
         secretEnvironment: [{ name: "PASSWORD", credentialRef: "valheim-password" }],
       },
@@ -1447,7 +1447,7 @@ describe("files — guards", () => {
   it("assertPullUrl allows only public https — the daemon fetches from inside the LAN", () => {
     expect(assertPullUrl("https://thunderstore.io/package/download/denikson/BepInExPack_Valheim/5.4.2351/").hostname).toBe("thunderstore.io");
     expect(() => assertPullUrl("http://thunderstore.io/x.zip")).toThrow("https");
-    expect(() => assertPullUrl("https://192.168.0.229:8787/x.zip")).toThrow("inside the network");
+    expect(() => assertPullUrl("https://192.168.1.20:8787/x.zip")).toThrow("inside the network");
     expect(() => assertPullUrl("https://127.0.0.1/x.zip")).toThrow("inside the network");
     expect(() => assertPullUrl("https://localhost/x.zip")).toThrow("inside the network");
     expect(() => assertPullUrl("not a url")).toThrow("Invalid");
@@ -1840,10 +1840,10 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     POWER_WAIT.intervalMs = 1;
     fake = await startFakeKuma({
       monitors: [
-        { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
-        { id: 13, name: "Palworld", type: "port", hostname: "192.168.0.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },
-        { id: 14, name: "node", type: "ping", hostname: "192.168.0.48", active: 1, tags: [{ name: "wing", value: "node" }] },
-        { id: 15, name: "Valheim query", type: "port", hostname: "192.168.0.48", port: 2457, active: 0, tags: [{ name: "server", value: "f5eb47ac" }] },
+        { id: 12, name: "Valheim", type: "port", hostname: "192.168.1.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
+        { id: 13, name: "Palworld", type: "port", hostname: "192.168.1.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+        { id: 14, name: "node", type: "ping", hostname: "192.168.1.48", active: 1, tags: [{ name: "wing", value: "node" }] },
+        { id: 15, name: "Valheim query", type: "port", hostname: "192.168.1.48", port: 2457, active: 0, tags: [{ name: "server", value: "f5eb47ac" }] },
       ],
     });
   });
@@ -2025,8 +2025,8 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     fake = await startFakeKuma({
       listUpdates: "updateMonitorIntoList",
       monitors: [
-        { id: 12, name: "Valheim", type: "port", hostname: "192.168.0.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }] },
-        { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.0.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] },
+        { id: 12, name: "Valheim", type: "port", hostname: "192.168.1.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }] },
+        { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.1.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] },
       ],
     });
     fake.failPause.add(17);
@@ -2078,7 +2078,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
   });
 
   it("rolls back and refuses when a pause fails part-way, so the action is never sent half-silenced", async () => {
-    fake.monitors.set(17, { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.0.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] });
+    fake.monitors.set(17, { id: 17, name: "Valheim (public)", type: "port", hostname: "192.168.1.48", port: 2458, active: 1, tags: [{ name: "server", value: "f5eb47ac" }] });
     fake.failPause.add(17);
     const calls = panelRoutes([{ state: "running" }]);
     const res = await power({});

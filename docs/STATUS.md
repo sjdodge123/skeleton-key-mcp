@@ -71,7 +71,7 @@ Roughly in priority order — pick up any of these:
 
 - The repo is **public** and deliberately carries **no real hostnames/IPs** — use generic placeholders (`<NAS_LAN_IP>:8787`, `192.168.x`) in code and docs.
 - The live deployment specifics (actual LAN IP, Vaultwarden internal URL, which hosts exist) live only with the owner. Don't hard-code them.
-- Watchtower on the NAS auto-pulls new `:latest`; a container restart re-locks the vault (unlock via the web UI unless `SKELETON_KEY_PASSPHRASE` is set).
+- Watchtower on the NAS auto-pulls new `:latest`, which now moves only when a `vX.Y.Z` release is tagged (merges publish `:main`); a container restart re-locks the vault (unlock via the web UI unless `SKELETON_KEY_PASSPHRASE` is set).
 
 ## Working agreements (how this project has been run)
 

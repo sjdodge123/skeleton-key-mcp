@@ -12,7 +12,7 @@ It's a framework, not a fixed inventory: connectors are adapters for a *type* of
 
 ## Quick start
 
-CI publishes an image to `ghcr.io/sjdodge123/skeleton-key-mcp:latest` on every push to `main`.
+CI publishes `ghcr.io/sjdodge123/skeleton-key-mcp:latest` (plus `:X.Y.Z` and `:X.Y`) when a `vX.Y.Z` release is tagged. Every merge to `main` also publishes `:main` and `:sha-<short>` for testing, but `:latest` only moves on a release. Images are signed with [cosign](https://github.com/sigstore/cosign) (keyless) and carry an SBOM and build provenance.
 
 ```bash
 docker pull ghcr.io/sjdodge123/skeleton-key-mcp:latest
@@ -229,3 +229,13 @@ Runtime state lives under `SKELETON_KEY_DATA_DIR` (default `./data`): the encryp
 Requires the Bitwarden CLI (`bw`) on `PATH` for the Vaultwarden connection step; the Docker image installs it for you.
 
 See `docs/SCOPE.md` for the full architecture and roadmap.
+
+## Contributing
+
+Contributions are welcome, especially new connectors. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It covers the security non-negotiables, the naming conventions, and how to propose a connector. Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+**Found a vulnerability?** Report it privately. See [SECURITY.md](SECURITY.md).
+
+## License
+
+[Apache-2.0](LICENSE)

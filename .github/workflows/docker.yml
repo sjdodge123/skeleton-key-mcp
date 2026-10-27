@@ -1,11 +1,20 @@
 name: Docker
 
-# Publishes a container image to GHCR so the NAS can pull it directly.
+# Publishes the container image to GHCR.
+#
+#   push to main  -> :main and :sha-<short>   (for testing; NOT :latest)
+#   tag vX.Y.Z    -> :latest, :X.Y.Z, :X.Y    (a deliberate release)
+#
+# `:latest` moves only on a release tag, so a merged PR never reaches a
+# Watchtower-style auto-updater until a maintainer cuts a release.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -18,11 +27,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign signing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -30,25 +42,39 @@ jobs:
 
       - name: Derive image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Attach an SBOM and full build provenance to the pushed image.
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - name: Sign the image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"

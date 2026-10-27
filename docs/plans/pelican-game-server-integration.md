@@ -133,7 +133,7 @@ Talks to the Pelican Panel **Application API** for provisioning/inventory and
 the **Client API** for power, startup and schedules (the connector picks the
 key per tool from the single `pelican-panel` item). Needs its own target
 registration (Panel URL + `credentialRef`) — separate from the existing
-`pelican48` SSH target, which is the box's shell, not the panel HTTP API.
+`panel-host` SSH target, which is the box's shell, not the panel HTTP API.
 Target option `ownerUserId` (the dedicated Pelican user's id) is required and
 is what `create_server` sets as `user`.
 
@@ -147,7 +147,7 @@ is what `create_server` sets as `user`.
   `delete_schedule` (this is what enforces "server hours"), `assign_allocation`
 - Confirm text names the server (identifier + name) and the exact change,
   e.g. `Create Pelican server 'valheim' (egg 'Valheim', allocation
-  192.168.0.48:2456, owner user 7) on pelican-panel`.
+  192.168.1.48:2456, owner user 7) on pelican-panel`.
 - Implement `snapshot()` (server + schedule JSON) so `form_skeleton` covers it.
 
 ### 2. `discord` connector (new) — webhook management with a dedicated bot
@@ -196,7 +196,7 @@ is unavailable, so RL is never a hard dependency of provisioning.
   Skeleton Key host/port, the UniFi gateway, Vaultwarden, Portainer, and low
   infra ports (22, 443, 8787, …); prefer constraining the destination to an
   IP:port returned by `pelican.list_allocations`.
-- Confirm text reads like `Open WAN UDP 2456-2458 → 192.168.0.48:2456
+- Confirm text reads like `Open WAN UDP 2456-2458 → 192.168.1.48:2456
   ('valheim') on unifi`.
 - Update `docs/SCOPE.md` (UniFi execute row + security-model bullet) — it
   currently says UniFi execute is toggles-only.
@@ -266,7 +266,7 @@ Steps 3–4 and 5–6 are independent of each other and can be parallel PRs.
   **remotely-managed**~~ **Resolved 2026-09-03:** checked via
   `GET /accounts/{account}/cfd_tunnel` with the `cloudflare-api-token` cred —
   the relevant tunnel, `status.gamernight.net` (running as the `awesome_knuth`
-  container on nas229), reports `"remote_config": true, "config_src":
+  container on nas1), reports `"remote_config": true, "config_src":
   "cloudflare"` — remotely-managed, no migration needed. (A second,
   unrelated tunnel `chaochao-dev` is locally-managed — `config_src: "local"`
   — but nothing in this plan touches it.) The current `cloudflare-api-token`
