@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
-import { authenticator } from "otplib";
+import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 
 // Real-AppState-over-HTTP harness (same shape as admin-routes.test.ts): the temp
 // data dir is set BEFORE importing, so paths.snapshotsDir points into it.
@@ -43,7 +43,7 @@ function post(p: string, body: unknown): Promise<Response> {
 }
 async function initAndSetup(): Promise<string> {
   await post("/store/init", { passphrase: "wizard-passphrase" });
-  const secret = authenticator.generateSecret();
+  const secret = generateTotpSecret();
   await app.store.update({ totpSecret: secret });
   const { paths } = await import("../config/paths.js");
   await writeFile(paths.setupComplete, JSON.stringify({ completedAt: "test" }), { mode: 0o600 });
@@ -61,7 +61,7 @@ describe("snapshot routes", () => {
     const id = await makeSkeleton();
     expect((await post("/snapshots", {})).status).toBe(400); // missing code
     expect((await post("/snapshots", { totp: "000000" })).status).toBe(403); // wrong code
-    const ok = await post("/snapshots", { totp: authenticator.generate(secret) });
+    const ok = await post("/snapshots", { totp: generateTotpCode(secret) });
     expect(ok.status).toBe(200);
     const body = await ok.json();
     expect(body.skeletons.some((s: any) => s.id === id)).toBe(true);
@@ -76,7 +76,7 @@ describe("snapshot routes", () => {
   it("download streams a gzip attachment with a valid TOTP", async () => {
     const secret = await initAndSetup();
     const id = await makeSkeleton();
-    const r = await post(`/snapshots/${id}/download`, { totp: authenticator.generate(secret) });
+    const r = await post(`/snapshots/${id}/download`, { totp: generateTotpCode(secret) });
     expect(r.status).toBe(200);
     expect(r.headers.get("content-disposition")).toContain(`skeleton-${id}.tar.gz`);
     const buf = Buffer.from(await r.arrayBuffer());
@@ -85,9 +85,9 @@ describe("snapshot routes", () => {
 
   it("rejects a traversal id and 404s an unknown id", async () => {
     const secret = await initAndSetup();
-    const bad = await post(`/snapshots/${encodeURIComponent("../etc")}/download`, { totp: authenticator.generate(secret) });
+    const bad = await post(`/snapshots/${encodeURIComponent("../etc")}/download`, { totp: generateTotpCode(secret) });
     expect([400, 404]).toContain(bad.status);
-    const missing = await post(`/snapshots/nope-missing/download`, { totp: authenticator.generate(secret) });
+    const missing = await post(`/snapshots/nope-missing/download`, { totp: generateTotpCode(secret) });
     expect(missing.status).toBe(404);
   });
 });

@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
-import { authenticator } from "otplib";
+import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 
 /**
  * Exercises the /api/store/autounlock endpoints over real HTTP with a real
@@ -97,7 +97,7 @@ describe("auto-unlock endpoints", () => {
 
   it("post-setup: status, enable, and disable are all TOTP-gated", async () => {
     await initStore();
-    const secret = authenticator.generateSecret();
+    const secret = generateTotpSecret();
     await markSetupComplete(secret);
 
     // Even reading kill-switch state requires a code post-setup.
@@ -106,17 +106,17 @@ describe("auto-unlock endpoints", () => {
     expect((await post("/store/autounlock/enable", {})).status).toBe(400);
     expect((await post("/store/autounlock/enable", { totp: "000000" })).status).toBe(403);
 
-    const ok = await post("/store/autounlock/enable", { totp: authenticator.generate(secret) });
+    const ok = await post("/store/autounlock/enable", { totp: generateTotpCode(secret) });
     expect(ok.status).toBe(200);
     expect(existsSync(keyFile)).toBe(true);
-    expect((await status(authenticator.generate(secret))).enabled).toBe(true);
+    expect((await status(generateTotpCode(secret))).enabled).toBe(true);
 
     expect((await post("/store/autounlock/disable", { totp: "000000" })).status).toBe(403);
-    const off = await post("/store/autounlock/disable", { totp: authenticator.generate(secret) });
+    const off = await post("/store/autounlock/disable", { totp: generateTotpCode(secret) });
     expect(off.status).toBe(200);
     expect(off.json.keyFileRemoved).toBe(true);
     expect(existsSync(keyFile)).toBe(false);
-    expect((await status(authenticator.generate(secret))).enabled).toBe(false);
+    expect((await status(generateTotpCode(secret))).enabled).toBe(false);
   });
 
   it("rolls the keyslot back when the key file can't be written (no mount)", async () => {

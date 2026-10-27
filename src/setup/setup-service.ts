@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-import { authenticator } from "otplib";
+import { generateTotpSecret, totpKeyUri } from "../lib/totp.js";
 import QRCode from "qrcode";
 import type { AppState } from "../app.js";
 import { paths } from "../config/paths.js";
@@ -51,8 +51,8 @@ export class SetupService {
 
   /** Step: enroll TOTP; returns the otpauth URL + a QR data-URL for display. */
   async beginTotpEnrollment(accountLabel = "skeleton-key"): Promise<{ secret: string; otpauth: string; qrDataUrl: string }> {
-    const secret = authenticator.generateSecret();
-    const otpauth = authenticator.keyuri(accountLabel, "Skeleton Key", secret);
+    const secret = generateTotpSecret();
+    const otpauth = totpKeyUri(accountLabel, "Skeleton Key", secret);
     const qrDataUrl = await QRCode.toDataURL(otpauth);
     // Stored provisionally; only committed once a code is verified.
     await this.app.store.update({ totpSecret: secret });
