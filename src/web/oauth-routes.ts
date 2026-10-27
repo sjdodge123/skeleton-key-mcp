@@ -2,7 +2,7 @@ import { Router, type Response } from "express";
 import { z } from "zod";
 import type { AppState } from "../app.js";
 import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
-import { baseUrl, firstStr } from "./http-util.js";
+import { baseUrl, bodyOf, firstStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
 
 /**
@@ -82,7 +82,7 @@ export function buildOAuthRouter(app: AppState): Router {
   router.post("/oauth/register", (req, res) => {
     const parsed = z
       .object({ client_name: z.string().optional(), redirect_uris: z.array(z.string().url()).min(1) })
-      .safeParse(req.body);
+      .safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: "invalid_client_metadata", error_description: parsed.error.message });
       return;
@@ -129,12 +129,13 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Consent decision (TOTP-gated) ---
   router.post("/oauth/authorize/decision", (req, res) => {
-    const client_id = firstStr(req.body.client_id);
-    const redirect_uri = firstStr(req.body.redirect_uri);
-    const state = firstStr(req.body.state);
-    const code_challenge = firstStr(req.body.code_challenge);
-    const totp = firstStr(req.body.totp);
-    const action = firstStr(req.body.action);
+    const body = bodyOf(req);
+    const client_id = firstStr(body.client_id);
+    const redirect_uri = firstStr(body.redirect_uri);
+    const state = firstStr(body.state);
+    const code_challenge = firstStr(body.code_challenge);
+    const totp = firstStr(body.totp);
+    const action = firstStr(body.action);
     const client = client_id ? app.oauth.getClient(client_id) : undefined;
     if (!client || !client.redirect_uris.includes(redirect_uri)) {
       res.status(400).send("Invalid client or redirect_uri");
@@ -166,12 +167,13 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Token endpoint ---
   router.post("/oauth/token", (req, res) => {
-    const grant_type = firstStr(req.body.grant_type);
-    const code = firstStr(req.body.code);
-    const client_id = firstStr(req.body.client_id);
-    const redirect_uri = firstStr(req.body.redirect_uri);
-    const code_verifier = firstStr(req.body.code_verifier);
-    const refresh_token = firstStr(req.body.refresh_token);
+    const body = bodyOf(req);
+    const grant_type = firstStr(body.grant_type);
+    const code = firstStr(body.code);
+    const client_id = firstStr(body.client_id);
+    const redirect_uri = firstStr(body.redirect_uri);
+    const code_verifier = firstStr(body.code_verifier);
+    const refresh_token = firstStr(body.refresh_token);
     try {
       if (grant_type === "authorization_code") {
         const out = app.oauth.redeemAuthCode({ code, client_id, redirect_uri, code_verifier });
@@ -190,7 +192,7 @@ export function buildOAuthRouter(app: AppState): Router {
 
   // --- Token revocation (RFC 7009) ---
   router.post("/oauth/revoke", (req, res) => {
-    const t = firstStr(req.body.token);
+    const t = firstStr(bodyOf(req).token);
     if (t) app.oauth.revokeToken(t);
     // RFC 7009: always 200, even for unknown/invalid tokens.
     res.status(200).end();

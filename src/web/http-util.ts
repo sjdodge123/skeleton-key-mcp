@@ -1,4 +1,4 @@
-import type { Request } from "express";
+import type { ErrorRequestHandler, Request } from "express";
 
 /**
  * Origin used to build OAuth discovery metadata and the WWW-Authenticate hint.
@@ -31,3 +31,50 @@ export function firstStr(v: unknown): string {
   if (Array.isArray(v)) return typeof v[0] === "string" ? v[0] : "";
   return typeof v === "string" ? v : "";
 }
+
+/**
+ * The parsed request body as a plain record. Express 5 leaves `req.body`
+ * `undefined` when no body parser matched (no body, or an unexpected
+ * Content-Type) where Express 4 defaulted it to `{}`; reading a field off that
+ * would throw and surface as a 500. Anything that isn't a plain object (a JSON
+ * array, a missing body) reads as empty, so a bodyless POST fails the handler's
+ * own validation instead.
+ */
+export function bodyOf(req: Request): Record<string, unknown> {
+  const b: unknown = req.body;
+  return b !== null && typeof b === "object" && !Array.isArray(b) ? (b as Record<string, unknown>) : {};
+}
+
+/**
+ * A named route parameter as a string, or null when it isn't one. Express 5
+ * types params as `string | string[]` (wildcard segments are arrays); a plain
+ * `:name` is always a string at runtime, but these are request inputs on
+ * authenticated routes, so callers narrow and reject rather than cast.
+ */
+export function paramStr(req: Request, name: string): string | null {
+  const v: unknown = req.params[name];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
+ * Final error handler. Express 5 forwards a rejected async handler here (Express
+ * 4 left it an unhandled rejection), and the built-in handler would print the
+ * stack outside production. The response carries only a fixed reason for the
+ * status: never `err.message` (a body-parser JSON error quotes the request body,
+ * which may be a passphrase or TOTP), never a stack, never the request `Host`.
+ * Only server faults are logged, by name and message; client errors (malformed
+ * body, oversized payload) are not, since their message may quote that body.
+ */
+export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
+  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; name?: unknown; message?: unknown };
+  const raw = typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 500;
+  const status = raw >= 400 && raw < 600 ? raw : 500;
+  if (status >= 500) {
+    console.error(`[skeleton-key] request failed: ${String(e.name ?? "Error")}: ${String(e.message ?? err)}`);
+  }
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  res.status(status).json({ error: status >= 500 ? "Internal server error." : status === 413 ? "Request body too large." : "Bad request." });
+};
