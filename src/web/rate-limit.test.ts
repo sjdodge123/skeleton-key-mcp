@@ -254,3 +254,155 @@ describe("OAuth endpoint request limits", () => {
     expect((await form(`${v6}/oauth/token`, { grant_type: "refresh_token", refresh_token: "nope" })).status).toBe(400);
   });
 });
+
+describe("every TOTP route is gated twice: middleware AND handler", () => {
+  /** Each TOTP-gated route, with a body that gets its handler as far as the
+   *  TOTP check. `prep` runs first (returns the path when it's dynamic). */
+  const ROUTES: {
+    name: string;
+    form?: true;
+    preSetup?: true;
+    path: string | (() => string);
+    body: (totp: string) => Record<string, string>;
+  }[] = [
+    { name: "autounlock status", path: "/api/store/autounlock/status", body: (totp) => ({ totp }) },
+    { name: "autounlock enable", path: "/api/store/autounlock/enable", body: (totp) => ({ totp }) },
+    { name: "autounlock disable", path: "/api/store/autounlock/disable", body: (totp) => ({ totp }) },
+    { name: "vault server", path: "/api/vault/server", body: (totp) => ({ totp, serverUrl: "https://vault.example" }) },
+    { name: "setup totp verify", preSetup: true, path: "/api/setup/totp/verify", body: (token) => ({ token }) },
+    { name: "audit recent", path: "/api/audit/recent", body: (totp) => ({ totp }) },
+    { name: "oauth client revoke", path: "/api/oauth/clients/some-client/revoke", body: (totp) => ({ totp }) },
+    { name: "snapshots list", path: "/api/snapshots", body: (totp) => ({ totp }) },
+    { name: "credential requests", path: "/api/credential-requests", body: (totp) => ({ totp }) },
+    { name: "snapshot download", path: "/api/snapshots/20260101-000000/download", body: (totp) => ({ totp }) },
+    {
+      name: "oauth consent",
+      form: true,
+      path: "/oauth/authorize/decision",
+      body: (totp) => {
+        const c = app.oauth.registerClient({ client_name: "Probe", redirect_uris: ["http://localhost:9/cb"] });
+        return { client_id: c.client_id, redirect_uri: "http://localhost:9/cb", state: "s", code_challenge: "c", action: "approve", totp };
+      },
+    },
+    {
+      name: "credential link",
+      form: true,
+      path: "/credential/:id",
+      body: (totp) => ({ totp, secret: "hunter2-hunter2" }),
+    },
+  ];
+
+  async function hit(route: (typeof ROUTES)[number]): Promise<Response> {
+    let path = typeof route.path === "string" ? route.path : route.path();
+    let body = route.body(code());
+    if (route.path === "/credential/:id") {
+      const req = app.credentialRequests.create({ name: "x", host: "h", reason: "r" });
+      path = `/credential/${req.id}`;
+      body = { ...body, formToken: req.formToken };
+    }
+    if (route.form) return form(`${v4}${path}`, body);
+    used.push(code());
+    return fetch(`${v4}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  }
+
+  beforeEach(() => {
+    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    app.vault.createLoginItem = vi.fn();
+    // A global lockout: every client is refused, whatever it sends.
+    for (let i = 0; i < 10; i++) app.checkTotp(wrong(i + 1), { client: `198.51.100.${i}`, via: "test" });
+  });
+
+  for (const route of ROUTES) {
+    it(`${route.name}: 429 + Retry-After from the middleware, and from the handler if the middleware is bypassed`, async () => {
+      const { paths } = await import("../config/paths.js");
+      const { rm: remove } = await import("node:fs/promises");
+      if (route.preSetup) await remove(paths.setupComplete);
+
+      const viaMiddleware = await hit(route);
+      expect(viaMiddleware.status).toBe(429);
+      expect(Number(viaMiddleware.headers.get("retry-after"))).toBeGreaterThan(0);
+
+      // Let the middleware through once: the handler's own check must still refuse.
+      const gate = vi.spyOn(app, "totpLockout").mockImplementationOnce(() => null);
+      const viaHandler = await hit(route);
+      expect(gate).toHaveBeenCalled();
+      expect(viaHandler.status).toBe(429);
+      expect(Number(viaHandler.headers.get("retry-after"))).toBeGreaterThan(0);
+      gate.mockRestore();
+    });
+  }
+
+  it("verifyTotpCode is called only from src/app.ts (everything else must go through checkTotp)", async () => {
+    const { readdir, readFile } = await import("node:fs/promises");
+    const srcDir = path.resolve(__dirname, "..");
+    const files = (await readdir(srcDir, { recursive: true })).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+    const users: string[] = [];
+    for (const f of files) if (/\bverifyTotpCode\b/.test(await readFile(path.join(srcDir, f), "utf8"))) users.push(f.split(path.sep).join("/"));
+    expect(users.sort()).toEqual(["app.ts", "lib/totp.ts"]);
+  });
+});
+
+describe("master passphrase attempt limiting (/api/store/unlock)", () => {
+  let unlocks: string[];
+
+  beforeEach(() => {
+    // The limiter is under test, not argon2: stub the derivation (each real
+    // one is ~1 s of CPU), keeping its contract — throws on a wrong passphrase.
+    unlocks = [];
+    vi.spyOn(app.store, "unlock").mockImplementation(async (p: unknown) => {
+      unlocks.push(String(p));
+      if (p !== "wizard-passphrase") throw new Error("Incorrect passphrase or corrupted bootstrap store.");
+    });
+    app.postUnlock = vi.fn(async () => {});
+  });
+
+  const unlock = async (passphrase: string, base = v4) => {
+    const r = await fetch(`${base}/api/store/unlock`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ passphrase }),
+    });
+    return { status: r.status, retryAfter: r.headers.get("retry-after"), json: await r.json().catch(() => ({})) };
+  };
+
+  it("locks out after 5 wrong passphrases and then refuses the right one WITHOUT deriving", async () => {
+    for (let i = 1; i <= 4; i++) expect((await unlock(`wrong-${i}`)).status).toBe(400);
+    const fifth = await unlock("wrong-5");
+    expect(fifth.status).toBe(429);
+    expect(Number(fifth.retryAfter)).toBe(60);
+    const right = await unlock("wizard-passphrase");
+    expect(right.status).toBe(429);
+    expect(right.json.error).toMatch(/Too many wrong passphrases/);
+    expect(unlocks).toHaveLength(5); // the sixth never reached the store
+    expect((await unlock("wizard-passphrase", v6)).status).toBe(200); // another client is unaffected
+  });
+
+  it("has its own budget, separate from TOTP", async () => {
+    for (let i = 0; i < 10; i++) app.checkTotp(wrong(i + 1), { client: `198.51.100.${i}`, via: "test" });
+    expect((await unlock("wizard-passphrase")).status).toBe(200);
+  });
+
+  it("runs one derivation at a time: a parallel attempt is refused as busy", async () => {
+    let release!: () => void;
+    (app.store.unlock as any).mockImplementationOnce(() => new Promise<void>((r) => (release = r)));
+    const first = app.unlockWithPassphrase("wizard-passphrase", { client: "203.0.113.1", via: "test" });
+    const second = await app.unlockWithPassphrase("wizard-passphrase", { client: "203.0.113.2", via: "test" });
+    expect(second).toEqual({ retryAfterSeconds: 1, busy: true });
+    release();
+    expect(await first).toBeNull();
+  });
+
+  it("audits failures and the lockout, logs the lockout to stdout with the client, and never the passphrase", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (let i = 1; i <= 5; i++) await unlock(`sekrit-guess-${i}`);
+    await unlock("wizard-passphrase");
+    const tools = app.audit.recent(100).map((e: any) => e.tool);
+    expect(tools.filter((t: string) => t === "auth.passphrase_failed")).toHaveLength(5);
+    expect(tools).toContain("auth.passphrase_lockout");
+    expect(tools).toContain("auth.passphrase_refused");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[skeleton-key\] PASSPHRASE lockout: client until \S+Z, last client 127\.0\.0\.1$/));
+    const dump = JSON.stringify(app.audit.recent(100)) + JSON.stringify(warn.mock.calls);
+    expect(dump).not.toMatch(/sekrit-guess|wizard-passphrase/);
+    warn.mockRestore();
+  });
+});

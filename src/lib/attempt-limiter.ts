@@ -1,11 +1,15 @@
 import { isIPv4, isIPv6 } from "node:net";
 
 /**
- * Brute-force limits for the admin second factor, and a plain request limiter
- * for the unauthenticated OAuth endpoints. In-memory by design: a restart
- * re-locks the vault, so there is nothing to brute-force until the admin has
- * unlocked it again, and a fresh counter costs an attacker more than it gains
- * them (see TOTP_LIMITS).
+ * Brute-force limits for the admin second factor and the master passphrase,
+ * and a plain request limiter for the unauthenticated OAuth endpoints.
+ *
+ * In-memory by design: a restart resets every counter. Without boot
+ * auto-unlock a restart also re-locks the vault, so there is no code to guess
+ * until the admin unlocks. WITH auto-unlock the store comes back unlocked, so
+ * a restart is a fresh budget — nothing on this surface lets a client cause
+ * one, but a crash it could trigger would. Persisting the counters is a
+ * possible follow-up.
  */
 
 export interface LockoutPolicy {
@@ -29,14 +33,16 @@ const HOUR = 60 * MINUTE;
  *
  * The global budget is the bound, because a LAN attacker can use as many
  * addresses as they like. It allows 10 wrong codes per 24 h before a lockout
- * of 1, 2, 4 … 128 minutes, then 4 hours for every further one. The window is
- * a day, not minutes, so pacing guesses just under the threshold yields only 9
- * a day. The best strategy is to climb the ladder (80 guesses in ~4¼ h), sit
- * out the 24 h reset and climb again: about 68 guesses a day, ~25,000 a year —
- * a 2.5% chance of success per year, ~40 years expected (~28 years median).
- * Holding at the 4-hour cap gives 60 a day. `attempt-limiter.test.ts`
- * simulates these strategies. Without the limiter, the whole code space falls
- * in well under an hour.
+ * of 1, 2, 4 … 128 minutes, then 4 hours for every further one. The doubling
+ * only starts over after 48 h with no lockout running and no failure at all —
+ * longer than the 24 h window, so guesses paced into the wait can't age out
+ * just as the ladder resets. Pacing under the threshold yields 9 a day;
+ * climbing the ladder and waiting out the reset about 41. The best strategy
+ * is simply guessing whenever allowed, which settles at 10 per 4 h: ~60 a
+ * day, ~22,000 a year — a 2.2% chance of success per year, ~45 years
+ * expected (~31 years median). `attempt-limiter.test.ts` simulates these
+ * strategies against this exact policy. Without the limiter, the whole code
+ * space falls in well under an hour.
  *
  * The per-client budget (5 per 15 min) cuts a single noisy address off first
  * and gives the admin a short, local lockout for a run of typos; the numbers
@@ -44,8 +50,16 @@ const HOUR = 60 * MINUTE;
  */
 export const TOTP_LIMITS = {
   client: { maxFailures: 5, windowMs: 15 * MINUTE, baseLockoutMs: MINUTE, maxLockoutMs: 4 * HOUR, resetAfterMs: 24 * HOUR },
-  global: { maxFailures: 10, windowMs: 24 * HOUR, baseLockoutMs: MINUTE, maxLockoutMs: 4 * HOUR, resetAfterMs: 24 * HOUR },
+  global: { maxFailures: 10, windowMs: 24 * HOUR, baseLockoutMs: MINUTE, maxLockoutMs: 4 * HOUR, resetAfterMs: 48 * HOUR },
 } as const satisfies { client: LockoutPolicy; global: LockoutPolicy };
+
+/**
+ * The master-passphrase budget on `/api/store/unlock`, counted separately from
+ * TOTP. Guessing a passphrase is already hopeless at argon2 speed; this mainly
+ * bounds the argon2 work (~1 s of CPU each) an unauthenticated LAN client can
+ * demand, and refuses during a lockout without deriving anything.
+ */
+export const PASSPHRASE_LIMITS = TOTP_LIMITS;
 
 export type LimitScope = "client" | "global";
 
@@ -69,6 +83,8 @@ interface Bucket {
   lockedUntil: number;
   /** Lockouts so far in this escalation run. */
   level: number;
+  /** When the last failure was recorded (0 = never). */
+  lastFailureAt: number;
 }
 
 /**
@@ -79,7 +95,7 @@ interface Bucket {
  * parallel requests can't slip past the check between two awaits.
  */
 export class AttemptLimiter {
-  private readonly global: Bucket = { failures: [], lockedUntil: 0, level: 0 };
+  private readonly global: Bucket = { failures: [], lockedUntil: 0, level: 0, lastFailureAt: 0 };
   private readonly clients = new Map<string, Bucket>();
   private readonly now: () => number;
   private readonly maxClients: number;
@@ -107,7 +123,7 @@ export class AttemptLimiter {
     let bucket = this.clients.get(client);
     if (!bucket) {
       this.makeRoom(now);
-      bucket = { failures: [], lockedUntil: 0, level: 0 };
+      bucket = { failures: [], lockedUntil: 0, level: 0, lastFailureAt: 0 };
       this.clients.set(client, bucket);
     }
     const started: Lockout[] = [];
@@ -128,7 +144,8 @@ export class AttemptLimiter {
   }
 
   private record(b: Bucket, p: LockoutPolicy, now: number): Omit<Lockout, "scope"> | null {
-    if (b.level > 0 && now - b.lockedUntil >= p.resetAfterMs) b.level = 0;
+    if (b.level > 0 && now - lastActivity(b) >= p.resetAfterMs) b.level = 0;
+    b.lastFailureAt = now;
     b.failures = b.failures.filter((t) => now - t < p.windowMs);
     b.failures.push(now);
     if (b.failures.length < p.maxFailures) return null;
@@ -146,7 +163,7 @@ export class AttemptLimiter {
     const p = this.policy.client;
     for (const [key, b] of this.clients) {
       const idle = b.lockedUntil <= now && b.failures.every((t) => now - t >= p.windowMs);
-      if (idle && (b.level === 0 || now - b.lockedUntil >= p.resetAfterMs)) this.clients.delete(key);
+      if (idle && (b.level === 0 || now - lastActivity(b) >= p.resetAfterMs)) this.clients.delete(key);
     }
     while (this.clients.size >= this.maxClients) {
       const oldest = this.clients.keys().next().value;
@@ -154,6 +171,12 @@ export class AttemptLimiter {
       this.clients.delete(oldest);
     }
   }
+}
+
+/** The escalation only resets after `resetAfterMs` with no lockout running
+ *  AND no failure at all — guesses made while waiting restart the wait. */
+function lastActivity(b: Bucket): number {
+  return Math.max(b.lockedUntil, b.lastFailureAt);
 }
 
 /**
@@ -218,4 +241,38 @@ export function clientKey(ip: string | undefined): string {
     .slice(0, 4)
     .map((g) => (parseInt(g, 16) || 0).toString(16))
     .join(":")}::/64`;
+}
+
+/**
+ * Coalesces refusals into at most one audit entry per `intervalMs`, so a
+ * flood against a closed gate can't bloat the append-only log. Each entry
+ * names the DISTINCT clients seen since the last one (the first few), so the
+ * admin's own refused retry can't mask the address that caused the lockout.
+ */
+export class RefusalCoalescer {
+  private pending = 0;
+  private readonly clients = new Set<string>();
+  private more = false;
+  private lastAt = Number.NEGATIVE_INFINITY;
+
+  constructor(
+    private readonly intervalMs: number,
+    private readonly maxClients = 5,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** Note one refusal. Returns what to write when an entry is due, else null. */
+  note(client: string): { count: number; clients: string } | null {
+    this.pending++;
+    if (this.clients.size < this.maxClients) this.clients.add(client);
+    else if (!this.clients.has(client)) this.more = true;
+    const now = this.now();
+    if (now - this.lastAt < this.intervalMs) return null;
+    const out = { count: this.pending, clients: [...this.clients].join(", ") + (this.more ? ", …" : "") };
+    this.pending = 0;
+    this.clients.clear();
+    this.more = false;
+    this.lastAt = now;
+    return out;
+  }
 }

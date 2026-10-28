@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AttemptLimiter, RequestLimiter, TOTP_LIMITS, clientKey, type LockoutPolicy } from "./attempt-limiter.js";
+import { AttemptLimiter, RefusalCoalescer, RequestLimiter, TOTP_LIMITS, clientKey, type LockoutPolicy } from "./attempt-limiter.js";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -131,7 +131,20 @@ describe("AttemptLimiter", () => {
     }
     type Sim = AttemptLimiter & { guess: () => boolean };
 
-    it("greedy (guess whenever allowed) settles at the 4-hour cap: ≤ 60 guesses a day", () => {
+    /** Climb `ladder` lockouts, make `pace` guesses the moment the last one
+     *  ends, then wait `waitMs` before climbing again. */
+    const ladderThenWait = (ladder: number, pace: number, waitMs: number) => (l: AttemptLimiter, c: ReturnType<typeof clock>) => {
+      for (let lockouts = 0; lockouts < ladder; ) {
+        if ((l as Sim).guess()) {
+          if (l.blocked("probe")) lockouts++;
+        } else c.advance(1000);
+      }
+      while (l.blocked("probe")) c.advance(1000);
+      for (let i = 0; i < pace; i++) (l as Sim).guess();
+      c.advance(waitMs);
+    };
+
+    it("greedy (guess whenever allowed) settles at the 4-hour cap: ~60 guesses a day", () => {
       const days = 60;
       const n = simulate(days, (l, c) => {
         if (!(l as Sim).guess()) c.advance(1000);
@@ -140,20 +153,22 @@ describe("AttemptLimiter", () => {
       expect(n / days).toBeLessThanOrEqual(62);
     });
 
-    it("climb the ladder then wait out the reset: ≤ ~68 a day", () => {
+    it("climb 8 rungs, pace 9 guesses as the last lockout ends, wait out the reset: no better than greedy", () => {
+      // The strategy that beat a reset measured from the lockout alone (75.8/day).
       const days = 60;
-      const n = simulate(days, (l, c) => {
-        // 8 lockouts (1 … 128 min), then sit out the 24 h reset.
-        for (let lockouts = 0; lockouts < 8; ) {
-          if ((l as Sim).guess()) {
-            if (l.blocked("probe")) lockouts++;
-          } else c.advance(1000);
-        }
-        while (l.blocked("probe")) c.advance(1000);
-        c.advance(DAY);
-      });
-      expect(n / days).toBeLessThanOrEqual(70);
+      const n = simulate(days, ladderThenWait(8, 9, TOTP_LIMITS.global.resetAfterMs));
+      expect(n / days).toBeLessThanOrEqual(45);
     });
+
+    it("no ladder/pace/wait combination beats ~60 a day", () => {
+      const days = 30;
+      let best = 0;
+      for (const ladder of [4, 6, 7, 8, 9, 10])
+        for (const pace of [0, 5, 9])
+          for (const waitMs of [DAY, DAY + 1000, TOTP_LIMITS.global.resetAfterMs, TOTP_LIMITS.global.resetAfterMs + 1000])
+            best = Math.max(best, simulate(days, ladderThenWait(ladder, pace, waitMs)) / days);
+      expect(best).toBeLessThanOrEqual(62);
+    }, 60_000);
 
     it("pacing just under the threshold yields only 9 a day", () => {
       const days = 30;
@@ -164,12 +179,38 @@ describe("AttemptLimiter", () => {
       expect(n / days).toBeLessThanOrEqual(9);
     });
 
-    it("≤ 70 guesses a day over a year is a < 3% chance against a 6-digit code", () => {
-      const perYear = 70 * 365;
-      const p = 1 - (1 - 1e-6) ** perYear;
-      expect(p).toBeLessThan(0.03);
-      expect(1e6 / perYear).toBeGreaterThan(35); // expected years to success
+    it("pacing 9 per half-window gains nothing (catches a window shortened below a day)", () => {
+      const days = 30;
+      const n = simulate(days, (l, c) => {
+        for (let i = 0; i < 9; i++) (l as Sim).guess();
+        c.advance(TOTP_LIMITS.global.windowMs / 2);
+      });
+      // With the 24 h window this lands lockouts; a 15-min window would allow ~1,700 a day.
+      expect(TOTP_LIMITS.global.windowMs).toBeGreaterThanOrEqual(DAY);
+      expect(n / days).toBeLessThanOrEqual(18);
     });
+
+    it("≤ 62 guesses a day over a year is a < 2.5% chance against a 6-digit code", () => {
+      const perYear = 62 * 365;
+      const p = 1 - (1 - 1e-6) ** perYear;
+      expect(p).toBeLessThan(0.025);
+      expect(1e6 / perYear).toBeGreaterThan(40); // expected years to success
+    });
+
+    it("the escalation reset needs a quiet period longer than the window", () => {
+      expect(TOTP_LIMITS.global.resetAfterMs).toBeGreaterThan(TOTP_LIMITS.global.windowMs);
+    });
+  });
+
+  it("a failure during the quiet period restarts it", () => {
+    const c = clock();
+    const l = new AttemptLimiter({ client: policy({ maxFailures: 2 }), global: policy({ maxFailures: 100 }) }, { now: c.now });
+    l.fail("a");
+    expect(l.fail("a")[0]!.durationMs).toBe(MIN);
+    c.advance(MIN + HOUR - 10);
+    l.fail("a"); // one guess near the end of the wait
+    c.advance(20);
+    expect(l.fail("a")[0]!.durationMs).toBe(2 * MIN); // still escalated
   });
 });
 
@@ -188,6 +229,21 @@ describe("RequestLimiter", () => {
     const r = new RequestLimiter(1, MIN, { maxKeys: 4, now: clock().now });
     for (let i = 0; i < 50; i++) r.hit(`k${i}`);
     expect((r as unknown as { windows: Map<string, unknown> }).windows.size).toBeLessThanOrEqual(4);
+  });
+});
+
+describe("RefusalCoalescer", () => {
+  it("writes at most one entry per interval, naming the distinct clients seen (capped)", () => {
+    const c = clock();
+    const r = new RefusalCoalescer(MIN, 3, c.now);
+    expect(r.note("attacker")).toEqual({ count: 1, clients: "attacker" }); // the first is written at once
+    for (let i = 0; i < 50; i++) expect(r.note(i % 2 ? "attacker" : "admin")).toBeNull();
+    for (const ip of ["a", "b", "c"]) r.note(ip);
+    c.advance(MIN);
+    // The admin's own retries don't mask the attacker; past the cap it says so.
+    expect(r.note("attacker")).toEqual({ count: 54, clients: "admin, attacker, a, …" });
+    c.advance(MIN);
+    expect(r.note("x")).toEqual({ count: 1, clients: "x" });
   });
 });
 

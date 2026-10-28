@@ -11,7 +11,7 @@ import { listConnectors, getConnector, registerableType } from "../connectors/in
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
 import { paramStr } from "./http-util.js";
-import { lockoutMessage, refuseLockedOut, totpAttempt, totpRateLimit } from "./rate-limit.js";
+import { lockoutMessage, passphraseRateLimit, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /** Strip URLs from a vault error before it leaves on the unauthenticated status
  *  endpoint — the vault's address is not something a LAN client should learn. */
@@ -53,7 +53,7 @@ export function buildApiRouter(app: AppState): Router {
   /** Verify the body's code through the attempt limiter. On refusal sends 403
    *  (wrong code) or 429 + Retry-After (locked out) and returns false. */
   const totpOk = (req: Request, res: Response, totp: string): boolean => {
-    const check = app.checkTotp(totp, totpAttempt(req));
+    const check = app.checkTotp(totp, clientAttempt(req));
     if (check.ok) return true;
     if (check.retryAfterSeconds) {
       refuseLockedOut(res, check.retryAfterSeconds).json({ error: lockoutMessage(check.retryAfterSeconds) });
@@ -101,9 +101,16 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/store/unlock",
+    passphraseRateLimit(app),
     h(async (req, res) => {
       const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body ?? {});
-      await app.store.unlock(passphrase);
+      // Attempt-limited like TOTP (its own budget); also one argon2 at a time.
+      const refused = await app.unlockWithPassphrase(passphrase, clientAttempt(req));
+      if (refused) {
+        const { retryAfterSeconds: wait, busy } = refused;
+        refuseLockedOut(res, wait).json({ error: busy ? "An unlock is already in progress — try again in a moment." : lockoutMessage(wait, "passphrases") });
+        return;
+      }
       // Re-establish the saved vault session, keep the bearer hash current, and
       // nudge locked sessions to re-list tools — shared with the boot paths.
       // A vault failure here must not read as a failed unlock: the store IS
@@ -317,7 +324,7 @@ export function buildApiRouter(app: AppState): Router {
     h(async (req, res) => {
       if (!(await guardSetup(res))) return;
       const { token } = z.object({ token: z.string().min(6) }).parse(req.body ?? {});
-      const check = setup.verifyTotp(token, totpAttempt(req));
+      const check = setup.verifyTotp(token, clientAttempt(req));
       if (!check.ok && check.retryAfterSeconds) {
         refuseLockedOut(res, check.retryAfterSeconds).json({ error: lockoutMessage(check.retryAfterSeconds) });
         return;

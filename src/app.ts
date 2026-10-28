@@ -8,7 +8,7 @@ import { CredentialRequestStore } from "./web/credential-requests.js";
 import { loadPublicUrl } from "./config/public-url.js";
 import { hashBearer, loadBearerHash, saveBearerHash } from "./config/bearer-hash.js";
 import { verifyTotpCode } from "./lib/totp.js";
-import { AttemptLimiter, TOTP_LIMITS, type Lockout, type Refusal } from "./lib/attempt-limiter.js";
+import { AttemptLimiter, PASSPHRASE_LIMITS, RefusalCoalescer, TOTP_LIMITS, type Lockout } from "./lib/attempt-limiter.js";
 import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
 import { fingerprintValue } from "./lib/fingerprint.js";
@@ -17,16 +17,26 @@ import { fingerprintValue } from "./lib/fingerprint.js";
  *  locked out (send 429 + Retry-After); a plain failure is a wrong code. */
 export type TotpCheck = { ok: true } | { ok: false; retryAfterSeconds?: number };
 
-/** Who is presenting a code, and where: the limiter's client key (see
- *  `clientKey`) and the route pattern, for the audit log. */
-export interface TotpAttempt {
+/** Who is presenting a code or passphrase, and where: the limiter's client
+ *  key (see `clientKey`) and the route pattern, for the audit log. */
+export interface ClientAttempt {
   client: string;
   via: string;
 }
 
 /** Refusals during a lockout are coalesced to one audit entry per window, so a
  *  flood against a locked gate can't bloat audit.sqlite (cf. server.ts). */
-const TOTP_REFUSAL_LOG_THROTTLE_MS = 10_000;
+const REFUSAL_LOG_THROTTLE_MS = 60_000;
+
+/** One attempt-limited secret: its limiter, its refusal log, and its names. */
+interface AuthGate {
+  /** Audit tool prefix: `auth.<name>_failed` / `_lockout` / `_refused`. */
+  name: "totp" | "passphrase";
+  /** For messages: "authenticator code" / "master passphrase". */
+  what: string;
+  limiter: AttemptLimiter;
+  refusals: RefusalCoalescer;
+}
 
 /**
  * Shared runtime state for the whole process: the encrypted bootstrap store, the
@@ -229,19 +239,26 @@ export class AppState {
 
   /** Brute-force limiter in front of every TOTP verification (in-memory; see TOTP_LIMITS). */
   readonly totpLimiter = new AttemptLimiter(TOTP_LIMITS);
-  private totpRefusalsPending = 0;
-  private lastTotpRefusalLogAt = 0;
+  /** Same for the master passphrase on `/api/store/unlock` (its own budget). */
+  readonly passphraseLimiter = new AttemptLimiter(PASSPHRASE_LIMITS);
+  private readonly totpGate: AuthGate = { name: "totp", what: "authenticator code", limiter: this.totpLimiter, refusals: new RefusalCoalescer(REFUSAL_LOG_THROTTLE_MS) };
+  private readonly passphraseGate: AuthGate = { name: "passphrase", what: "master passphrase", limiter: this.passphraseLimiter, refusals: new RefusalCoalescer(REFUSAL_LOG_THROTTLE_MS) };
+  /** One argon2 derivation at a time: a parallel burst can neither outrun the
+   *  failure counter nor pin the CPU. */
+  private passphraseInFlight = false;
 
   /**
    * Seconds until `attempt.client` may present a code again, or null when it
-   * may now. Never looks at a code. Gates check this before parsing the body;
+   * may now. Never looks at a code. Gates check this before the handler runs;
    * `checkTotp` checks it again before evaluating.
    */
-  totpLockout(attempt: TotpAttempt): number | null {
-    const refusal = this.totpLimiter.blocked(attempt.client);
-    if (!refusal) return null;
-    this.auditTotpRefusal(attempt, refusal);
-    return Math.max(1, Math.ceil(refusal.retryAfterMs / 1000));
+  totpLockout(attempt: ClientAttempt): number | null {
+    return this.lockoutOf(this.totpGate, attempt);
+  }
+
+  /** `totpLockout` for the master passphrase. */
+  passphraseLockout(attempt: ClientAttempt): number | null {
+    return this.lockoutOf(this.passphraseGate, attempt);
   }
 
   /**
@@ -251,7 +268,7 @@ export class AppState {
    * Fails closed if the store is locked (no secret available); that, and an
    * empty code, are refused without counting — there was nothing to guess.
    */
-  checkTotp(token: string, attempt: TotpAttempt): TotpCheck {
+  checkTotp(token: string, attempt: ClientAttempt): TotpCheck {
     const retryAfterSeconds = this.totpLockout(attempt);
     if (retryAfterSeconds !== null) return { ok: false, retryAfterSeconds };
     const secret = this.store.locked ? undefined : this.store.get().totpSecret;
@@ -261,33 +278,71 @@ export class AppState {
       this.totpLimiter.succeed(attempt.client);
       return { ok: true };
     }
-    const lockouts = this.totpLimiter.fail(attempt.client);
-    this.auditTotp("auth.totp_failed", attempt, `wrong authenticator code via ${attempt.via}`);
-    for (const l of lockouts) this.auditTotp("auth.totp_lockout", attempt, lockoutDetail(l, attempt));
-    if (lockouts.length === 0) return { ok: false };
-    return { ok: false, retryAfterSeconds: Math.ceil(Math.max(...lockouts.map((l) => l.durationMs)) / 1000) };
+    const locked = this.recordFailure(this.totpGate, attempt);
+    return locked === null ? { ok: false } : { ok: false, retryAfterSeconds: locked };
   }
 
-  /** Coalesced record of attempts refused during a lockout (see TOTP_REFUSAL_LOG_THROTTLE_MS). */
-  private auditTotpRefusal(attempt: TotpAttempt, refusal: Refusal): void {
-    this.totpRefusalsPending++;
-    const now = Date.now();
-    if (now - this.lastTotpRefusalLogAt < TOTP_REFUSAL_LOG_THROTTLE_MS) return;
-    const n = this.totpRefusalsPending;
-    this.totpRefusalsPending = 0;
-    this.lastTotpRefusalLogAt = now;
-    const scope = refusal.scope === "global" ? "global" : "per-client";
-    this.auditTotp(
-      "auth.totp_refused",
-      attempt,
-      `${n} attempt(s) refused during a ${scope} lockout since the last entry; latest via ${attempt.via}, ` +
-        `${Math.ceil(refusal.retryAfterMs / 1000)} s left`,
-    );
+  /**
+   * Unlock the bootstrap store with the master passphrase, behind its own
+   * attempt limiter. Returns a refusal when locked out (the passphrase is not
+   * evaluated) or while another unlock is still deriving (`busy`), and null
+   * once the store is open. A failed unlock is counted, then rethrown, unless
+   * it started a lockout, which is returned as a refusal instead.
+   */
+  async unlockWithPassphrase(passphrase: string, attempt: ClientAttempt): Promise<{ retryAfterSeconds: number; busy?: true } | null> {
+    const retryAfterSeconds = this.passphraseLockout(attempt);
+    if (retryAfterSeconds !== null) return { retryAfterSeconds };
+    if (this.passphraseInFlight) return { retryAfterSeconds: 1, busy: true };
+    this.passphraseInFlight = true;
+    try {
+      await this.store.unlock(passphrase);
+    } catch (err) {
+      const locked = this.recordFailure(this.passphraseGate, attempt);
+      if (locked !== null) return { retryAfterSeconds: locked };
+      throw err;
+    } finally {
+      this.passphraseInFlight = false;
+    }
+    this.passphraseLimiter.succeed(attempt.client);
+    return null;
   }
 
-  /** Never carries the code: `args` is digested, and a digest of a 6-digit
+  private lockoutOf(gate: AuthGate, attempt: ClientAttempt): number | null {
+    const refusal = gate.limiter.blocked(attempt.client);
+    if (!refusal) return null;
+    const seconds = Math.max(1, Math.ceil(refusal.retryAfterMs / 1000));
+    const due = gate.refusals.note(attempt.client);
+    if (due) {
+      const scope = refusal.scope === "global" ? "global" : "per-client";
+      this.auditAuth(
+        `auth.${gate.name}_refused`,
+        attempt,
+        `${due.count} attempt(s) refused during a ${scope} ${gate.name} lockout since the last entry, ` +
+          `from ${due.clients}; latest via ${attempt.via}, ${seconds} s left`,
+      );
+    }
+    return seconds;
+  }
+
+  /** Count a wrong secret; audit it and any lockout it starts. Returns the
+   *  lockout's length in seconds when one started, else null. */
+  private recordFailure(gate: AuthGate, attempt: ClientAttempt): number | null {
+    const lockouts = gate.limiter.fail(attempt.client);
+    this.auditAuth(`auth.${gate.name}_failed`, attempt, `wrong ${gate.what} via ${attempt.via}`);
+    for (const l of lockouts) {
+      this.auditAuth(`auth.${gate.name}_lockout`, attempt, lockoutDetail(gate, l, attempt));
+      // Also to stdout, so `container_logs` names the address even while the
+      // lockout keeps the admin out of the audit view.
+      const until = new Date(Date.now() + l.durationMs).toISOString();
+      console.warn(`[skeleton-key] ${gate.name.toUpperCase()} lockout: ${l.scope} until ${until}, last client ${attempt.client}`);
+    }
+    if (lockouts.length === 0) return null;
+    return Math.ceil(Math.max(...lockouts.map((l) => l.durationMs)) / 1000);
+  }
+
+  /** Never carries the secret: `args` is digested, and a digest of a 6-digit
    *  code is trivially reversible, so it stays empty. */
-  private auditTotp(tool: string, attempt: TotpAttempt, detail: string): void {
+  private auditAuth(tool: string, attempt: ClientAttempt, detail: string): void {
     try {
       this.audit.record({ ts: new Date().toISOString(), tool, target: attempt.client, tier: "auth", args: {}, status: "denied", detail });
     } catch {
@@ -315,10 +370,10 @@ export class AppState {
   }
 }
 
-function lockoutDetail(l: Lockout, attempt: TotpAttempt): string {
+function lockoutDetail(gate: AuthGate, l: Lockout, attempt: ClientAttempt): string {
   const mins = Math.round(l.durationMs / 60_000);
   const who = l.scope === "global" ? "ALL clients" : `client ${attempt.client}`;
-  return `${who} locked out of TOTP for ${mins} min after ${l.failures} wrong codes (last via ${attempt.via})`;
+  return `${who} locked out of the ${gate.what} for ${mins} min after ${l.failures} wrong attempts (last via ${attempt.via})`;
 }
 
 /** Constant-time string compare (avoids leaking length/prefix via timing). */

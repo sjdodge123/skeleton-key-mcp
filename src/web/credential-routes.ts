@@ -5,7 +5,7 @@ import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
 import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
-import { lockoutMessage, refuseLockedOut, totpAttempt, totpRateLimit } from "./rate-limit.js";
+import { lockoutMessage, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
  * Secure credential hand-off (issue #18). The agent creates a request via the
@@ -281,7 +281,7 @@ export function buildCredentialRouter(app: AppState): Router {
     }
 
     const totp = firstStr(body.totp);
-    const check = app.checkTotp(totp, totpAttempt(req));
+    const check = app.checkTotp(totp, clientAttempt(req));
     if (!check.ok) {
       if (check.retryAfterSeconds) {
         refuseLockedOut(res, check.retryAfterSeconds).type("html").send(formPage(request, { error: lockoutMessage(check.retryAfterSeconds) }));

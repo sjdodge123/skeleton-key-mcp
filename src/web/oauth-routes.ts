@@ -4,7 +4,7 @@ import type { AppState } from "../app.js";
 import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
 import { baseUrl, bodyOf, firstStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
-import { lockoutMessage, oauthRateLimit, refuseLockedOut, totpAttempt, totpRateLimit } from "./rate-limit.js";
+import { lockoutMessage, oauthRateLimit, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
  * OAuth 2.1 endpoints for the MCP authorization flow. Claude discovers these via
@@ -181,7 +181,7 @@ export function buildOAuthRouter(app: AppState): Router {
     if (action === "deny") {
       return redirectError(res, redirect_uri, state, "access_denied", "User denied the request");
     }
-    const check = app.checkTotp(totp, totpAttempt(req));
+    const check = app.checkTotp(totp, clientAttempt(req));
     if (!check.ok) {
       if (check.retryAfterSeconds) refuseLockedOut(res, check.retryAfterSeconds);
       res.type("html").send(
