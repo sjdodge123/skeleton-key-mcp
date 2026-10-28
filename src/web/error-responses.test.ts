@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 import type { AppState } from "../app.js";
@@ -22,6 +23,7 @@ let app: AppState;
 let httpServer: Server;
 let root: string;
 let paths: { setupComplete: string };
+let VaultCommandError: typeof import("../secrets/vaultwarden.js").VaultCommandError;
 
 const TOTP_SECRET = generateTotpSecret();
 const REDIRECT = "http://127.0.0.1:9/callback";
@@ -36,6 +38,7 @@ beforeEach(async () => {
   const { AppState } = await import("../app.js");
   ({ paths } = await import("../config/paths.js"));
   const { buildHttpApp } = await import("./server.js");
+  ({ VaultCommandError } = await import("../secrets/vaultwarden.js"));
   app = await AppState.create();
   const ex = buildHttpApp(app);
   await new Promise<void>((resolve) => {
@@ -120,6 +123,19 @@ describe("/api (the h() wrapper)", () => {
     expect(r.text).not.toContain(SECRET);
   });
 
+  it("a client-chosen record key in a path prints as <key>; field names and indices print as is", async () => {
+    const { clientMessage } = await import("./http-util.js");
+    const { z } = await import("zod");
+    const schema = z.object({ env: z.record(z.string(), z.string()), list: z.array(z.string()) });
+    const parsed = schema.safeParse({ env: { [`${SECRET}.with-dots`]: 1, PLAIN_NAME: 2 }, list: ["a", 3] });
+    expect(parsed.success).toBe(false);
+    const text = clientMessage(parsed.error)!;
+    expect(text).not.toContain(SECRET);
+    expect(text).toContain("env.<key>:");
+    expect(text).toContain("env.PLAIN_NAME:");
+    expect(text).toContain("list.1:");
+  });
+
   it("an unrecognized key in a strict schema is not echoed", async () => {
     const { clientMessage } = await import("./http-util.js");
     const { z } = await import("zod");
@@ -137,25 +153,61 @@ describe("/api (the h() wrapper)", () => {
 });
 
 describe("vault failures reach the admin as a fixed summary", () => {
+  /** Stub a `bw` failure as sanitizeBwError builds it: `bw <sub> failed: …`. */
   function failReestablish(message: string): void {
     app.vault.logout = async () => {};
     app.vault.reestablish = async () => {
-      throw new Error(message);
+      throw new VaultCommandError(message, /^bw (\w+)/.exec(message)?.[1] ?? "unlock", 1);
     };
   }
 
   it("POST /api/setup/vault classifies a rejected API key", async () => {
+    silenceErrors();
     failReestablish(`bw login failed: client_id or client_secret is incorrect. Try again. (${SECRET})`);
     const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
     expect(r.status).toBe(400);
     expect(r.json).toEqual({ error: "The vault rejected the service account's API key (client id / secret)." });
   });
 
-  it("POST /api/setup/vault names only the bw subcommand for an unclassified failure", async () => {
+  it("POST /api/setup/vault names only the bw subcommand for an unclassified failure, and logs its class not its text", async () => {
+    const logged = silenceErrors();
     failReestablish(`bw unlock failed: upstream replied ${SECRET}`);
     const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
     expect(r.status).toBe(400);
     expect(r.json).toEqual({ error: "The vault command `bw unlock` failed." });
+    expect(logged.mock.calls.flat().join("\n")).toBe("[skeleton-key] vault failure: VaultCommandError(unlock, exit 1) → unclassified");
+  });
+
+  it("a classified failure logs the class it matched, once, however many layers describe it", async () => {
+    const logged = silenceErrors();
+    const { describeVaultFailure } = await import("../secrets/vaultwarden.js");
+    const err = new VaultCommandError(`bw login failed: client_secret is incorrect ${SECRET}`, "login", 1);
+    describeVaultFailure(err);
+    describeVaultFailure(err);
+    expect(logged.mock.calls.flat()).toEqual(["[skeleton-key] vault failure: VaultCommandError(login, exit 1) → api-key-rejected"]);
+  });
+
+  it("POST /api/setup/vault: an empty session key from bw is a vault failure (400), not a bare 500", async () => {
+    silenceErrors();
+    app.vault.logout = async () => {};
+    app.vault.reestablish = async () => {
+      throw new VaultCommandError("bw unlock returned an empty session key.", "unlock", 0);
+    };
+    const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
+    expect(r.status).toBe(400);
+    expect(r.json).toEqual({ error: "The vault command `bw unlock` failed." });
+  });
+
+  it("a plain Error that merely reads like a bw failure is not treated as one", async () => {
+    const logged = silenceErrors();
+    app.vault.logout = async () => {};
+    app.vault.reestablish = async () => {
+      throw new Error(`bw unlock failed: ${SECRET}`);
+    };
+    const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
+    expect(r.status).toBe(500);
+    expect(r.json).toEqual({ error: "Internal server error." });
+    expect(logged.mock.calls.flat().join(" ")).not.toContain(SECRET);
   });
 
   it("POST /api/setup/vault: a non-vault fault (local store write) is a logged 500, not a vault message", async () => {
@@ -171,6 +223,28 @@ describe("vault failures reach the admin as a fixed summary", () => {
     expect(logged.mock.calls.flat().join(" ")).not.toContain(SECRET);
   });
 
+  it("POST /api/setup/checks: a failed check's detail is the fixed summary, never the raw message", async () => {
+    const logged = silenceErrors();
+    app.vault.listOrganizations = async () => {
+      throw new VaultCommandError(`bw list failed: upstream said ${SECRET}`, "list", 1);
+    };
+    app.vault.listCollections = async () => {
+      throw new SyntaxError(`Unexpected token in JSON at position 3 ("${SECRET}")`);
+    };
+    app.vault.listItemNames = async () => {
+      throw new Error(`decrypt failed: ${SECRET}`);
+    };
+    const r = await post("/api/setup/checks", {});
+    expect(r.status).toBe(200);
+    expect(r.text).not.toContain(SECRET);
+    expect(r.json.checks.map((c: { detail: string }) => c.detail)).toEqual([
+      "The vault command `bw list` failed.",
+      "The vault operation failed.",
+      "The vault operation failed.",
+    ]);
+    expect(logged.mock.calls.flat().join(" ")).not.toContain(SECRET);
+  });
+
   it("the CLI's generic login wording is not pinned on the master password", async () => {
     const { describeVaultFailure } = await import("../secrets/vaultwarden.js");
     expect(describeVaultFailure(new Error("bw login failed: Username or password is incorrect. Try again."))).toBe(
@@ -179,6 +253,7 @@ describe("vault failures reach the admin as a fixed summary", () => {
   });
 
   it("POST /api/vault/server: the response, /api/status and the audit entry all omit the raw message", async () => {
+    const logged = silenceErrors();
     await app.store.update({ bwServerUrl: "http://192.168.1.20:5555", bwClientId: "id", bwClientSecret: "cs", bwMasterPassword: "mp" });
     failReestablish(`bw unlock failed: request to https://vault.example.net/api failed, reason: getaddrinfo ENOTFOUND ${SECRET}`);
     const r = await post("/api/vault/server", { serverUrl: "https://vault.example.net" });
@@ -188,9 +263,12 @@ describe("vault failures reach the admin as a fixed summary", () => {
     expect(JSON.parse(st).vaultError).toBe("Could not reach the vault server — check the URL and that Vaultwarden is up.");
     expect(st).not.toContain(SECRET);
     expect(JSON.stringify(app.audit.recent(20))).not.toContain(SECRET);
+    // Described twice (AppState.vaultError, then the route); logged once.
+    expect(logged.mock.calls.flat()).toEqual(["[skeleton-key] vault failure: VaultCommandError(unlock, exit 1) → unreachable"]);
   });
 
   it("POST /api/store/unlock reports a classified vaultError", async () => {
+    silenceErrors();
     await app.store.update({ bwServerUrl: "https://vault.example.net", bwClientId: "id", bwClientSecret: "cs", bwMasterPassword: "mp" });
     failReestablish(`bw unlock failed: Invalid master password. ${SECRET}`);
     app.store.lock();
@@ -217,8 +295,9 @@ describe("credential hand-off: a failed vault write", () => {
   }
 
   it("shows the bw subcommand, not its stderr", async () => {
+    silenceErrors();
     app.vault.createLoginItem = async () => {
-      throw new Error(`bw create failed: 422 ${SECRET}`);
+      throw new VaultCommandError(`bw create failed: 422 ${SECRET}`, "create", 1);
     };
     const text = await submit();
     expect(text).toContain("Could not store the credential: The vault command");
@@ -266,21 +345,30 @@ describe("OAuth endpoints", () => {
 });
 
 describe("/mcp", () => {
+  it("a failed tools/list_changed push is logged by name only", async () => {
+    await markSetupComplete();
+    const logged = silenceErrors();
+    vi.spyOn(McpServer.prototype, "sendToolListChanged").mockRejectedValue(new Error(`push broke on ${SECRET}`));
+    const r = await fetch(`${root}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${await bearer()}` },
+      body: JSON.stringify(INITIALIZE),
+    });
+    expect(r.status).toBe(200);
+    await r.text();
+    app.emitToolsChanged();
+    await vi.waitFor(() => expect(logged).toHaveBeenCalled());
+    expect(logged.mock.calls.flat()).toEqual(["[skeleton-key] tools/list_changed push failed: Error"]);
+  });
+
   it("a transport fault is a fixed JSON-RPC 500, logged by name only", async () => {
     await markSetupComplete();
     const logged = silenceErrors();
     vi.spyOn(StreamableHTTPServerTransport.prototype, "handleRequest").mockRejectedValue(new Error(`transport broke on ${SECRET}`));
-    const client = app.oauth.registerClient({ client_name: "t", redirect_uris: [REDIRECT] });
-    const verifier = randomBytes(32).toString("base64url");
-    const code = app.oauth.createAuthCode({
-      client_id: client.client_id, redirect_uri: REDIRECT, scope: "mcp",
-      code_challenge: createHash("sha256").update(verifier).digest("base64url"),
-    });
-    const token = app.oauth.redeemAuthCode({ code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier }).access_token;
     const r = await fetch(`${root}/mcp`, {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } }),
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${await bearer()}` },
+      body: JSON.stringify(INITIALIZE),
     });
     expect(r.status).toBe(500);
     const text = await r.text();
@@ -291,3 +379,16 @@ describe("/mcp", () => {
     expect(lines).not.toContain(SECRET);
   });
 });
+
+const INITIALIZE = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } };
+
+/** A valid OAuth access token, minted directly. */
+async function bearer(): Promise<string> {
+  const client = app.oauth.registerClient({ client_name: "t", redirect_uris: [REDIRECT] });
+  const verifier = randomBytes(32).toString("base64url");
+  const code = app.oauth.createAuthCode({
+    client_id: client.client_id, redirect_uri: REDIRECT, scope: "mcp",
+    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+  });
+  return app.oauth.redeemAuthCode({ code, client_id: client.client_id, redirect_uri: REDIRECT, code_verifier: verifier }).access_token;
+}

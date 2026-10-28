@@ -69,15 +69,29 @@ export function faultLabel(err: unknown): string {
   return `${typeof e.name === "string" ? e.name : "Error"}${code}`;
 }
 
+/** For a log line: a `UserFacingError`'s message (safe by construction and
+ *  the useful part), otherwise `faultLabel`. */
+export function logText(err: unknown): string {
+  return err instanceof UserFacingError ? err.message : faultLabel(err);
+}
+
+/** A path segment worth printing: an array index or an identifier-shaped field
+ *  name. Anything else is a key the client chose (a `z.record`/`z.map` key)
+ *  and could be anything, so it prints as `<key>`. */
+function pathSegment(p: PropertyKey): string {
+  if (typeof p === "number") return String(p);
+  return typeof p === "string" && /^[A-Za-z_]\w{0,40}$/.test(p) ? p : "<key>";
+}
+
 /**
  * A zod failure as `path: message` per issue. The messages are zod's own
  * wording or our schemas' fixed refine text, neither of which quotes the
  * rejected value; an unrecognized-key issue names the client's own key, so it
- * gets fixed text too.
+ * gets fixed text too, as does any path segment that isn't field-shaped.
  */
 export function describeZodError(err: ZodError): string {
   const parts = err.issues.map((i) => {
-    const where = i.path.length > 0 ? `${i.path.map(String).join(".")}: ` : "";
+    const where = i.path.length > 0 ? `${i.path.map(pathSegment).join(".")}: ` : "";
     return `${where}${i.code === "unrecognized_keys" ? "Unrecognized key." : i.message}`;
   });
   return `Invalid request — ${parts.join("; ")}`;

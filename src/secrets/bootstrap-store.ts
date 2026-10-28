@@ -201,14 +201,14 @@ export class BootstrapStore {
   async unlockWithKey(unlockKey: Uint8Array): Promise<void> {
     const parsed = await this.readOnDisk();
     if (parsed.magic === MAGIC_V1) {
-      throw new Error("Store predates auto-unlock; unlock once with the passphrase to migrate it.");
+      throw new UserFacingError("Store predates auto-unlock; unlock once with the passphrase to migrate it.");
     }
     const v2 = parsed as V2Format;
     if (!v2.slots.unlockKey) {
-      throw new Error("Auto-unlock is not enrolled for this store.");
+      throw new UserFacingError("Auto-unlock is not enrolled for this store.", 409);
     }
     const dataKey = this.unwrapDataKey(v2.slots.unlockKey, unlockKey);
-    if (!dataKey) throw new Error("Auto-unlock key does not match this store.");
+    if (!dataKey) throw new UserFacingError("Auto-unlock key does not match this store.");
     this.adopt(v2, dataKey);
   }
 

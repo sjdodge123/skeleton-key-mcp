@@ -10,7 +10,7 @@ import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
-import { describeVaultFailure } from "../secrets/vaultwarden.js";
+import { describeVaultFailure, VaultCommandError } from "../secrets/vaultwarden.js";
 import { UserFacingError } from "../lib/errors.js";
 import { clientMessage, paramStr } from "./http-util.js";
 
@@ -272,7 +272,7 @@ export function buildApiRouter(app: AppState): Router {
       } catch (err) {
         // A `bw` failure gets its fixed summary; a UserFacingError keeps its
         // own status; anything else (a local store write) is a logged 500.
-        if (err instanceof Error && !(err instanceof UserFacingError) && /^bw [a-z]+ failed/.test(err.message)) {
+        if (err instanceof VaultCommandError) {
           throw new UserFacingError(describeVaultFailure(err));
         }
         throw err;

@@ -151,7 +151,7 @@ describe("POST /api/vault/server", () => {
     const st = await getStatus();
     expect(st.vaultUnlocked).toBe(false);
     expect(st.vaultError).toBe(INSECURE_URL_HINT);
-    expect(JSON.stringify(st)).not.toMatch(/vault-broken\.example\.net/);
+    expect(JSON.stringify(st)).not.toContain("vault-broken.example.net");
   });
 
   it("pre-setup (wizard) needs no TOTP", async () => {
@@ -174,12 +174,12 @@ describe("POST /api/store/unlock when the vault cannot be re-established", () =>
     expect(r.json.ok).toBe(true);
     expect(r.json.vaultUnlocked).toBe(false);
     expect(r.json.vaultError).toBe(INSECURE_URL_HINT);
-    expect(JSON.stringify(r.json)).not.toMatch(/192\.168\.1\.20/);
+    expect(JSON.stringify(r.json)).not.toContain("192.168.1.20");
     expect(app.store.locked).toBe(false);
     const st = await getStatus();
     expect(st.storeLocked).toBe(false);
     expect(st.vaultUnlocked).toBe(false);
     expect(st.vaultError).toBe(INSECURE_URL_HINT);
-    expect(JSON.stringify(st)).not.toMatch(/192\.168\.1\.20/);
+    expect(JSON.stringify(st)).not.toContain("192.168.1.20");
   });
 });

@@ -3,6 +3,7 @@ import https from "node:https";
 import sodium from "./lib/sodium.js";
 import { AppState } from "./app.js";
 import { buildHttpApp } from "./web/server.js";
+import { faultLabel, logText } from "./web/http-util.js";
 import { env, paths } from "./config/paths.js";
 import { detectLanBaseUrl, savePublicUrl, switchScheme } from "./config/public-url.js";
 import { certFingerprint, resolveTls, tlsMode } from "./web/tls.js";
@@ -91,10 +92,7 @@ async function main(): Promise<void> {
         await app.store.unlockWithKey(unlockKey);
         how = "auto-unlock key file";
       } catch (err) {
-        console.error(
-          "[skeleton-key] Auto-unlock key file rejected:",
-          err instanceof Error ? err.message : err,
-        );
+        console.error(`[skeleton-key] Auto-unlock key file rejected: ${logText(err)}`);
       } finally {
         sodium.memzero(unlockKey);
       }
@@ -111,7 +109,7 @@ async function main(): Promise<void> {
           await app.store.unlock(passphrase);
           how = "passphrase env (deprecated)";
         } catch (err) {
-          console.error("[skeleton-key] Boot unlock failed:", err instanceof Error ? err.message : err);
+          console.error(`[skeleton-key] Boot unlock failed: ${logText(err)}`);
         }
       }
     }
@@ -120,7 +118,8 @@ async function main(): Promise<void> {
         await app.postUnlock();
         console.log(`[skeleton-key] Store unlocked at boot (${how}).`);
       } catch (err) {
-        console.error("[skeleton-key] Post-unlock init failed:", err instanceof Error ? err.message : err);
+        // vaultError is the fixed vault summary when the vault was the cause.
+        console.error(`[skeleton-key] Post-unlock init failed: ${app.vaultError ?? logText(err)}`);
       }
     }
   }
@@ -144,7 +143,7 @@ async function main(): Promise<void> {
       if (now - lastHandshakeLog < 60_000) return;
       lastHandshakeLog = now;
       console.warn(
-        `[skeleton-key] TLS handshake failed (${err.message}). If this is a client still configured ` +
+        `[skeleton-key] TLS handshake failed (${faultLabel(err)}). If this is a client still configured ` +
           "with http://, update it to https:// — and point NODE_EXTRA_CA_CERTS at the certificate " +
           "for Node-based MCP clients (see README).",
       );
