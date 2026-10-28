@@ -13,6 +13,7 @@ import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.
 import { describeVaultFailure, VaultCommandError } from "../secrets/vaultwarden.js";
 import { UserFacingError } from "../lib/errors.js";
 import { clientMessage, paramStr } from "./http-util.js";
+import { lockoutMessage, passphraseRateLimit, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 function hostOf(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -50,6 +51,22 @@ function h(fn: (req: Request, res: Response) => Promise<void>) {
 export function buildApiRouter(app: AppState): Router {
   const router = Router();
   const setup = new SetupService(app);
+  // Every route below that takes a TOTP code mounts this first: a locked-out
+  // client gets 429 before its body is parsed (see ./rate-limit.ts).
+  const totpLimit = totpRateLimit(app);
+
+  /** Verify the body's code through the attempt limiter. On refusal sends 403
+   *  (wrong code) or 429 + Retry-After (locked out) and returns false. */
+  const totpOk = (req: Request, res: Response, totp: string): boolean => {
+    const check = app.checkTotp(totp, clientAttempt(req));
+    if (check.ok) return true;
+    if (check.retryAfterSeconds) {
+      refuseLockedOut(res, check.retryAfterSeconds).json({ error: lockoutMessage(check.retryAfterSeconds) });
+    } else {
+      res.status(403).json({ error: "Invalid authenticator code." });
+    }
+    return false;
+  };
 
   // --- Status (always available) ---
   router.get(
@@ -89,13 +106,20 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/store/unlock",
+    passphraseRateLimit(app),
     h(async (req, res) => {
       const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body ?? {});
       if (!(await app.store.exists())) {
         res.status(409).json({ error: "No store exists yet; initialize it first." });
         return;
       }
-      await app.store.unlock(passphrase);
+      // Attempt-limited like TOTP (its own budget); also one argon2 at a time.
+      const refused = await app.unlockWithPassphrase(passphrase, clientAttempt(req));
+      if (refused) {
+        const { retryAfterSeconds: wait, busy } = refused;
+        refuseLockedOut(res, wait).json({ error: busy ? "An unlock is already in progress — try again in a moment." : lockoutMessage(wait, "passphrases") });
+        return;
+      }
       // Re-establish the saved vault session, keep the bearer hash current, and
       // nudge locked sessions to re-list tools — shared with the boot paths.
       // A vault failure here must not read as a failed unlock: the store IS
@@ -127,10 +151,7 @@ export function buildApiRouter(app: AppState): Router {
     }
     if (await app.isSetupComplete()) {
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return false;
-      }
+      if (!totpOk(req, res, totp)) return false;
     }
     return true;
   };
@@ -140,6 +161,7 @@ export function buildApiRouter(app: AppState): Router {
   // something an unauthenticated LAN client should be able to enumerate.
   router.post(
     "/store/autounlock/status",
+    totpLimit,
     h(async (req, res) => {
       if (!(await guardAutoUnlock(req, res))) return;
       res.json({
@@ -152,6 +174,7 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/store/autounlock/enable",
+    totpLimit,
     h(async (req, res) => {
       if (!(await guardAutoUnlock(req, res))) return;
       const key = await app.store.enableAutoUnlock();
@@ -183,6 +206,7 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/store/autounlock/disable",
+    totpLimit,
     h(async (req, res) => {
       if (!(await guardAutoUnlock(req, res))) return;
       await app.store.disableAutoUnlock();
@@ -205,6 +229,7 @@ export function buildApiRouter(app: AppState): Router {
   // vault unlocks and syncs on the new one.
   router.post(
     "/vault/server",
+    totpLimit,
     h(async (req, res) => {
       if (!(await guardAutoUnlock(req, res))) return;
       const { serverUrl } = z
@@ -316,10 +341,16 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/setup/totp/verify",
+    totpLimit,
     h(async (req, res) => {
       if (!(await guardSetup(res))) return;
       const { token } = z.object({ token: z.string().min(6) }).parse(req.body ?? {});
-      res.json({ valid: setup.verifyTotp(token) });
+      const check = setup.verifyTotp(token, clientAttempt(req));
+      if (!check.ok && check.retryAfterSeconds) {
+        refuseLockedOut(res, check.retryAfterSeconds).json({ error: lockoutMessage(check.retryAfterSeconds) });
+        return;
+      }
+      res.json({ valid: check.ok });
     }),
   );
 
@@ -398,6 +429,7 @@ export function buildApiRouter(app: AppState): Router {
   // body, like the other admin reads; needs an unlocked store to verify TOTP.
   router.post(
     "/audit/recent",
+    totpLimit,
     h(async (req, res) => {
       if (app.store.locked) {
         res.status(409).json({ error: "Unlock the store first." });
@@ -406,10 +438,7 @@ export function buildApiRouter(app: AppState): Router {
       const { totp, limit } = z
         .object({ totp: z.string().min(6), limit: z.number().int().positive().max(1000).optional() })
         .parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return;
-      }
+      if (!totpOk(req, res, totp)) return;
       // `detail` on an EXECUTE entry is the tool's confirmation text, which is
       // derived from the call arguments and can embed a raw command line (SSH
       // run_command, Portainer exec) — i.e. potentially a secret. `args` is already
@@ -432,12 +461,10 @@ export function buildApiRouter(app: AppState): Router {
   // Revoking an agent's access is sensitive, so require a fresh TOTP code.
   router.post(
     "/oauth/clients/:id/revoke",
+    totpLimit,
     h(async (req, res) => {
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return;
-      }
+      if (!totpOk(req, res, totp)) return;
       const id = paramStr(req, "id");
       if (!id) {
         res.status(400).json({ error: "Invalid client id." });
@@ -458,16 +485,14 @@ export function buildApiRouter(app: AppState): Router {
   // secrets), so both need an unlocked store + a fresh TOTP code.
   router.post(
     "/snapshots",
+    totpLimit,
     h(async (req, res) => {
       if (app.store.locked) {
         res.status(409).json({ error: "Unlock the store first." });
         return;
       }
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return;
-      }
+      if (!totpOk(req, res, totp)) return;
       res.json({ skeletons: await listSkeletons() });
     }),
   );
@@ -479,16 +504,14 @@ export function buildApiRouter(app: AppState): Router {
   // never the request Host header (anti-phishing, see CLAUDE.md).
   router.post(
     "/credential-requests",
+    totpLimit,
     h(async (req, res) => {
       if (app.store.locked) {
         res.status(409).json({ error: "Unlock the store first." });
         return;
       }
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return;
-      }
+      if (!totpOk(req, res, totp)) return;
       const base = app.publicUrl();
       const requests = app.credentialRequests.list().map((r) => ({
         ...r,
@@ -502,16 +525,14 @@ export function buildApiRouter(app: AppState): Router {
 
   router.post(
     "/snapshots/:id/download",
+    totpLimit,
     h(async (req, res) => {
       if (app.store.locked) {
         res.status(409).json({ error: "Unlock the store first." });
         return;
       }
       const { totp } = z.object({ totp: z.string().min(6) }).parse(req.body ?? {});
-      if (!app.verifyTotp(totp)) {
-        res.status(403).json({ error: "Invalid authenticator code." });
-        return;
-      }
+      if (!totpOk(req, res, totp)) return;
       const id = paramStr(req, "id");
       if (!id || !/^[0-9A-Za-z._-]+$/.test(id)) {
         res.status(400).json({ error: "Invalid skeleton id." });

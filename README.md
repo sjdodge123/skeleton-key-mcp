@@ -147,6 +147,16 @@ Skeleton Key then generates a **random unlock key**, enrolls it as a second keys
 
 Existing deployments: stores created before auto-unlock migrate to the keyslot format automatically on their next passphrase unlock — nothing manual. If you were using `SKELETON_KEY_PASSPHRASE`, it still works but warns at boot; switch to auto-unlock and delete the env var from your stack.
 
+## Lockouts
+
+Every authenticator-code prompt (the admin pages, agent consent, credential links) and the master-passphrase unlock is **attempt-limited**. Five wrong entries from one address lock that address out for a minute. Ten wrong entries from anywhere in 24 h lock out **everyone** for a minute. Repeated lockouts double, up to 4 hours. While locked out you get *"Too many wrong …"* (HTTP 429), and the code is not even checked. A correct code during a lockout is refused too, so wait for the time shown.
+
+Because the global limit has to hold against an attacker on your LAN using many addresses, **someone on the LAN can keep you locked out** by repeatedly entering wrong codes. While that lasts you can't read the activity log in the web UI. To find and stop them:
+
+1. **Find the address.** Every lockout is logged to the container's stdout, e.g. `[skeleton-key] TOTP lockout: global until 2026-10-28T04:00:00.000Z, last client 192.168.0.57`. In Portainer that's the container's logs. When you're back in, the activity log (`/admin`) has `auth.totp_failed` rows per wrong code, and the `auth.*_refused` rows name the addresses that kept trying.
+2. **Block it at the network** (a firewall rule on your router, or pull the device off the LAN). That ends the attack. Restarting doesn't.
+3. **Restart only as a last resort.** The counters are in memory, so a restart clears them. Without auto-unlock, the restart also re-locks the vault until you enter your passphrase. **With [auto-unlock](#boot-auto-unlock) enabled, the restart comes back unlocked with a fresh budget for the attacker too.** So block first, then restart.
+
 ## Conversational onboarding
 
 After the wizard (scoped vault + first MCP connection), you don't hand-build the rest — you ask Claude. These **global MCP tools** are always available:

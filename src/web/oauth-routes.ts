@@ -4,6 +4,7 @@ import type { AppState } from "../app.js";
 import { InvalidGrantError, OAUTH_SCOPE } from "../oauth/oauth-service.js";
 import { baseUrl, bodyOf, describeZodError, faultLabel, firstStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
+import { lockoutMessage, oauthRateLimit, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
  * OAuth 2.1 endpoints for the MCP authorization flow. Claude discovers these via
@@ -53,8 +54,44 @@ function consentPage(params: {
 </div></body></html>`;
 }
 
+/** Consent form fields carried through a re-render (error or lockout). */
+function consentFields(body: Record<string, unknown>) {
+  return {
+    client_id: firstStr(body.client_id),
+    redirect_uri: firstStr(body.redirect_uri),
+    state: firstStr(body.state),
+    code_challenge: firstStr(body.code_challenge),
+    scope: OAUTH_SCOPE,
+  };
+}
+
 export function buildOAuthRouter(app: AppState): Router {
   const router = Router();
+
+  // Unauthenticated endpoints get a per-client request budget. A client
+  // registers once per connector install and refreshes once per access-token
+  // lifetime, so these never touch real use; they bound client-table growth
+  // and request floods. (Brute force is the TOTP limiter's job, below.)
+  const registerLimit = oauthRateLimit(app, "register", 20, 10 * 60_000);
+  const tokenLimit = oauthRateLimit(app, "token", 60, 60_000);
+
+  // While locked out, the consent screen re-renders with the lockout message
+  // (429) instead of evaluating the code. "Deny" carries no code, so it is
+  // always let through.
+  const consentLimit = totpRateLimit(app, {
+    skip: (req) => firstStr(bodyOf(req).action) === "deny",
+    render: (req, res, message) => {
+      const fields = consentFields(bodyOf(req));
+      const client = fields.client_id ? app.oauth.getClient(fields.client_id) : undefined;
+      // Same validation as the handler: never re-render a consent page for an
+      // unknown client or an unregistered redirect_uri.
+      if (!client || !client.redirect_uris.includes(fields.redirect_uri)) {
+        res.type("text").send(message);
+        return;
+      }
+      res.type("html").send(consentPage({ clientName: client.client_name, error: message, fields }));
+    },
+  });
 
   // --- Discovery metadata ---
   router.get("/.well-known/oauth-authorization-server", (req, res) => {
@@ -79,7 +116,7 @@ export function buildOAuthRouter(app: AppState): Router {
   });
 
   // --- Dynamic client registration (RFC 7591) ---
-  router.post("/oauth/register", (req, res) => {
+  router.post("/oauth/register", registerLimit, (req, res) => {
     const parsed = z
       .object({ client_name: z.string().optional(), redirect_uris: z.array(z.string().url()).min(1) })
       .safeParse(req.body ?? {});
@@ -128,7 +165,7 @@ export function buildOAuthRouter(app: AppState): Router {
   });
 
   // --- Consent decision (TOTP-gated) ---
-  router.post("/oauth/authorize/decision", (req, res) => {
+  router.post("/oauth/authorize/decision", consentLimit, (req, res) => {
     const body = bodyOf(req);
     const client_id = firstStr(body.client_id);
     const redirect_uri = firstStr(body.redirect_uri);
@@ -144,12 +181,14 @@ export function buildOAuthRouter(app: AppState): Router {
     if (action === "deny") {
       return redirectError(res, redirect_uri, state, "access_denied", "User denied the request");
     }
-    if (!app.verifyTotp(totp)) {
+    const check = app.checkTotp(totp, clientAttempt(req));
+    if (!check.ok) {
+      if (check.retryAfterSeconds) refuseLockedOut(res, check.retryAfterSeconds);
       res.type("html").send(
         consentPage({
           clientName: client.client_name,
-          error: "Invalid authenticator code — try again.",
-          fields: { client_id, redirect_uri, state, code_challenge, scope: OAUTH_SCOPE },
+          error: check.retryAfterSeconds ? lockoutMessage(check.retryAfterSeconds) : "Invalid authenticator code — try again.",
+          fields: consentFields(body),
         }),
       );
       return;
@@ -166,7 +205,7 @@ export function buildOAuthRouter(app: AppState): Router {
   });
 
   // --- Token endpoint ---
-  router.post("/oauth/token", (req, res) => {
+  router.post("/oauth/token", tokenLimit, (req, res) => {
     const body = bodyOf(req);
     const grant_type = firstStr(body.grant_type);
     const code = firstStr(body.code);
@@ -197,7 +236,7 @@ export function buildOAuthRouter(app: AppState): Router {
   });
 
   // --- Token revocation (RFC 7009) ---
-  router.post("/oauth/revoke", (req, res) => {
+  router.post("/oauth/revoke", tokenLimit, (req, res) => {
     const t = firstStr(bodyOf(req).token);
     if (t) app.oauth.revokeToken(t);
     // RFC 7009: always 200, even for unknown/invalid tokens.
