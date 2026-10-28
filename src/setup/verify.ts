@@ -1,4 +1,4 @@
-import type { VaultwardenClient } from "../secrets/vaultwarden.js";
+import { describeVaultFailure, type VaultwardenClient } from "../secrets/vaultwarden.js";
 
 export interface CheckResult {
   name: string;
@@ -71,6 +71,8 @@ export async function verifyScoping(
   return results;
 }
 
+/** A failed check's detail reaches the (pre-setup, unauthenticated) wizard
+ *  API, so it is the fixed summary, never the raw `bw` or parser message. */
 function msg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return describeVaultFailure(err);
 }

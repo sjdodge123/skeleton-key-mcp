@@ -373,13 +373,16 @@ describe("every TOTP route is gated twice: middleware AND handler", () => {
 describe("master passphrase attempt limiting (/api/store/unlock)", () => {
   let unlocks: string[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
     // The limiter is under test, not argon2: stub the derivation (each real
     // one is ~1 s of CPU), keeping its contract — throws on a wrong passphrase.
+    // Import after the outer beforeEach's resetModules so it is the same class
+    // the app's h() checks with instanceof (a wrong passphrase is a 400, not a 500).
+    const { UserFacingError } = await import("../lib/errors.js");
     unlocks = [];
     vi.spyOn(app.store, "unlock").mockImplementation(async (p: unknown) => {
       unlocks.push(String(p));
-      if (p !== "wizard-passphrase") throw new Error("Incorrect passphrase or corrupted bootstrap store.");
+      if (p !== "wizard-passphrase") throw new UserFacingError("Incorrect passphrase or corrupted bootstrap store.");
     });
     app.postUnlock = vi.fn(async () => {});
   });

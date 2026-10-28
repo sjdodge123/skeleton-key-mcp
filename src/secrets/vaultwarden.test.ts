@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { buildLoginItemJson, mergeLoginItem, resolveItem, VaultwardenClient, FRESH_SYNC_TIMEOUT_MS } from "./vaultwarden.js";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { buildLoginItemJson, mergeLoginItem, resolveItem, VaultwardenClient, VaultCommandError, FRESH_SYNC_TIMEOUT_MS } from "./vaultwarden.js";
 
 type Item = { id: string; name: string; login?: any; fields?: any[]; notes?: string; deletedDate?: string | null };
 
@@ -415,5 +418,23 @@ describe("logout / reestablish hints", () => {
     await expect(
       client.reestablish({ serverUrl: "https://v.example", clientId: "a", clientSecret: "b", masterPassword: "c" }),
     ).rejects.toThrow(/^bw unlock failed: Invalid master password\.$/);
+  });
+});
+
+describe("bw failures are typed", () => {
+  it("a failed `bw` run rejects with VaultCommandError carrying the subcommand and exit code", async () => {
+    // A fake `bw` on PATH that fails the way the real CLI does: stderr + non-zero exit.
+    const bin = await mkdtemp(path.join(tmpdir(), "sk-fakebw-"));
+    try {
+      await writeFile(path.join(bin, "bw"), "#!/bin/sh\necho 'Not logged in.' >&2\necho 'second line' >&2\nexit 3\n");
+      await chmod(path.join(bin, "bw"), 0o755);
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH ?? ""}`);
+      const err = await new VaultwardenClient(bin).setServer("https://v.example").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(VaultCommandError);
+      expect(err).toMatchObject({ subcommand: "config", exitCode: 3, message: "bw config failed: Not logged in." });
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(bin, { recursive: true, force: true });
+    }
   });
 });

@@ -5,6 +5,7 @@ import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
 import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
+import { describeVaultFailure } from "../secrets/vaultwarden.js";
 import { lockoutMessage, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
@@ -446,8 +447,8 @@ export function buildCredentialRouter(app: AppState): Router {
     } catch (err) {
       // Roll the claim back so the user can retry the same link.
       releaseClaim();
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${message}` }));
+      // A fixed summary only: the raw `bw` stderr can quote an upstream reply.
+      res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${describeVaultFailure(err)}` }));
       return;
     } finally {
       // Drop the plaintext values as soon as the write is done (or failed) —

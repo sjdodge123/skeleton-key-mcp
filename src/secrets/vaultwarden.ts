@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { Credential } from "./types.js";
 import { paths } from "../config/paths.js";
+import { UserFacingError } from "../lib/errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -10,15 +11,35 @@ const execFileAsync = promisify(execFile);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * A failed `bw` invocation. The message is the safe first-line form built by
+ * `sanitizeBwError` (it can still quote the server URL or an upstream reply, so
+ * the web layer shows `describeVaultFailure` instead); `subcommand` is our own
+ * argv[0], never input, and `exitCode` is the process exit status when known.
+ */
+export class VaultCommandError extends Error {
+  override readonly name = "VaultCommandError";
+
+  constructor(
+    message: string,
+    readonly subcommand: string,
+    readonly exitCode: number | null = null,
+  ) {
+    super(message);
+  }
+}
+
+/**
  * Reduce a `bw` failure to a safe, first-line message. We never surface the
  * original execFile error (its `.message` embeds the full argv, which for some
  * commands contains base64 secret payloads and the session key) — that would
  * leak secrets into the audit log and tool output.
  */
-function sanitizeBwError(subcommand: string, err: unknown): Error {
+function sanitizeBwError(subcommand: string, err: unknown, exitCode?: number | null): VaultCommandError {
   const stderr = (err as { stderr?: unknown })?.stderr;
   const first = typeof stderr === "string" ? stderr.trim().split("\n")[0] : "";
-  return new Error(`bw ${subcommand} failed${first ? `: ${first}` : ""}`);
+  // execFile puts the exit status on `code` (a string there means spawn failed).
+  const code = exitCode ?? (err as { code?: unknown })?.code;
+  return new VaultCommandError(`bw ${subcommand} failed${first ? `: ${first}` : ""}`, subcommand, typeof code === "number" ? code : null);
 }
 
 /**
@@ -33,7 +54,68 @@ export const INSECURE_URL_HINT =
 
 function withInsecureUrlHint(err: unknown): Error {
   const e = err instanceof Error ? err : new Error(String(err));
-  return /insecure url not allowed/i.test(e.message) ? new Error(`${e.message}. ${INSECURE_URL_HINT}`) : e;
+  if (!/insecure url not allowed/i.test(e.message)) return e;
+  const message = `${e.message}. ${INSECURE_URL_HINT}`;
+  return e instanceof VaultCommandError ? new VaultCommandError(message, e.subcommand, e.exitCode) : new Error(message);
+}
+
+/** Known failure classes, matched against the sanitized `bw` message. */
+const VAULT_FAILURE_CLASSES: { id: string; test: RegExp; text: string }[] = [
+  { id: "insecure-url", test: /insecure url not allowed/i, text: INSECURE_URL_HINT },
+  {
+    id: "api-key-rejected",
+    test: /client_?id|client_?secret|invalid_client/i,
+    text: "The vault rejected the service account's API key (client id / secret).",
+  },
+  { id: "master-password-rejected", test: /master password/i, text: "The vault rejected the service account's master password." },
+  // The CLI's generic wording, used for more than one kind of login failure.
+  {
+    id: "credentials-rejected",
+    test: /username or password is incorrect/i,
+    text: "The vault rejected the service account's credentials (API key or master password).",
+  },
+  {
+    id: "tls-untrusted",
+    test: /certificate|self[- ]signed|unable_to_verify|cert_/i,
+    text: "The vault server's TLS certificate is not trusted by the Bitwarden CLI.",
+  },
+  {
+    id: "unreachable",
+    test: /enotfound|eai_again|econnrefused|econnreset|etimedout|ehostunreach|enetunreach|getaddrinfo|fetch failed|socket hang up/i,
+    text: "Could not reach the vault server — check the URL and that Vaultwarden is up.",
+  },
+];
+
+/** Errors already logged by `describeVaultFailure`, so a failure described at
+ *  several layers (AppState.vaultError, then the route) logs once. */
+const logged = new WeakSet<object>();
+
+/**
+ * A fixed summary of a vault failure, for an HTTP client. The raw message is
+ * the CLI's first stderr line, which can quote the server URL or an upstream
+ * response, so only its class is surfaced; a `UserFacingError` (our own wording
+ * about named items and collections) passes through as is.
+ *
+ * Every other failure is logged once, by name, subcommand, exit code and the
+ * class it matched (or "unclassified") — never the stderr text — so the admin
+ * still has something to go on when the summary is generic.
+ */
+export function describeVaultFailure(err: unknown): string {
+  if (err instanceof UserFacingError) return err.message;
+  const msg = err instanceof Error ? err.message : "";
+  const match = VAULT_FAILURE_CLASSES.find((c) => c.test.test(msg));
+  if (err instanceof Object && !logged.has(err)) {
+    logged.add(err);
+    const who =
+      err instanceof VaultCommandError
+        ? `VaultCommandError(${err.subcommand}, exit ${err.exitCode ?? "?"})`
+        : err instanceof Error
+          ? err.name
+          : "Error";
+    console.error(`[skeleton-key] vault failure: ${who} → ${match?.id ?? "unclassified"}`);
+  }
+  if (match) return match.text;
+  return err instanceof VaultCommandError ? `The vault command \`bw ${err.subcommand}\` failed.` : "The vault operation failed.";
 }
 
 export interface BwStatus {
@@ -131,10 +213,10 @@ export class VaultwardenClient {
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
       child.stderr.on("data", (d) => (stderr += d));
-      child.on("error", () => reject(new Error(`bw ${args[0] ?? ""} failed to start`)));
+      child.on("error", () => reject(new VaultCommandError(`bw ${args[0] ?? ""} failed to start`, args[0] ?? "")));
       child.on("close", (code) => {
         if (code === 0) resolve(stdout.trim());
-        else reject(sanitizeBwError(args[0] ?? "", { stderr }));
+        else reject(sanitizeBwError(args[0] ?? "", { stderr }, code));
       });
       child.stdin.on("error", () => {}); // ignore EPIPE if bw exits early
       child.stdin.end(input);
@@ -172,7 +254,7 @@ export class VaultwardenClient {
     const session = await this.run(["unlock", "--passwordenv", "BW_PASSWORD", "--raw"], {
       BW_PASSWORD: masterPassword,
     });
-    if (!session) throw new Error("bw unlock returned an empty session key.");
+    if (!session) throw new VaultCommandError("bw unlock returned an empty session key.", "unlock", 0);
     this.session = session;
   }
 
@@ -239,7 +321,7 @@ export class VaultwardenClient {
   }
 
   private assertUnlocked(): void {
-    if (!this.session) throw new Error("Vaultwarden client is locked; unlock first.");
+    if (!this.session) throw new UserFacingError("Vaultwarden client is locked; unlock first.", 409);
   }
 
   async listOrganizations(): Promise<{ id: string; name: string }[]> {
@@ -264,12 +346,12 @@ export class VaultwardenClient {
     const cols = await this.listCollections();
     if (name) {
       const col = cols.find((c) => c.name === name);
-      if (!col) throw new Error(`Collection "${name}" not found in the scoped vault.`);
+      if (!col) throw new UserFacingError(`Collection "${name}" not found in the scoped vault.`);
       return { collectionId: col.id, organizationId: col.organizationId, name: col.name };
     }
-    if (cols.length === 0) throw new Error("No collection is available to write to.");
+    if (cols.length === 0) throw new UserFacingError("No collection is available to write to.");
     if (cols.length > 1) {
-      throw new Error(`Ambiguous target: ${cols.length} collections exist — specify which to write to.`);
+      throw new UserFacingError(`Ambiguous target: ${cols.length} collections exist — specify which to write to.`);
     }
     const col = cols[0]!;
     return { collectionId: col.id, organizationId: col.organizationId, name: col.name };
@@ -295,7 +377,7 @@ export class VaultwardenClient {
     // so refuse to create a second item with an existing name.
     const existing = await this.listItemNames();
     if (existing.includes(input.name)) {
-      throw new Error(`A vault item named "${input.name}" already exists — pick a different name.`);
+      throw new UserFacingError(`A vault item named "${input.name}" already exists — pick a different name.`);
     }
     const { collectionId, organizationId } = await this.resolveCollection(input.collectionName);
     const item = buildLoginItemJson({ ...input, organizationId, collectionId });
@@ -361,7 +443,7 @@ export class VaultwardenClient {
     // bounded to one item.
     const byId = await this.getItemById(ref);
     if (byId) return byId;
-    throw new Error(`No vault item named "${ref}" in the scoped collection.`);
+    throw new UserFacingError(`No vault item named "${ref}" in the scoped collection.`);
   }
 
   /**
@@ -373,7 +455,7 @@ export class VaultwardenClient {
     if (opts.fresh) await this.syncBestEffort();
     if (opts.byId) {
       const item = await this.getItemById(ref);
-      if (!item) throw new Error(`No vault item with id "${ref}" in the scoped collection (deleted, trashed, or recreated).`);
+      if (!item) throw new UserFacingError(`No vault item with id "${ref}" in the scoped collection (deleted, trashed, or recreated).`);
       return item;
     }
     return this.findItem(ref);
@@ -477,14 +559,14 @@ export function resolveItem<T extends { id: string; name: string; deletedDate?: 
   const exact = candidates.filter((i) => i.name === ref);
   if (exact.length === 1) return exact[0]!;
   if (exact.length > 1) {
-    throw new Error(`${exact.length} vault items are named "${ref}" — rename them so the credentialRef is unique.`);
+    throw new UserFacingError(`${exact.length} vault items are named "${ref}" — rename them so the credentialRef is unique.`);
   }
   const byId = candidates.filter((i) => i.id === ref);
   if (byId.length) return byId[0]!; // ids are unique
   const ci = candidates.filter((i) => i.name.toLowerCase() === ref.toLowerCase());
   if (ci.length === 1) return ci[0]!;
   if (ci.length > 1) {
-    throw new Error(`${ci.length} vault items match "${ref}" case-insensitively — rename them so the credentialRef is unique.`);
+    throw new UserFacingError(`${ci.length} vault items match "${ref}" case-insensitively — rename them so the credentialRef is unique.`);
   }
   // Last resort: a UNIQUE substring match. This preserves the migration path of
   // the old `bw get item <ref>` (which substring-matched), so a pre-existing
@@ -494,7 +576,7 @@ export function resolveItem<T extends { id: string; name: string; deletedDate?: 
   const sub = candidates.filter((i) => i.name.toLowerCase().includes(ref.toLowerCase()));
   if (sub.length === 1) return sub[0]!;
   if (sub.length > 1) {
-    throw new Error(`${sub.length} vault items match "${ref}" — rename them or use the exact name so the credentialRef is unique.`);
+    throw new UserFacingError(`${sub.length} vault items match "${ref}" — rename them or use the exact name so the credentialRef is unique.`);
   }
   return null;
 }

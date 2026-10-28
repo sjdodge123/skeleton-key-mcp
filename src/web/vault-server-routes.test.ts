@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import { generateTotpCode } from "../lib/totp.js";
+import { INSECURE_URL_HINT } from "../secrets/vaultwarden.js";
 
 /**
  * Exercises `POST /api/vault/server` (re-pointing the Vaultwarden client at a
@@ -139,18 +140,18 @@ describe("POST /api/vault/server", () => {
     expect(JSON.stringify(audit)).not.toContain("client-secret");
   });
 
-  it("fails closed: a URL the CLI refuses leaves the stored URL untouched and surfaces a redacted vaultError", async () => {
+  it("fails closed: a URL the CLI refuses leaves the stored URL untouched and surfaces a fixed vaultError", async () => {
     await initConnectedStore();
     await markSetupComplete();
     stubVault(/vault-broken/);
     const r = await post("/vault/server", { serverUrl: "https://vault-broken.example.net", totp: generateTotpCode(TOTP_SECRET) });
     expect(r.status).toBe(400);
-    expect(r.json.error).toMatch(/Insecure URL not allowed/);
+    expect(r.json.error).toBe(INSECURE_URL_HINT);
     expect(app.store.get().bwServerUrl).toBe(OLD_URL);
     const st = await getStatus();
     expect(st.vaultUnlocked).toBe(false);
-    expect(st.vaultError).toMatch(/<vault url>/);
-    expect(st.vaultError).not.toMatch(/vault-broken\.example\.net/);
+    expect(st.vaultError).toBe(INSECURE_URL_HINT);
+    expect(JSON.stringify(st)).not.toContain("vault-broken.example.net");
   });
 
   it("pre-setup (wizard) needs no TOTP", async () => {
@@ -163,7 +164,7 @@ describe("POST /api/vault/server", () => {
 });
 
 describe("POST /api/store/unlock when the vault cannot be re-established", () => {
-  it("reports ok:true + vaultUnlocked:false with a redacted error instead of a failed unlock", async () => {
+  it("reports ok:true + vaultUnlocked:false with a fixed error instead of a failed unlock", async () => {
     await initConnectedStore();
     await markSetupComplete();
     stubVault(/^http:/); // the stored plain-http URL is what the CLI refuses
@@ -172,12 +173,13 @@ describe("POST /api/store/unlock when the vault cannot be re-established", () =>
     expect(r.status).toBe(200);
     expect(r.json.ok).toBe(true);
     expect(r.json.vaultUnlocked).toBe(false);
-    expect(r.json.vaultError).toMatch(/Insecure URL not allowed/);
-    expect(r.json.vaultError).not.toMatch(/192\.168\.0\.229/);
+    expect(r.json.vaultError).toBe(INSECURE_URL_HINT);
+    expect(JSON.stringify(r.json)).not.toContain("192.168.1.20");
     expect(app.store.locked).toBe(false);
     const st = await getStatus();
     expect(st.storeLocked).toBe(false);
     expect(st.vaultUnlocked).toBe(false);
-    expect(st.vaultError).toContain("<vault url>");
+    expect(st.vaultError).toBe(INSECURE_URL_HINT);
+    expect(JSON.stringify(st)).not.toContain("192.168.1.20");
   });
 });

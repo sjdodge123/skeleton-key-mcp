@@ -125,6 +125,9 @@ describe("auto-unlock endpoints", () => {
     const r = await post("/store/autounlock/enable", {});
     expect(r.status).toBe(400);
     expect(String(r.json.error)).toContain("Mount a writable host directory");
+    // The errno code, never the fs message text.
+    expect(String(r.json.error)).toMatch(/ — E[A-Z]+\. /);
+    expect(String(r.json.error)).not.toMatch(/no such file|EACCES:|ENOENT:/);
     expect((await status()).enabled).toBe(false);
   });
 

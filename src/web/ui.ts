@@ -103,7 +103,7 @@ function renderSteps(){
   }).join("");
 }
 function checksHtml(checks){
-  return checks.map(c=>'<div class="check '+(c.passed?"ok":"bad")+'"><div class="n">'+(c.passed?"✓":"✗")+" "+c.name+'</div><div class="d">'+c.detail+'</div></div>').join("");
+  return checks.map(c=>'<div class="check '+(c.passed?"ok":"bad")+'"><div class="n">'+(c.passed?"✓":"✗")+" "+esc(c.name)+'</div><div class="d">'+esc(c.detail)+'</div></div>').join("");
 }
 function go(n){ S.step=n; if(n>S.max) S.max=n; render(); }
 

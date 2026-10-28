@@ -4,6 +4,7 @@ import { generateTotpSecret, totpKeyUri } from "../lib/totp.js";
 import QRCode from "qrcode";
 import type { AppState, ClientAttempt, TotpCheck } from "../app.js";
 import { paths } from "../config/paths.js";
+import { UserFacingError } from "../lib/errors.js";
 import { verifyScoping, type CheckResult } from "./verify.js";
 
 export interface VaultConnectInput {
@@ -80,7 +81,7 @@ export class SetupService {
     if (!s.mcpBearerToken) missing.push("MCP bearer token");
     if (!s.totpSecret) missing.push("TOTP enrollment");
     if (missing.length > 0) {
-      throw new Error(`Cannot complete setup; still missing: ${missing.join(", ")}.`);
+      throw new UserFacingError(`Cannot complete setup; still missing: ${missing.join(", ")}.`);
     }
     await writeFile(paths.setupComplete, JSON.stringify({ completedAt: new Date().toISOString() }), {
       mode: 0o600,
