@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import sodium from "../lib/sodium.js";
 import type { AppState } from "../app.js";
@@ -10,13 +10,9 @@ import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
-import { paramStr } from "./http-util.js";
-
-/** Strip URLs from a vault error before it leaves on the unauthenticated status
- *  endpoint — the vault's address is not something a LAN client should learn. */
-function redactUrls(msg: string | null | undefined): string | null {
-  return msg ? msg.replace(/https?:\/\/[^\s"')]+/gi, "<vault url>") : null;
-}
+import { describeVaultFailure, VaultCommandError } from "../secrets/vaultwarden.js";
+import { UserFacingError } from "../lib/errors.js";
+import { clientMessage, paramStr } from "./http-util.js";
 
 function hostOf(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -27,12 +23,21 @@ function hostOf(url: string | null | undefined): string | null {
   }
 }
 
-/** Wrap an async handler so thrown errors become 400s with a message. */
+/**
+ * Wrap an async handler. A validation failure or a `UserFacingError` becomes a
+ * response carrying its (known-safe) message; anything else goes to the
+ * central `errorHandler` — a fixed 500, logged by name only — because its
+ * message can quote a request body, a `bw` stderr line, or an upstream reply.
+ */
 function h(fn: (req: Request, res: Response) => Promise<void>) {
-  return (req: Request, res: Response) => {
+  return (req: Request, res: Response, next: NextFunction) => {
     fn(req, res).catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!res.headersSent) res.status(400).json({ error: message });
+      const message = clientMessage(err);
+      if (message === null) {
+        next(err);
+        return;
+      }
+      if (!res.headersSent) res.status(err instanceof UserFacingError ? err.status : 400).json({ error: message });
     });
   };
 }
@@ -55,7 +60,7 @@ export function buildApiRouter(app: AppState): Router {
         storeExists: await app.store.exists(),
         storeLocked: app.store.locked,
         vaultUnlocked: app.vault.unlocked,
-        vaultError: redactUrls(app.vaultError),
+        vaultError: app.vaultError,
         publicUrl: app.publicUrl(),
         targetCount: app.registry.list().length,
         toolCount: app.store.locked ? 0 : resolveTools(app).length,
@@ -86,6 +91,10 @@ export function buildApiRouter(app: AppState): Router {
     "/store/unlock",
     h(async (req, res) => {
       const { passphrase } = z.object({ passphrase: z.string().min(1) }).parse(req.body ?? {});
+      if (!(await app.store.exists())) {
+        res.status(409).json({ error: "No store exists yet; initialize it first." });
+        return;
+      }
       await app.store.unlock(passphrase);
       // Re-establish the saved vault session, keep the bearer hash current, and
       // nudge locked sessions to re-list tools — shared with the boot paths.
@@ -98,7 +107,7 @@ export function buildApiRouter(app: AppState): Router {
         res.json({
           ok: true,
           vaultUnlocked: false,
-          vaultError: redactUrls(err instanceof Error ? err.message : String(err)),
+          vaultError: describeVaultFailure(err),
         });
         return;
       }
@@ -151,10 +160,12 @@ export function buildApiRouter(app: AppState): Router {
       } catch (err) {
         // No key file → the slot is useless; roll it back so state stays honest.
         await app.store.disableAutoUnlock().catch(() => {});
+        // The errno code only, never the message text (see clientMessage).
+        const code = (err as { code?: unknown }).code;
         res.status(400).json({
           error:
-            `Could not write the unlock key file (${env.unlockKeyFile}): ` +
-            `${err instanceof Error ? err.message : String(err)}. ` +
+            `Could not write the unlock key file (${env.unlockKeyFile})` +
+            `${typeof code === "string" && /^E[A-Z]+$/.test(code) ? ` — ${code}` : ""}. ` +
             "Mount a writable host directory there (see docker-compose.yml) or set SKELETON_KEY_UNLOCK_KEY_FILE.",
         });
         return;
@@ -208,11 +219,11 @@ export function buildApiRouter(app: AppState): Router {
       try {
         await app.changeVaultServer(serverUrl);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = describeVaultFailure(err);
         app.audit.record({
           ts: new Date().toISOString(), tool: "vault.change_server", target: "vaultwarden",
           tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "error",
-          detail: redactUrls(message) ?? "vault reconnect failed",
+          detail: message,
         });
         res.status(400).json({ error: message });
         return;
@@ -255,7 +266,17 @@ export function buildApiRouter(app: AppState): Router {
           collectionName: z.string().optional(),
         })
         .parse(req.body ?? {});
-      const checks = await setup.connectVault(input);
+      let checks;
+      try {
+        checks = await setup.connectVault(input);
+      } catch (err) {
+        // A `bw` failure gets its fixed summary; a UserFacingError keeps its
+        // own status; anything else (a local store write) is a logged 500.
+        if (err instanceof VaultCommandError) {
+          throw new UserFacingError(describeVaultFailure(err));
+        }
+        throw err;
+      }
       res.json({ checks });
     }),
   );
@@ -343,7 +364,7 @@ export function buildApiRouter(app: AppState): Router {
         .parse(req.body ?? {});
       const connector = getConnector(body.type);
       if (!connector) {
-        res.status(400).json({ error: `Unknown connector type: ${body.type}` });
+        res.status(400).json({ error: `Unknown connector type; expected one of: ${listConnectors().map((c) => c.type).join(", ")}.` });
         return;
       }
       // Validate connector-specific options.

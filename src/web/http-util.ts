@@ -1,4 +1,6 @@
 import type { ErrorRequestHandler, Request } from "express";
+import { ZodError } from "zod";
+import { UserFacingError } from "../lib/errors.js";
 
 /**
  * Origin used to build OAuth discovery metadata and the WWW-Authenticate hint.
@@ -57,6 +59,56 @@ export function paramStr(req: Request, name: string): string | null {
 }
 
 /**
+ * `Name (code)` for a server-fault log line. Never the message: it can quote
+ * request input (a body, a one-time link id), a `bw` stderr line, or a value
+ * from upstream.
+ */
+export function faultLabel(err: unknown): string {
+  const e = (err ?? {}) as { name?: unknown; code?: unknown };
+  const code = typeof e.code === "string" || typeof e.code === "number" ? ` (${e.code})` : "";
+  return `${typeof e.name === "string" ? e.name : "Error"}${code}`;
+}
+
+/** For a log line: a `UserFacingError`'s message (safe by construction and
+ *  the useful part), otherwise `faultLabel`. */
+export function logText(err: unknown): string {
+  return err instanceof UserFacingError ? err.message : faultLabel(err);
+}
+
+/** A path segment worth printing: an array index or an identifier-shaped field
+ *  name. Anything else is a key the client chose (a `z.record`/`z.map` key)
+ *  and could be anything, so it prints as `<key>`. */
+function pathSegment(p: PropertyKey): string {
+  if (typeof p === "number") return String(p);
+  return typeof p === "string" && /^[A-Za-z_]\w{0,40}$/.test(p) ? p : "<key>";
+}
+
+/**
+ * A zod failure as `path: message` per issue. The messages are zod's own
+ * wording or our schemas' fixed refine text, neither of which quotes the
+ * rejected value; an unrecognized-key issue names the client's own key, so it
+ * gets fixed text too, as does any path segment that isn't field-shaped.
+ */
+export function describeZodError(err: ZodError): string {
+  const parts = err.issues.map((i) => {
+    const where = i.path.length > 0 ? `${i.path.map(pathSegment).join(".")}: ` : "";
+    return `${where}${i.code === "unrecognized_keys" ? "Unrecognized key." : i.message}`;
+  });
+  return `Invalid request — ${parts.join("; ")}`;
+}
+
+/**
+ * The message a client may see for `err`, or null when it must get a fixed
+ * string instead: only a `UserFacingError` or a zod validation failure (see
+ * `describeZodError`) is ever echoed.
+ */
+export function clientMessage(err: unknown): string | null {
+  if (err instanceof UserFacingError) return err.message;
+  if (err instanceof ZodError) return describeZodError(err);
+  return null;
+}
+
+/**
  * Final error handler. Express 5 forwards a rejected async handler here (Express
  * 4 left it an unhandled rejection), and the built-in handler would print the
  * stack outside production. The response carries only a fixed reason for the
@@ -68,7 +120,7 @@ export function paramStr(req: Request, name: string): string | null {
  * logged at all.
  */
 export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
-  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; expose?: unknown; name?: unknown; code?: unknown };
+  const e = (err ?? {}) as { status?: unknown; statusCode?: unknown; expose?: unknown };
   // Only a client error raised by Express itself keeps its status: http-errors
   // from body-parser (malformed or oversized body, marked `expose`) and the
   // router's URIError for a malformed percent-encoded route param (status 400,
@@ -78,10 +130,7 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
   const raw = typeof e.status === "number" ? e.status : typeof e.statusCode === "number" ? e.statusCode : 500;
   const fromExpress = e.expose === true || (err instanceof URIError && raw === 400);
   const status = fromExpress && raw >= 400 && raw < 500 ? raw : 500;
-  if (status >= 500) {
-    const code = typeof e.code === "string" || typeof e.code === "number" ? ` (${e.code})` : "";
-    console.error(`[skeleton-key] request failed: ${typeof e.name === "string" ? e.name : "Error"}${code}`);
-  }
+  if (status >= 500) console.error(`[skeleton-key] request failed: ${faultLabel(err)}`);
   if (res.headersSent) {
     next(err);
     return;

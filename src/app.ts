@@ -1,6 +1,6 @@
 import { access } from "node:fs/promises";
 import { BootstrapStore } from "./secrets/bootstrap-store.js";
-import { VaultwardenClient, type GetCredentialOptions } from "./secrets/vaultwarden.js";
+import { VaultwardenClient, describeVaultFailure, type GetCredentialOptions } from "./secrets/vaultwarden.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
@@ -11,6 +11,7 @@ import { verifyTotpCode } from "./lib/totp.js";
 import { timingSafeEqual } from "node:crypto";
 import { paths } from "./config/paths.js";
 import { fingerprintValue } from "./lib/fingerprint.js";
+import { UserFacingError } from "./lib/errors.js";
 
 /**
  * Shared runtime state for the whole process: the encrypted bootstrap store, the
@@ -43,8 +44,9 @@ export class AppState {
   /** SHA-256 of the MCP bearer token, so it's verifiable while locked. */
   private bearerHash: string | null = null;
 
-  /** Why the last vault (re)connect failed — the sanitized `bw` message — or
-   *  null once the vault is up. Surfaced by `/api/status` (URLs redacted) so
+  /** Why the last vault (re)connect failed — a fixed summary from
+   *  `describeVaultFailure`, never the raw `bw` message — or null once the
+   *  vault is up. Surfaced by the unauthenticated `/api/status` so
    *  the admin page can explain a store that unlocked while the vault did not,
    *  instead of leaving the only clue in the container log. */
   vaultError: string | null = null;
@@ -97,7 +99,7 @@ export class AppState {
           masterPassword: s.bwMasterPassword,
         });
       } catch (err) {
-        this.vaultError = err instanceof Error ? err.message : String(err);
+        this.vaultError = describeVaultFailure(err);
         throw err;
       }
       this.vaultError = null;
@@ -118,10 +120,10 @@ export class AppState {
    * the stored ones — nothing secret enters or leaves through this path.
    */
   async changeVaultServer(serverUrl: string): Promise<void> {
-    if (this.store.locked) throw new Error("Unlock the store first.");
+    if (this.store.locked) throw new UserFacingError("Unlock the store first.", 409);
     const s = this.store.get();
     if (!s.bwClientId || !s.bwClientSecret || !s.bwMasterPassword) {
-      throw new Error("The vault has not been connected yet — run the setup wizard.");
+      throw new UserFacingError("The vault has not been connected yet — run the setup wizard.", 409);
     }
     await this.vault.logout();
     try {
@@ -133,7 +135,7 @@ export class AppState {
       });
       await this.vault.sync();
     } catch (err) {
-      this.vaultError = err instanceof Error ? err.message : String(err);
+      this.vaultError = describeVaultFailure(err);
       throw err;
     }
     await this.store.update({ bwServerUrl: serverUrl });

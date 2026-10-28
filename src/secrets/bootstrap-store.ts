@@ -2,6 +2,7 @@ import { readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../lib/atomic-file.js";
 import sodium from "../lib/sodium.js";
+import { UserFacingError } from "../lib/errors.js";
 import type { BootstrapSecrets } from "./types.js";
 import { paths } from "../config/paths.js";
 
@@ -113,7 +114,7 @@ export class BootstrapStore {
   /** Create a brand-new store protected by `passphrase`. Fails if one exists. */
   async initialize(passphrase: string): Promise<void> {
     if (await this.exists()) {
-      throw new Error("Bootstrap store already exists; refusing to overwrite.");
+      throw new UserFacingError("Bootstrap store already exists; refusing to overwrite.", 409);
     }
     this.dataKey = sodium.randombytes_buf(sodium.crypto_secretbox_KEYBYTES);
     this.cache = {};
@@ -125,7 +126,7 @@ export class BootstrapStore {
     const raw = await readFile(this.file, "utf8");
     const parsed = JSON.parse(raw) as V1Format | V2Format;
     if (parsed.magic !== MAGIC_V1 && parsed.magic !== MAGIC_V2) {
-      throw new Error("Unrecognized bootstrap store format.");
+      throw new UserFacingError("Unrecognized bootstrap store format.", 500);
     }
     return parsed;
   }
@@ -167,7 +168,7 @@ export class BootstrapStore {
       try {
         cache = this.openPayload(v1, key);
       } catch {
-        throw new Error("Incorrect passphrase or corrupted bootstrap store.");
+        throw new UserFacingError("Incorrect passphrase or corrupted bootstrap store.");
       } finally {
         sodium.memzero(key);
       }
@@ -189,7 +190,7 @@ export class BootstrapStore {
     );
     const dataKey = this.unwrapDataKey(slot, kek);
     sodium.memzero(kek);
-    if (!dataKey) throw new Error("Incorrect passphrase or corrupted bootstrap store.");
+    if (!dataKey) throw new UserFacingError("Incorrect passphrase or corrupted bootstrap store.");
     this.adopt(v2, dataKey);
   }
 
@@ -200,14 +201,14 @@ export class BootstrapStore {
   async unlockWithKey(unlockKey: Uint8Array): Promise<void> {
     const parsed = await this.readOnDisk();
     if (parsed.magic === MAGIC_V1) {
-      throw new Error("Store predates auto-unlock; unlock once with the passphrase to migrate it.");
+      throw new UserFacingError("Store predates auto-unlock; unlock once with the passphrase to migrate it.");
     }
     const v2 = parsed as V2Format;
     if (!v2.slots.unlockKey) {
-      throw new Error("Auto-unlock is not enrolled for this store.");
+      throw new UserFacingError("Auto-unlock is not enrolled for this store.", 409);
     }
     const dataKey = this.unwrapDataKey(v2.slots.unlockKey, unlockKey);
-    if (!dataKey) throw new Error("Auto-unlock key does not match this store.");
+    if (!dataKey) throw new UserFacingError("Auto-unlock key does not match this store.");
     this.adopt(v2, dataKey);
   }
 
@@ -218,7 +219,7 @@ export class BootstrapStore {
       cache = this.openPayload(v2, dataKey);
     } catch {
       sodium.memzero(dataKey);
-      throw new Error("Corrupted bootstrap store payload.");
+      throw new UserFacingError("Corrupted bootstrap store payload.", 500);
     }
     this.dataKey = dataKey;
     this.cache = cache;
@@ -281,7 +282,7 @@ export class BootstrapStore {
   }
 
   private assertUnlocked(): void {
-    if (!this.dataKey) throw new Error("Bootstrap store is locked.");
+    if (!this.dataKey) throw new UserFacingError("Bootstrap store is locked.", 409);
   }
 
   get(): Readonly<BootstrapSecrets> {

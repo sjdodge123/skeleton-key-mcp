@@ -10,7 +10,7 @@ import { buildCredentialRouter } from "./credential-routes.js";
 import { buildAdminRouter } from "./admin-routes.js";
 import { mcpAuth } from "./auth.js";
 import { WIZARD_HTML } from "./ui.js";
-import { errorHandler } from "./http-util.js";
+import { errorHandler, faultLabel } from "./http-util.js";
 
 interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -123,7 +123,7 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
           // Push tools/list_changed to this session whenever the tool set changes.
           const unsubscribe = app.onToolsChanged(() => {
             mcp.sendToolListChanged().catch((e) =>
-              console.error("[skeleton-key] tools/list_changed push failed:", e instanceof Error ? e.message : e),
+              console.error(`[skeleton-key] tools/list_changed push failed: ${faultLabel(e)}`),
             );
           });
           sessions.set(id, { transport, unsubscribe, lastSeen: Date.now() });
@@ -142,8 +142,10 @@ export function mountMcp(server: express.Express, app: AppState, auth: express.R
     } catch (err) {
       // If the session was already registered before the throw, don't orphan it.
       if (registeredId) dropSession(registeredId, true);
+      // Fixed text, logged by name only: the message can quote the request.
+      console.error(`[skeleton-key] mcp request failed: ${faultLabel(err)}`);
       if (!res.headersSent) {
-        jsonRpcError(res, 500, -32603, err instanceof Error ? err.message : String(err));
+        jsonRpcError(res, 500, -32603, "Internal error.");
       }
     }
   });

@@ -1,8 +1,8 @@
 import { Router, type Response } from "express";
 import { z } from "zod";
 import type { AppState } from "../app.js";
-import { OAUTH_SCOPE } from "../oauth/oauth-service.js";
-import { baseUrl, bodyOf, firstStr } from "./http-util.js";
+import { InvalidGrantError, OAUTH_SCOPE } from "../oauth/oauth-service.js";
+import { baseUrl, bodyOf, describeZodError, faultLabel, firstStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
 
 /**
@@ -84,7 +84,7 @@ export function buildOAuthRouter(app: AppState): Router {
       .object({ client_name: z.string().optional(), redirect_uris: z.array(z.string().url()).min(1) })
       .safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: "invalid_client_metadata", error_description: parsed.error.message });
+      res.status(400).json({ error: "invalid_client_metadata", error_description: describeZodError(parsed.error) });
       return;
     }
     const client = app.oauth.registerClient(parsed.data);
@@ -186,7 +186,13 @@ export function buildOAuthRouter(app: AppState): Router {
         res.status(400).json({ error: "unsupported_grant_type" });
       }
     } catch (err) {
-      res.status(400).json({ error: "invalid_grant", error_description: err instanceof Error ? err.message : String(err) });
+      if (err instanceof InvalidGrantError) {
+        res.status(400).json({ error: "invalid_grant", error_description: "The authorization code or refresh token is invalid, expired, already used, or does not match this client, redirect URI or PKCE verifier." });
+        return;
+      }
+      // Not a grant decision (e.g. the token store failed): a server fault.
+      console.error(`[skeleton-key] oauth token request failed: ${faultLabel(err)}`);
+      res.status(500).json({ error: "server_error" });
     }
   });
 
