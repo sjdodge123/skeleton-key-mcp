@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -28,6 +28,30 @@ const code = () => generateTotpCode(TOTP_SECRET);
 const wrong = (i = 1) => String((Number(code()) + i) % 1_000_000).padStart(6, "0");
 const used: string[] = [];
 
+/** One real bootstrap store, built once with an auto-unlock keyslot. Each test
+ *  copies it and opens it with that key — no argon2 per test (each derivation
+ *  is ~1 s of CPU, enough to time out other suites running in parallel). */
+let templateDir: string;
+let templateStore: string;
+let unlockKey: Uint8Array;
+
+beforeAll(async () => {
+  vi.resetModules();
+  templateDir = await mkdtemp(path.join(tmpdir(), "sk-ratelimit-template-"));
+  process.env.SKELETON_KEY_DATA_DIR = templateDir;
+  const { BootstrapStore } = await import("../secrets/bootstrap-store.js");
+  const { paths } = await import("../config/paths.js");
+  const store = await BootstrapStore.open();
+  await store.initialize("wizard-passphrase");
+  await store.update({ totpSecret: TOTP_SECRET });
+  unlockKey = new Uint8Array(await store.enableAutoUnlock());
+  templateStore = paths.bootstrapStore;
+});
+
+afterAll(async () => {
+  await rm(templateDir, { recursive: true, force: true });
+});
+
 beforeEach(async () => {
   vi.resetModules();
   dir = await mkdtemp(path.join(tmpdir(), "sk-ratelimit-"));
@@ -35,12 +59,12 @@ beforeEach(async () => {
   vi.stubEnv("SKELETON_KEY_PUBLIC_URL", "");
   vi.stubEnv("SKELETON_KEY_UNLOCK_KEY_FILE", path.join(dir, "unlock-key"));
 
+  const { paths } = await import("../config/paths.js");
+  await copyFile(templateStore, paths.bootstrapStore);
   const { AppState } = await import("../app.js");
   const { buildHttpApp } = await import("./server.js");
-  const { paths } = await import("../config/paths.js");
   app = await AppState.create();
-  await app.store.initialize("wizard-passphrase");
-  await app.store.update({ totpSecret: TOTP_SECRET });
+  await app.store.unlockWithKey(new Uint8Array(unlockKey));
   await writeFile(paths.setupComplete, JSON.stringify({ completedAt: "test" }), { mode: 0o600 });
 
   // Dual-stack listen, so 127.0.0.1 and ::1 arrive as two different clients.
@@ -55,8 +79,12 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  httpServer.close();
+  // Drop keep-alive sockets and wait for the server to close BEFORE the
+  // SQLite handles go, so no late request touches a closed native handle.
+  httpServer.closeAllConnections();
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   app.audit.close();
   app.oauth.close();
   await rm(dir, { recursive: true, force: true });

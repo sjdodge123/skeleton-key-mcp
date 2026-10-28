@@ -130,6 +130,8 @@ describe("AttemptLimiter", () => {
       return guesses;
     }
     type Sim = AttemptLimiter & { guess: () => boolean };
+    /** Skip to the end of the running lockout (what a patient attacker does). */
+    const waitOut = (l: AttemptLimiter, c: ReturnType<typeof clock>) => c.advance(l.blocked("probe")?.retryAfterMs ?? 1000);
 
     /** Climb `ladder` lockouts, make `pace` guesses the moment the last one
      *  ends, then wait `waitMs` before climbing again. */
@@ -137,9 +139,9 @@ describe("AttemptLimiter", () => {
       for (let lockouts = 0; lockouts < ladder; ) {
         if ((l as Sim).guess()) {
           if (l.blocked("probe")) lockouts++;
-        } else c.advance(1000);
+        } else waitOut(l, c);
       }
-      while (l.blocked("probe")) c.advance(1000);
+      while (l.blocked("probe")) waitOut(l, c);
       for (let i = 0; i < pace; i++) (l as Sim).guess();
       c.advance(waitMs);
     };
@@ -147,7 +149,7 @@ describe("AttemptLimiter", () => {
     it("greedy (guess whenever allowed) settles at the 4-hour cap: ~60 guesses a day", () => {
       const days = 60;
       const n = simulate(days, (l, c) => {
-        if (!(l as Sim).guess()) c.advance(1000);
+        if (!(l as Sim).guess()) waitOut(l, c);
       });
       // The ladder's first ~8 h give 80 extra; after that 10 per 4 h.
       expect(n / days).toBeLessThanOrEqual(62);
