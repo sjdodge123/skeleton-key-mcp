@@ -55,7 +55,7 @@ afterEach(async () => {
 });
 
 function target(options: Record<string, unknown> = {}): Target {
-  return { name: "status-kuma", type: "uptime-kuma", host: "127.0.0.1", port: fake.port, credentialRef: "kuma-login", options: { baseUrl: fake.url, timeoutMs: 5000, ...options } };
+  return { name: "kuma1", type: "uptime-kuma", host: "127.0.0.1", port: fake.port, credentialRef: "kuma-login", options: { baseUrl: fake.url, timeoutMs: 5000, ...options } };
 }
 const cred = (over: Partial<Credential> = {}): Credential => ({ ref: "kuma-login", username: "admin", password: "kuma-pass", fields: {}, uris: [], ...over });
 function ctx(t: Target = target(), c: Credential = cred()): ToolContext {
@@ -96,11 +96,11 @@ describe("connector shape", () => {
 describe("transport guard", () => {
   it("allows https anywhere, http only to LAN/loopback, and never a URL with embedded credentials", () => {
     expect(() => assertKumaTransportOk("https://status.example.com")).not.toThrow();
-    expect(() => assertKumaTransportOk("http://192.168.0.50:3001")).not.toThrow();
+    expect(() => assertKumaTransportOk("http://192.168.1.50:3001")).not.toThrow();
     expect(() => assertKumaTransportOk("http://127.0.0.1:3001")).not.toThrow();
     expect(() => assertKumaTransportOk("http://status.example.com")).toThrow(/not a private LAN address/);
     expect(() => assertKumaTransportOk("https://admin:pw@status.example.com")).toThrow(/must not embed credentials/);
-    expect(() => assertKumaTransportOk("ftp://192.168.0.50")).toThrow(/Unsupported/);
+    expect(() => assertKumaTransportOk("ftp://192.168.1.50")).toThrow(/Unsupported/);
   });
 
   it("refuses to send the password over plain http to a routable host without opening a socket", async () => {
@@ -173,7 +173,7 @@ describe("list_monitors", () => {
   it("renders id, name, type, where, state and tags — with URL credentials and query values redacted", async () => {
     const res = await tool("list_monitors").run({}, ctx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("Uptime Kuma monitors on status-kuma: 5 (1 paused)");
+    expect(res.text).toContain("Uptime Kuma monitors on kuma1: 5 (1 paused)");
     expect(res.text).toContain("[12] Valheim — port 192.168.1.48:2456 — ACTIVE — tags: managed:pelican, wing:node");
     expect(res.text).toContain("[15] Valheim query — port 192.168.1.48:2457 — PAUSED — tags: server:f5eb47ac");
     expect(res.text).toContain("[16] Website — http https://example.com/health?token=… — ACTIVE — tags: —");
@@ -194,7 +194,7 @@ describe("monitor_status", () => {
   it("reads heartbeats via getMonitorBeats and summarises latest / last change / tally", async () => {
     const res = await tool("monitor_status").run({ monitor: "Valheim", hours: 24 }, ctx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("Monitor [12] 'Valheim' (port 192.168.1.48:2456) on status-kuma: ACTIVE");
+    expect(res.text).toContain("Monitor [12] 'Valheim' (port 192.168.1.48:2456) on kuma1: ACTIVE");
     expect(res.text).toContain('Latest beat: UP at 2026-10-11T01:02:00.000Z 12ms "200 - OK"');
     expect(res.text).toContain("Last status change: UP at 2026-10-11T01:01:00.000Z");
     expect(res.text).toContain("Last 24h: 3 beats — 1 DOWN, 2 UP");
@@ -210,7 +210,7 @@ describe("monitor_status", () => {
 
 describe("pause_monitor / resume_monitor", () => {
   it("pauses by case-insensitive name, names the monitor in the confirm, and is a no-op when already paused", async () => {
-    expect(tool("pause_monitor").confirm!({ monitor: "valheim" }, target())).toBe("PAUSE Uptime Kuma monitor 'valheim' on status-kuma — no checks or notifications until resumed");
+    expect(tool("pause_monitor").confirm!({ monitor: "valheim" }, target())).toBe("PAUSE Uptime Kuma monitor 'valheim' on kuma1 — no checks or notifications until resumed");
     const res = await tool("pause_monitor").run({ monitor: "valheim" }, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("Paused Uptime Kuma monitor [12] 'Valheim'");
@@ -223,7 +223,7 @@ describe("pause_monitor / resume_monitor", () => {
   });
 
   it("resumes by id and reports an already-active monitor as no change", async () => {
-    expect(tool("resume_monitor").confirm!({ monitor: 15 }, target())).toBe("RESUME Uptime Kuma monitor #15 on status-kuma");
+    expect(tool("resume_monitor").confirm!({ monitor: 15 }, target())).toBe("RESUME Uptime Kuma monitor #15 on kuma1");
     const res = await tool("resume_monitor").run({ monitor: 15 }, ctx());
     expect(res.text).toContain("Resumed Uptime Kuma monitor [15] 'Valheim query'");
     expect(fake.monitors.get(15)!.active).toBe(1);
@@ -247,7 +247,7 @@ describe("pause_monitor / resume_monitor", () => {
 describe("maintenance / end_maintenance", () => {
   it("pauses the selection (names, ids and a tag), returns a handle, and end_maintenance resumes exactly what it paused", async () => {
     const confirm = tool("maintenance").confirm!({ monitors: ["Valheim", 15], tag: "wing:node", note: "mod install" }, target());
-    expect(confirm).toBe("PAUSE Uptime Kuma monitors ['Valheim', #15] and every monitor tagged 'wing:node' on status-kuma as a maintenance window (mod install) — end_maintenance resumes exactly these");
+    expect(confirm).toBe("PAUSE Uptime Kuma monitors ['Valheim', #15] and every monitor tagged 'wing:node' on kuma1 as a maintenance window (mod install) — end_maintenance resumes exactly these");
 
     const res = await tool("maintenance").run({ monitors: ["Valheim", 15], tag: "wing:node", note: "mod install" }, ctx());
     expect(res.isError).toBeFalsy();
@@ -262,7 +262,7 @@ describe("maintenance / end_maintenance", () => {
     // Persisted, and visible in list_monitors.
     const onDisk = JSON.parse(await readFile(path.join(dir, "handles.json"), "utf8"));
     expect(onDisk.handles).toHaveLength(1);
-    expect(onDisk.handles[0]).toMatchObject({ handle, target: "status-kuma", monitors: [{ id: 12, name: "Valheim" }, { id: 14, name: "node" }], note: "mod install" });
+    expect(onDisk.handles[0]).toMatchObject({ handle, target: "kuma1", monitors: [{ id: 12, name: "Valheim" }, { id: 14, name: "node" }], note: "mod install" });
     const listed = await tool("list_monitors").run({}, ctx());
     expect(listed.text).toContain(`${handle} since`);
     expect(listed.text).toContain("mod install: Valheim [12], node [14]");
@@ -270,10 +270,10 @@ describe("maintenance / end_maintenance", () => {
     // Someone resumed 'node' by hand meanwhile — reported, not re-poked.
     fake.monitors.get(14)!.active = 1;
     fake.log.length = 0;
-    expect(tool("end_maintenance").confirm!({ handle }, target())).toBe(`RESUME the Uptime Kuma monitors paused by maintenance handle '${handle}' on status-kuma`);
+    expect(tool("end_maintenance").confirm!({ handle }, target())).toBe(`RESUME the Uptime Kuma monitors paused by maintenance handle '${handle}' on kuma1`);
     const end = await tool("end_maintenance").run({ handle }, ctx());
     expect(end.isError).toBeFalsy();
-    expect(end.text).toContain(`Maintenance ${handle} on status-kuma ended: resumed 1 of 2 — Valheim [12]`);
+    expect(end.text).toContain(`Maintenance ${handle} on kuma1 ended: resumed 1 of 2 — Valheim [12]`);
     expect(end.text).toContain("Already active (resumed by someone else meanwhile): node [14]");
     expect(fake.log).toContain("resumeMonitor:12");
     expect(fake.log).not.toContain("resumeMonitor:14");
@@ -341,18 +341,18 @@ describe("maintenance / end_maintenance", () => {
   it("explains an unknown handle, listing the open ones, and refuses another target's handle", async () => {
     const none = await tool("end_maintenance").run({ handle: "mw_deadbeef" }, ctx());
     expect(none.isError).toBe(true);
-    expect(none.text).toMatch(/Unknown maintenance handle 'mw_deadbeef'\. No maintenance window is open on status-kuma/);
+    expect(none.text).toMatch(/Unknown maintenance handle 'mw_deadbeef'\. No maintenance window is open on kuma1/);
     expect(none.text).toMatch(/resume_monitor/);
 
     const res = await tool("maintenance").run({ monitors: ["Valheim"] }, ctx());
     const handle = /mw_[0-9a-f]{8}/.exec(res.text)![0];
     const other = await tool("end_maintenance").run({ handle: "mw_deadbeef" }, ctx());
-    expect(other.text).toContain(`Open handles on status-kuma: ${handle} (Valheim, since`);
+    expect(other.text).toContain(`Open handles on kuma1: ${handle} (Valheim, since`);
 
     const elsewhere: Target = { ...target(), name: "other-kuma" };
     const wrong = await tool("end_maintenance", elsewhere).run({ handle }, ctx(elsewhere));
     expect(wrong.isError).toBe(true);
-    expect(wrong.text).toMatch(/belongs to target 'status-kuma', not 'other-kuma'/);
+    expect(wrong.text).toMatch(/belongs to target 'kuma1', not 'other-kuma'/);
     expect(fake.monitors.get(12)!.active).toBe(0);
   });
 
@@ -362,7 +362,7 @@ describe("maintenance / end_maintenance", () => {
     expect(none.text).toMatch(/Name at least one monitor/);
     const tag = await tool("maintenance").run({ tag: "nope" }, ctx());
     expect(tag.isError).toBe(true);
-    expect(tag.text).toMatch(/No monitor on status-kuma carries the tag 'nope'/);
+    expect(tag.text).toMatch(/No monitor on kuma1 carries the tag 'nope'/);
   });
 });
 
@@ -457,7 +457,7 @@ describe("a broken handle store", () => {
     fake.failResume.add(13);
     const res = await tool("maintenance").run({ tag: "managed:pelican" }, ctx());
     expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/MONITORS STILL PAUSED on status-kuma: \[13\] Palworld: .*injected resume failure.*Resume them now with resume_monitor/);
+    expect(res.text).toMatch(/MONITORS STILL PAUSED on kuma1: \[13\] Palworld: .*injected resume failure.*Resume them now with resume_monitor/);
     expect(res.text).toContain("rolled back: resumed Valheim [12]");
     expect(fake.monitors.get(12)!.active).toBe(1);
     expect(fake.monitors.get(13)!.active).toBe(0);
@@ -470,7 +470,7 @@ describe("a broken handle store", () => {
     expect(res.text).toContain("[12] Valheim");
     expect(res.text).toMatch(/WARNING: the maintenance-handle store could not be read/);
 
-    await writeFile(path.join(dir, "handles.json"), JSON.stringify({ handles: [null, 42, { handle: "mw_ok", target: "status-kuma", monitors: [{ id: 12, name: "Valheim" }], startedAt: "2026-10-11T00:00:00Z" }] }), "utf8");
+    await writeFile(path.join(dir, "handles.json"), JSON.stringify({ handles: [null, 42, { handle: "mw_ok", target: "kuma1", monitors: [{ id: 12, name: "Valheim" }], startedAt: "2026-10-11T00:00:00Z" }] }), "utf8");
     expect((await store.list()).map((h) => h.handle)).toEqual(["mw_ok"]);
   });
 

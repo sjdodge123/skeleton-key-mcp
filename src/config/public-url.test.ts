@@ -17,9 +17,9 @@ function ifaces(spec: Record<string, { address: string; family?: string; interna
 
 describe("detectLanBaseUrl", () => {
   it("returns the private LAN IPv4 with the given port and scheme", () => {
-    const spec = ifaces({ eth0: [{ address: "192.168.0.42" }] });
-    expect(detectLanBaseUrl(8787, "http", spec)).toBe("http://192.168.0.42:8787");
-    expect(detectLanBaseUrl(8787, "https", spec)).toBe("https://192.168.0.42:8787");
+    const spec = ifaces({ eth0: [{ address: "192.168.1.42" }] });
+    expect(detectLanBaseUrl(8787, "http", spec)).toBe("http://192.168.1.42:8787");
+    expect(detectLanBaseUrl(8787, "https", spec)).toBe("https://192.168.1.42:8787");
   });
 
   it("ignores loopback and public addresses", () => {
@@ -90,8 +90,8 @@ describe("persisted public URL", () => {
   it("round-trips through save/load and returns null before anything is written", async () => {
     const file = path.join(dir, "public-url");
     expect(await loadPublicUrl(file)).toBeNull();
-    await savePublicUrl("http://192.168.0.9:8787", file);
-    expect(await loadPublicUrl(file)).toBe("http://192.168.0.9:8787");
+    await savePublicUrl("http://192.168.1.53:8787", file);
+    expect(await loadPublicUrl(file)).toBe("http://192.168.1.53:8787");
   });
 });
 
@@ -111,8 +111,8 @@ describe("AppState.publicUrl priority", () => {
     const { AppState } = await import("../app.js");
     const app = await AppState.create();
     try {
-      app.setLearnedPublicUrl("http://192.168.0.9:8787");
-      expect(app.publicUrl()).toBe("http://192.168.0.9:8787");
+      app.setLearnedPublicUrl("http://192.168.1.53:8787");
+      expect(app.publicUrl()).toBe("http://192.168.1.53:8787");
       vi.stubEnv("SKELETON_KEY_PUBLIC_URL", "https://sk.lan:8787/");
       expect(app.publicUrl()).toBe("https://sk.lan:8787");
     } finally {

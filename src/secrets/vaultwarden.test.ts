@@ -191,7 +191,7 @@ describe("buildLoginItemJson", () => {
 
   it("carries an arbitrary named field set (multi-field credential hand-off) onto one item", () => {
     const item = buildLoginItemJson({
-      name: "sxm-bot",
+      name: "example-bot",
       username: "svc-account",
       notes: "migrated off fly.io",
       organizationId: "org-1",

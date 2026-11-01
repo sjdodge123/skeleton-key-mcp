@@ -24,6 +24,8 @@
 /src/connectors/command-policy* @sjdodge123
 /src/connectors/net.ts          @sjdodge123
 /scripts/host/                  @sjdodge123
+/scripts/check-homelab-data.mjs  @sjdodge123
+/.githooks/                     @sjdodge123
 
 # --- Supply chain: dependencies, build, and CI ---
 /package.json                   @sjdodge123

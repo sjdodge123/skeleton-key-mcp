@@ -44,7 +44,7 @@ describe("global tool registry", () => {
 
 describe("request_credential input schema", () => {
   const schema = byName.get("request_credential")!.inputSchema;
-  const base = { name: "sxm-bot", host: "fly-app", reason: "migrate off fly.io" };
+  const base = { name: "example-bot", host: "fly-app", reason: "migrate off fly.io" };
   const field = { name: "DISCORD_BOT_TOKEN" };
 
   const parse = (input: unknown): { success: boolean; data?: any } => schema.safeParse(input) as { success: boolean; data?: any };
@@ -86,7 +86,7 @@ describe("request_credential input schema", () => {
   it("names the requested fields in the approval confirmation", () => {
     const confirm = byName.get("request_credential")!.confirm!;
     expect(confirm({ ...base, fields: [field] })).toContain("DISCORD_BOT_TOKEN");
-    expect(confirm({ ...base, kind: "token" })).toContain("sxm-bot");
+    expect(confirm({ ...base, kind: "token" })).toContain("example-bot");
   });
 
   it("records the field set on the request and reports the names (only) once fulfilled", async () => {
@@ -94,7 +94,7 @@ describe("request_credential input schema", () => {
     const fakeApp = {
       vault: { listItemNames: async () => [] },
       credentialRequests: requests,
-      publicUrl: () => "http://192.168.0.9:8787",
+      publicUrl: () => "http://192.168.1.53:8787",
     } as unknown as AppState;
 
     const out = await byName.get("request_credential")!.run(
@@ -102,7 +102,7 @@ describe("request_credential input schema", () => {
       fakeApp,
     );
     // The link always comes from the configured public URL (anti-phishing).
-    expect(out.text).toContain("http://192.168.0.9:8787/credential/");
+    expect(out.text).toContain("http://192.168.1.53:8787/credential/");
     const id = out.text.match(/\/credential\/([0-9a-f-]{36})/)![1]!;
     expect(requests.get(id)!.fields).toEqual([
       { name: "DISCORD_BOT_TOKEN", label: undefined, secret: true }, // secret defaults to true
@@ -116,7 +116,7 @@ describe("request_credential input schema", () => {
     expect(fulfilled).toContain("fulfilled");
     expect(fulfilled).toContain("DISCORD_BOT_TOKEN");
     expect(fulfilled).toContain("SXM_USERNAME");
-    expect(fulfilled).toContain("credentialRef 'sxm-bot'");
+    expect(fulfilled).toContain("credentialRef 'example-bot'");
   });
 });
 
@@ -125,18 +125,18 @@ describe("network_scan gateway-first recommendation", () => {
 
   it("recommends registering a confirmed gateway first (it names the other devices)", async () => {
     vi.mocked(scanLan).mockResolvedValue([
-      { host: "192.168.0.1", port: 443, connectorType: "unifi", label: "UniFi", confidence: "confirmed" },
-      { host: "192.168.0.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
+      { host: "192.168.1.1", port: 443, connectorType: "unifi", label: "UniFi", confidence: "confirmed" },
+      { host: "192.168.1.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
     ] as Awaited<ReturnType<typeof scanLan>>);
     const out = (await scan.run({}, {} as AppState)).text;
     expect(out).toContain("Recommended first target");
-    expect(out).toContain("192.168.0.1");
+    expect(out).toContain("192.168.1.1");
   });
 
   it("stays quiet when no gateway is confidently detected", async () => {
     vi.mocked(scanLan).mockResolvedValue([
-      { host: "192.168.0.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
-      { host: "192.168.0.7", port: 8443, connectorType: "unifi", label: "UniFi", confidence: "likely" },
+      { host: "192.168.1.50", port: 22, connectorType: "ssh", label: "SSH host", confidence: "confirmed" },
+      { host: "192.168.1.7", port: 8443, connectorType: "unifi", label: "UniFi", confidence: "likely" },
     ] as Awaited<ReturnType<typeof scanLan>>);
     const out = (await scan.run({}, {} as AppState)).text;
     expect(out).not.toContain("Recommended first target");

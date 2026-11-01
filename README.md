@@ -153,7 +153,7 @@ Every authenticator-code prompt (the admin pages, agent consent, credential link
 
 Because the global limit has to hold against an attacker on your LAN using many addresses, **someone on the LAN can keep you locked out** by repeatedly entering wrong codes. While that lasts you can't read the activity log in the web UI. To find and stop them:
 
-1. **Find the address.** Every lockout is logged to the container's stdout, e.g. `[skeleton-key] TOTP lockout: global until 2026-10-28T04:00:00.000Z, last client 192.168.0.57`. In Portainer that's the container's logs. When you're back in, the activity log (`/admin`) has `auth.totp_failed` rows per wrong code, and the `auth.*_refused` rows name the addresses that kept trying.
+1. **Find the address.** Every lockout is logged to the container's stdout, e.g. `[skeleton-key] TOTP lockout: global until 2026-10-28T04:00:00.000Z, last client 192.168.1.77`. In Portainer that's the container's logs. When you're back in, the activity log (`/admin`) has `auth.totp_failed` rows per wrong code, and the `auth.*_refused` rows name the addresses that kept trying.
 2. **Block it at the network** (a firewall rule on your router, or pull the device off the LAN). That ends the attack. Restarting doesn't.
 3. **Restart only as a last resort.** The counters are in memory, so a restart clears them. Without auto-unlock, the restart also re-locks the vault until you enter your passphrase. **With [auto-unlock](#boot-auto-unlock) enabled, the restart comes back unlocked with a fresh budget for the attacker too.** So block first, then restart.
 
@@ -177,7 +177,7 @@ After the wizard (scoped vault + first MCP connection), you don't hand-build the
 A typical first session, entirely in chat:
 
 > **You:** Map my network — my LAN is 192.168.0.
-> **Claude:** *(network_scan)* Found a Synology at 192.168.0.20, Proxmox at 192.168.0.30, …
+> **Claude:** *(network_scan)* Found a Synology at 192.168.1.20, Proxmox at 192.168.1.30, …
 > **You:** Generate an SSH key for the Synology, user `skeletonkey`, and register it.
 > **Claude:** *(vault_generate_ssh_key)* Here's the public key to install: `ssh-ed25519 …`. *(register_target)* Registered `synology1`.
 > **You:** I installed it — validate.

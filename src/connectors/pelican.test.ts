@@ -884,7 +884,7 @@ describe("port expansion (mirrors the panel's AssignmentService)", () => {
 
   it("refuses CIDR, which the panel would expand across every port", () => {
     expect(() => assertAllocationIp("192.168.0.0/24")).toThrow(/refuses CIDR/);
-    expect(() => assertAllocationIp("192.168.0.999")).toThrow(/one literal IPv4/);
+    expect(() => assertAllocationIp("192.168.1.999")).toThrow(/one literal IPv4/);
     expect(assertAllocationIp(" 192.168.1.48 ")).toBe("192.168.1.48");
   });
 });
@@ -995,7 +995,7 @@ describe("import_egg", () => {
           ok: false,
           status: 302,
           statusText: "",
-          headers: { get: (h: string) => (h.toLowerCase() === "location" ? "http://192.168.0.1/admin" : null) },
+          headers: { get: (h: string) => (h.toLowerCase() === "location" ? "http://192.168.1.1/admin" : null) },
           text: async () => "",
         } as any;
       }),
@@ -1149,7 +1149,7 @@ describe("panel host resolution (the one place a connector reaches another targe
   it("refuses when the named target is not an ssh target", async () => {
     // Without this check a typo'd name pointing at the gateway would have this
     // connector opening a shell on the UniFi box.
-    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.0.1", credentialRef: "u" };
+    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.1.1", credentialRef: "u" };
     const t = panelTarget({ sshTarget: "unifi" });
     const res = await panelTool("panel_version", t).run({}, hostCtx({ resolveTarget: () => unifi }, t));
     expect(res.isError).toBe(true);
@@ -1598,7 +1598,7 @@ describe("files — client API tools", () => {
 
   it("pull_file refuses an http or in-network URL before any call", async () => {
     const calls = mockFetch([{ match: () => true, reply: { status: 204 } }]);
-    const bad = ["http://thunderstore.io/x.zip", "https://192.168.0.1/x.zip", "https://localhost/x.zip"];
+    const bad = ["http://thunderstore.io/x.zip", "https://192.168.1.1/x.zip", "https://localhost/x.zip"];
     for (const url of bad) {
       const res = await tool("pull_file").run({ server: REF, url, directory: "/", filename: "x.zip" }, ctx());
       expect(res.isError).toBe(true);
@@ -1857,7 +1857,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
   });
 
   const kumaTarget = (): Target => ({
-    name: "status-kuma",
+    name: "kuma1",
     type: "uptime-kuma",
     host: "127.0.0.1",
     port: fake.port,
@@ -1874,7 +1874,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
         if (ref === "kuma-login") return kumaCred;
         throw new Error(`no vault item ${ref}`);
       },
-      resolveTarget: (name: string) => (name === "status-kuma" ? kumaTarget() : undefined),
+      resolveTarget: (name: string) => (name === "kuma1" ? kumaTarget() : undefined),
       targetsOfType: (type: string) => (type === "uptime-kuma" ? [kumaTarget()] : []),
       ...over,
     };
@@ -1915,7 +1915,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     const res = await power({});
     expect(res.isError).toBeFalsy();
     expect(res.text).toContain("White-glove restart of Pelican server 'Valheim' (f5eb47ac) on pelican-panel");
-    expect(res.text).toContain("1. Paused 1 Uptime Kuma monitor on status-kuma: Valheim [12]. Already paused, left alone: Valheim query [15].");
+    expect(res.text).toContain("1. Paused 1 Uptime Kuma monitor on kuma1: Valheim [12]. Already paused, left alone: Valheim query [15].");
     expect(res.text).toContain("2. Sent 'restart'");
     expect(res.text).toMatch(/3\. Server reached 'running' after \ds \(observed: running → stopping → starting → running\)/);
     expect(res.text).toContain("4. Resumed: Valheim [12].");
@@ -1960,7 +1960,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     fake.failResume.add(12);
     const res = await power({ signal: "stop" });
     expect(res.isError).toBe(true);
-    expect(res.text.startsWith("MONITORS STILL PAUSED on status-kuma: [12] Valheim:")).toBe(true);
+    expect(res.text.startsWith("MONITORS STILL PAUSED on kuma1: [12] Valheim:")).toBe(true);
     expect(res.text).toContain("resume_monitor");
     expect(fake.monitors.get(12)!.active).toBe(0);
   });
@@ -1990,11 +1990,11 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     const two = [kumaTarget(), { ...kumaTarget(), name: "other-kuma" }];
     const res = await power({}, gloveCtx({ targetsOfType: () => two }));
     expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/Several uptime-kuma targets are registered \(status-kuma, other-kuma\)/);
+    expect(res.text).toMatch(/Several uptime-kuma targets are registered \(kuma1, other-kuma\)/);
     expect(res.text).toMatch(/monitorsTarget/);
     expect(writes(calls)).toHaveLength(0);
 
-    const t = target({ ownerUserId: 7, monitorsTarget: "status-kuma" });
+    const t = target({ ownerUserId: 7, monitorsTarget: "kuma1" });
     const ok = await power({}, gloveCtx({ targetsOfType: () => two }, t));
     expect(ok.isError).toBeFalsy();
     expect(ok.text).toMatch(/observed: running → stopping → starting → running/);
@@ -2014,7 +2014,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     const res = await power({ waitSeconds: 1 });
     await closing;
     expect(res.isError).toBe(true);
-    expect(res.text.startsWith("MONITORS STILL PAUSED on status-kuma: [12] Valheim:")).toBe(true);
+    expect(res.text.startsWith("MONITORS STILL PAUSED on kuma1: [12] Valheim:")).toBe(true);
     expect(res.text).toMatch(/Could not connect to Uptime Kuma|Timed out/);
     expect(res.text).toContain("4. Resumed: nothing to resume.");
     expect(fake.monitors.get(12)!.active).toBe(0);
@@ -2043,7 +2043,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
 
   it("refuses a monitorsTarget that is not an uptime-kuma target or is not registered", async () => {
     const calls = panelRoutes([{ state: "running" }]);
-    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.0.1", credentialRef: "u" };
+    const unifi: Target = { name: "unifi", type: "unifi", host: "192.168.1.1", credentialRef: "u" };
     const bad = await power({}, gloveCtx({ resolveTarget: () => unifi }, target({ ownerUserId: 7, monitorsTarget: "unifi" })));
     expect(bad.isError).toBe(true);
     expect(bad.text).toMatch(/is a 'unifi' target, not 'uptime-kuma'/);
@@ -2061,7 +2061,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     const calls = panelRoutes([{ state: "running" }], { json: {} }, "Satisfactory - Ararat");
     const res = await power({});
     expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/No monitor on Uptime Kuma target 'status-kuma' matches Pelican server 'Satisfactory - Ararat' \(f5eb47ac\)/);
+    expect(res.text).toMatch(/No monitor on Uptime Kuma target 'kuma1' matches Pelican server 'Satisfactory - Ararat' \(f5eb47ac\)/);
     expect(res.text).toContain("tag it 'managed:pelican'");
     expect(writes(calls)).toHaveLength(0);
     expect(fake.log.some((e) => e.startsWith("pauseMonitor"))).toBe(false);
@@ -2094,7 +2094,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
     fake.log.length = 0;
     const worse = await power({});
     expect(worse.isError).toBe(true);
-    expect(worse.text).toMatch(/^Pelican error: MONITORS STILL PAUSED on status-kuma: \[12\] Valheim: .*injected resume failure/);
+    expect(worse.text).toMatch(/^Pelican error: MONITORS STILL PAUSED on kuma1: \[12\] Valheim: .*injected resume failure/);
     expect(worse.text).toContain("The 'restart' was NOT sent.");
     expect(fake.monitors.get(12)!.active).toBe(0);
     fake.monitors.get(12)!.active = 1; // leave the fixture clean

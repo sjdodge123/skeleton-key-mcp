@@ -663,12 +663,12 @@ class UniFi {
     const doNet = mode === "both" || mode === "netconsole";
 
     if (opts.enabled && !opts.host) {
-      throw new Error("set_remote_logging needs a collector 'host' (e.g. 192.168.0.32) when enabling.");
+      throw new Error("set_remote_logging needs a collector 'host' (e.g. 192.168.1.40) when enabling.");
     }
     // LAN-only: the gateway's crash-log stream may only ever go to an RFC1918
     // collector, never a routable/off-LAN sink (defense-in-depth vs. a bad host).
     if (opts.host && !isPrivateIPv4(opts.host)) {
-      throw new Error(`Invalid collector host '${opts.host}' — expected a private LAN IPv4 (e.g. 192.168.0.32).`);
+      throw new Error(`Invalid collector host '${opts.host}' — expected a private LAN IPv4 (e.g. 192.168.1.40).`);
     }
     const portStr = (name: string, v: number | undefined, dflt: number): string => {
       const n = v ?? dflt;
@@ -1178,7 +1178,7 @@ function buildTools(target: Target): ConnectorTool[] {
       tier: "execute",
       inputSchema: z.object({
         enabled: z.boolean().describe("true = stream logs to host; false = clear the syslog + netconsole targets (revert)."),
-        host: z.string().optional().describe("Collector's private LAN IPv4 (e.g. 192.168.0.32). Required when enabled=true."),
+        host: z.string().optional().describe("Collector's private LAN IPv4 (e.g. 192.168.1.40). Required when enabled=true."),
         mode: z.enum(["both", "syslog", "netconsole"]).optional().describe("Which channel(s) to configure. Default 'both'."),
         syslogPort: z.number().int().optional().describe("Remote syslog UDP port (default 514)."),
         netconsolePort: z.number().int().optional().describe("Netconsole UDP port (default 6666)."),
