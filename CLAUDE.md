@@ -40,6 +40,7 @@ Connectors fetch credentials from the Vaultwarden secrets client at call time (h
 2. Pull credentials from the Vaultwarden secrets client, not from env or config files.
 3. For `execute` tools: write the audit entry (tool, target, args digest, timestamp, result) and honor any per-target command allow/deny list (SSH especially — deny destructive commands like `rm -rf`, `mkfs`, `dd`).
 4. Keep destructive NAS/network endpoints out of v1 unless specifically requested.
+5. Run `npm run manifest` and commit `tools.manifest.json` (a test fails when it's stale). The conformance suite (`src/connectors/conformance.test.ts`) checks naming, verb-vs-tier, confirm text and that read tools send no state-changing request; never widen its exception lists to make a tool pass.
 
 ## Build order
 

@@ -3,7 +3,7 @@ import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../connectors/ssh-keygen.js";
 import { scanLan } from "../discovery/scan.js";
-import { getConnector, registerableType } from "../connectors/index.js";
+import { assertKnownOptionKeys, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
 import { runSsh, shellQuote } from "../connectors/ssh-exec.js";
 import { startSkeletonJob, waitForSkeletonJob, getSkeletonJob, describeSkeletonJob } from "../snapshots/jobs.js";
 import { DEFAULT_TTL_MINUTES, MAX_TTL_MINUTES, MIN_TTL_MINUTES, safeHost } from "../web/credential-requests.js";
@@ -396,7 +396,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         const connector = getConnector(i.type);
         if (!connector) return err(`Unknown connector type '${i.type}'.`);
         try {
-          connector.configSchema.parse(i.options ?? {});
+          validateTargetOptions(connector, i.options);
         } catch (e) {
           return err(`Invalid options for '${i.type}': ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -480,14 +480,14 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
     {
       name: "update_target",
       description:
-        "Update a registered target's credentialRef (and optionally host/port/options) — e.g. re-point a host from a password login to a generated SSH key. A new credentialRef must resolve to an existing vault item.",
+        "Update a registered target's credentialRef (and optionally host/port/options) — e.g. re-point a host from a password login to a generated SSH key. A new credentialRef must resolve to an existing vault item. Options are merged into the existing ones; set an option to null to remove it. Unknown option keys are refused.",
       tier: "execute",
       inputSchema: z.object({
         name: safeName,
         credentialRef: z.string().optional().describe("New vault item name to use for this target."),
         host: z.string().optional(),
         port: z.number().int().positive().optional(),
-        options: z.record(z.string(), z.unknown()).optional(),
+        options: z.record(z.string(), z.unknown()).optional().describe("Options to merge in; a null value removes that option."),
       }),
       confirm: (input) => {
         const i = input as { name: string; credentialRef?: string };
@@ -500,6 +500,28 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         // Verify the new ref resolves before committing, so a typo can't brick a
         // working target — and pin the item's immutable id while we're at it.
         // Without a new ref the existing name + pinned id are kept as-is.
+        // Shallow-MERGE options (don't replace): a caller changing one option
+        // must not silently drop others — notably the SSH command allow/deny
+        // guard (options.denyPatterns), a load-bearing safety control. Only an
+        // explicit null removes a key. New keys must be ones the connector
+        // declares, and the merged result must still validate; a stale key an
+        // older version accepted is tolerated so it can't block the update.
+        let options = existing.options;
+        if (i.options) {
+          const set = Object.fromEntries(Object.entries(i.options).filter(([, v]) => v !== null));
+          const merged: Record<string, unknown> = { ...existing.options, ...set };
+          for (const [k, v] of Object.entries(i.options)) if (v === null) delete merged[k];
+          const connector = getConnector(existing.type);
+          if (connector) {
+            try {
+              assertKnownOptionKeys(connector, set);
+              connector.configSchema.parse(merged);
+            } catch (e) {
+              return err(`Invalid options for '${existing.type}': ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+          options = merged;
+        }
         let credentialId = existing.credentialId;
         if (i.credentialRef) {
           try {
@@ -514,10 +536,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
           credentialId,
           host: i.host ?? existing.host,
           port: i.port ?? existing.port,
-          // Shallow-MERGE options (don't replace): a caller changing one option
-          // must not silently drop others — notably the SSH command allow/deny
-          // guard (options.denyPatterns), a load-bearing safety control.
-          options: i.options ? { ...existing.options, ...i.options } : existing.options,
+          options,
         };
         await a.registry.upsert(merged);
         a.emitToolsChanged();

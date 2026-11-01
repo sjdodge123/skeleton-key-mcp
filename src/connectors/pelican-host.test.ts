@@ -534,9 +534,9 @@ describe("panel_version reports the whole upgrade story in one read", () => {
 describe("panel_prepare_runtime", () => {
   const prepare = (input: Record<string, unknown>) => tool("panel_prepare_runtime").run(input, ctx());
 
-  it("confirm names the host, the PHP version, the release and the helper", () => {
+  it("confirm names the panel target, the host, the PHP version, the release and the helper", () => {
     const text = tool("panel_prepare_runtime").confirm!({ phpVersion: "8.4", release: "v1.0.0-rc.1" }, panelTarget);
-    expect(text).toContain("PREPARE the PHP runtime on Pelican host 'panel-host'");
+    expect(text).toContain("PREPARE the PHP runtime for pelican 'pelican-panel' on host 'panel-host'");
     expect(text).toContain("install PHP 8.4");
     expect(text).toContain("php8.4-fpm");
     expect(text).toContain("for panel release v1.0.0-rc.1");
@@ -718,9 +718,9 @@ describe("wings_update", () => {
   const update = (input: Record<string, unknown>) => tool("wings_update").run(input, ctx());
   const WINGS_AFTER = { stdout: `wings v1.0.0-rc.1\n${status({ wings: "1.0.0-rc.1" })}` };
 
-  it("confirm names the host, both versions and the helper", () => {
+  it("confirm names the panel target, the host, both versions and the helper", () => {
     const text = tool("wings_update").confirm!({ expectVersion: "1.0.0-beta22", tag: "v1.0.0-rc.1" }, panelTarget);
-    expect(text).toContain("UPDATE the Wings daemon on Pelican host 'panel-host' from 1.0.0-beta22 to v1.0.0-rc.1");
+    expect(text).toContain("UPDATE the Wings daemon for pelican 'pelican-panel' on host 'panel-host' from 1.0.0-beta22 to v1.0.0-rc.1");
     expect(text).toContain(`${HELPER_PATH} via sudo -n and nothing else`);
   });
 

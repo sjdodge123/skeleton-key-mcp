@@ -7,7 +7,7 @@ import { env } from "../config/paths.js";
 import { saveUnlockKey, removeUnlockKey } from "../secrets/unlock-key-file.js";
 import { SetupService } from "../setup/setup-service.js";
 import { scanLan } from "../discovery/scan.js";
-import { listConnectors, getConnector, registerableType } from "../connectors/index.js";
+import { listConnectors, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
 import { describeVaultFailure, VaultCommandError } from "../secrets/vaultwarden.js";
@@ -398,8 +398,8 @@ export function buildApiRouter(app: AppState): Router {
         res.status(400).json({ error: `Unknown connector type; expected one of: ${listConnectors().map((c) => c.type).join(", ")}.` });
         return;
       }
-      // Validate connector-specific options.
-      connector.configSchema.parse(body.options ?? {});
+      // Validate connector-specific options; unknown keys are refused.
+      validateTargetOptions(connector, body.options);
       if (connector.requiresCredential && !body.credentialRef) {
         res.status(400).json({ error: `Connector '${body.type}' requires a credentialRef.` });
         return;

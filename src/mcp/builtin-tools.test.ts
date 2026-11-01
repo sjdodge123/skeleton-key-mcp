@@ -300,6 +300,42 @@ describe("credentialId pinning across register / update / delete / list", () => 
     expect(targets[0]).toMatchObject({ credentialRef: "pihole-ssh", credentialId: KEY_ID });
   });
 
+  it("register_target refuses an unknown option key instead of silently dropping it", async () => {
+    const targets: Target[] = [];
+    const { app } = fakeApp(targets, { "pihole-pw": ID });
+    const out = await byName.get("register_target")!.run(
+      { name: "pihole", type: "ssh", host: "10.0.0.2", credentialRef: "pihole-pw", options: { sudoPrefix: ["docker"] } },
+      app,
+    );
+    expect(out.isError).toBe(true);
+    expect(out.text).toContain("'sudoPrefix'");
+    expect(out.text).toContain("'sudoPrefixes'");
+    expect(targets).toHaveLength(0);
+  });
+
+  it("update_target refuses unknown or ill-typed new options, and leaves the target untouched", async () => {
+    const original: Target = { name: "pihole", type: "ssh", host: "10.0.0.2", credentialRef: "pihole-pw", credentialId: ID, options: { denyPatterns: ["rm"] } };
+    const targets: Target[] = [{ ...original }];
+    const { app } = fakeApp(targets, { "pihole-pw": ID });
+    const update = byName.get("update_target")!;
+    const unknown = await update.run({ name: "pihole", options: { denyPattern: ["dd"] } }, app);
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toContain("'denyPattern'");
+    const badType = await update.run({ name: "pihole", options: { commandTimeoutMs: "soon" } }, app);
+    expect(badType.isError).toBe(true);
+    expect(targets[0]).toEqual(original);
+  });
+
+  it("update_target merges options, removes one set to null, and tolerates a stale stored key", async () => {
+    const targets: Target[] = [
+      { name: "pihole", type: "ssh", host: "10.0.0.2", credentialRef: "pihole-pw", credentialId: ID, options: { denyPatterns: ["rm"], legacyKey: 1, allowPatterns: ["ls"] } },
+    ];
+    const { app } = fakeApp(targets, { "pihole-pw": ID });
+    const out = await byName.get("update_target")!.run({ name: "pihole", options: { sudoPrefixes: ["docker"], allowPatterns: null } }, app);
+    expect(out.isError).toBeFalsy();
+    expect(targets[0]!.options).toEqual({ denyPatterns: ["rm"], legacyKey: 1, sudoPrefixes: ["docker"] });
+  });
+
   it("vault_delete_credential treats a target pinned to the item's id as a dependent", async () => {
     // The target's NAME ref no longer resolves to this item (it was renamed),
     // but its pinned id still does — deleting would break it.

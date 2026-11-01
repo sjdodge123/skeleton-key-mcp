@@ -2949,7 +2949,7 @@ function buildTools(target: Target): ConnectorTool[] {
         const i = input as { expectVersion: string; skipBackup?: boolean; release?: string };
         const o = options(t);
         return (
-          `UPGRADE the Pelican panel itself on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.release ?? "the latest release"} ` +
+          `UPGRADE the Pelican panel itself (pelican '${t.name}') on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.release ?? "the latest release"} ` +
           `(${o.panelPath}) — runs database migrations, takes the panel down during the upgrade` +
           `${i.skipBackup ? ", and SKIPS the database backup" : ""}; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
         );
@@ -3003,7 +3003,7 @@ function buildTools(target: Target): ConnectorTool[] {
           );
         }
         return (
-          `PREPARE the PHP runtime on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}': install PHP ${i.phpVersion} (ppa:ondrej/php + ` +
+          `PREPARE the PHP runtime for pelican '${t.name}' on host '${o.sshTarget ?? "(no sshTarget set)"}': install PHP ${i.phpVersion} (ppa:ondrej/php + ` +
           `Pelican's extensions), make it the CLI default, switch the panel's nginx fastcgi socket to php${i.phpVersion}-fpm and restart ` +
           `php-fpm + nginx — for panel release ${i.release ?? "latest"}; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
         );
@@ -3034,7 +3034,7 @@ function buildTools(target: Target): ConnectorTool[] {
         const i = input as { expectVersion: string; tag: string };
         const o = options(t);
         return (
-          `UPDATE the Wings daemon on Pelican host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.tag} — replaces ` +
+          `UPDATE the Wings daemon for pelican '${t.name}' on host '${o.sshTarget ?? "(no sshTarget set)"}' from ${i.expectVersion} to ${i.tag} — replaces ` +
           `/usr/local/bin/wings (checksum-verified) and restarts the wings service; runs the root helper ${HELPER_PATH} via sudo -n and nothing else`
         );
       },
