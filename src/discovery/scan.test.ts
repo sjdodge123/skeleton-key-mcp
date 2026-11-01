@@ -56,7 +56,7 @@ describe("isPrivateSubnet", () => {
 
   it("rejects malformed input", () => {
     expect(isPrivateSubnet("192.168")).toBe(false);
-    expect(isPrivateSubnet("192.168.0.1")).toBe(false);
+    expect(isPrivateSubnet("192.168.1.1")).toBe(false);
     expect(isPrivateSubnet("192.168.abc")).toBe(false);
     expect(isPrivateSubnet("")).toBe(false);
     expect(isPrivateSubnet("192.168.300")).toBe(false);

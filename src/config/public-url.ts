@@ -4,7 +4,7 @@ import path from "node:path";
 import { paths } from "./paths.js";
 
 /**
- * The "public URL" is the absolute base (e.g. http://192.168.0.20:8787) Skeleton
+ * The "public URL" is the absolute base (e.g. http://192.168.1.20:8787) Skeleton
  * Key puts in front of user-facing links — notably the vault-unlock guidance and
  * the credential hand-off links, both of which ask the user to type a secret.
  *

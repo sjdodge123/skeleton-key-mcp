@@ -87,7 +87,7 @@ const FIELDS = [
 
 describe("credential hand-off — multi-field mode", () => {
   it("renders one input per field, masked only for secret ones", async () => {
-    const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
     const html = await (await fetch(`${root}/credential/${req.id}`)).text();
     expect(html).toContain('name="f_DISCORD_BOT_TOKEN"');
     expect(html).toContain('name="f_SXM_USERNAME"');
@@ -99,7 +99,7 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("writes ONE vault item carrying every field, hidden per the field's secret flag", async () => {
-    const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
@@ -112,7 +112,7 @@ describe("credential hand-off — multi-field mode", () => {
 
     expect(created).toHaveLength(1);
     const item = created[0];
-    expect(item.name).toBe("sxm-bot");
+    expect(item.name).toBe("example-bot");
     expect(item.collectionName).toBe("Homelab");
     expect(item.fields).toEqual([
       { name: "DISCORD_BOT_TOKEN", value: "discord-value", hidden: true },
@@ -156,7 +156,7 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("requires every field and stays claimable after the rejection", async () => {
-    const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
@@ -171,7 +171,7 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("is TOTP-gated and CSRF-gated like the single-secret form", async () => {
-    const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
     const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
 
     const noCsrf = await postForm(req.id, { formToken: "wrong", action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values });
@@ -185,7 +185,7 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("is single-use — a replay of the same link cannot write a second item", async () => {
-    const req = app.credentialRequests.create({ name: "sxm-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
     const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
     const body = { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values };
     expect((await postForm(req.id, body)).status).toBe(200);
@@ -197,7 +197,7 @@ describe("credential hand-off — multi-field mode", () => {
 
 describe("credential hand-off — single-secret mode (unchanged)", () => {
   it("still writes a username/password login with an ssh:// URI", async () => {
-    const req = app.credentialRequests.create({ name: "nas1", host: "192.168.0.50", kind: "password", username: "root", reason: "onboard nas1" });
+    const req = app.credentialRequests.create({ name: "nas1", host: "192.168.1.50", kind: "password", username: "root", reason: "onboard nas1" });
     const html = await (await fetch(`${root}/credential/${req.id}`)).text();
     expect(html).toContain('name="secret"');
     expect(html).not.toContain('name="f_');
@@ -210,12 +210,12 @@ describe("credential hand-off — single-secret mode (unchanged)", () => {
       secret: "hunter2",
     });
     expect(res.status).toBe(200);
-    expect(created[0]).toMatchObject({ name: "nas1", username: "root", password: "hunter2", url: "ssh://192.168.0.50" });
+    expect(created[0]).toMatchObject({ name: "nas1", username: "root", password: "hunter2", url: "ssh://192.168.1.50" });
     expect(created[0].fields).toEqual([]);
   });
 
   it("still writes a token as a hidden 'token' custom field", async () => {
-    const req = app.credentialRequests.create({ name: "pve-token", host: "192.168.0.10", kind: "token", reason: "onboard proxmox" });
+    const req = app.credentialRequests.create({ name: "pve-token", host: "192.168.1.10", kind: "token", reason: "onboard proxmox" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",

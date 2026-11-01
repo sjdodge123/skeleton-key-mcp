@@ -265,7 +265,7 @@ Steps 3–4 and 5–6 are independent of each other and can be parallel PRs.
 - ~~Before step 6's tunnel tools: confirm the existing tunnel is
   **remotely-managed**~~ **Resolved 2026-09-03:** checked via
   `GET /accounts/{account}/cfd_tunnel` with the `cloudflare-api-token` cred —
-  the relevant tunnel, `status.gamernight.net` (running as the `awesome_knuth`
+  the relevant tunnel, `status.example.com` (running as the `awesome_knuth`
   container on nas1), reports `"remote_config": true, "config_src":
   "cloudflare"` — remotely-managed, no migration needed. (A second,
   unrelated tunnel `chaochao-dev` is locally-managed — `config_src: "local"`

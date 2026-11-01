@@ -137,8 +137,8 @@ describe("read-only policy: every command of a compound line is vetted", () => {
       "dmesg -Tc", "ss -4K dst 10.0.0.1",
       "date -s '2020-01-01'", "date 010100002020", "hostname evil", "hostname -F /etc/x",
       "dmesg -c", "dmesg -C", "dmesg --clear", "journalctl --vacuum-time=1s", "journalctl --rotate",
-      "ss -K dst 10.0.0.1", "arp -d 192.168.0.1", "env systemctl stop x", "smartctl -t long /dev/sda",
-      "smartctl -s off /dev/sda", "sort -o /etc/passwd /tmp/x", "ping -f 192.168.0.1",
+      "ss -K dst 10.0.0.1", "arp -d 192.168.1.1", "env systemctl stop x", "smartctl -t long /dev/sda",
+      "smartctl -s off /dev/sda", "sort -o /etc/passwd /tmp/x", "ping -f 192.168.1.1",
     ]) no(cmd);
   });
 
@@ -146,7 +146,7 @@ describe("read-only policy: every command of a compound line is vetted", () => {
     for (const cmd of [
       "find /etc -name '*.mount'", "ip a", "ip -br a", "ip -4 route show", "ip link show", "ip route", "ip route get 1.1.1.1", "ip -s link ls", "date", "date +%s", "hostname", "hostname -I",
       "dmesg -T", "dmesg --level=err", "journalctl -u pvestatd -n 50", "journalctl --list-boots", "ss -tlnp",
-      "arp -a", "env", "smartctl -x /dev/sda", "hostname -f", "dmesg -e", "smartctl -d sat -a /dev/sda", "sort", "ping -c 3 192.168.0.1",
+      "arp -a", "env", "smartctl -x /dev/sda", "hostname -f", "dmesg -e", "smartctl -d sat -a /dev/sda", "sort", "ping -c 3 192.168.1.1",
     ]) ok(cmd);
   });
 

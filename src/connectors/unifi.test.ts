@@ -231,8 +231,8 @@ describe("get_settings", () => {
 
 describe("isPrivateIPv4", () => {
   it("accepts RFC1918 addresses and rejects everything else", () => {
-    for (const ok of ["192.168.0.32", "10.1.2.3", "172.16.5.5", "172.31.255.255"]) expect(isPrivateIPv4(ok)).toBe(true);
-    for (const no of ["8.8.8.8", "172.32.0.1", "172.15.0.1", "1.1.1.1", "300.1.1.1", "192.168.0.32:514", "example.com", ""]) {
+    for (const ok of ["192.168.1.40", "10.1.2.3", "172.16.5.5", "172.31.255.255"]) expect(isPrivateIPv4(ok)).toBe(true);
+    for (const no of ["8.8.8.8", "172.32.0.1", "172.15.0.1", "1.1.1.1", "300.1.1.1", "192.168.1.40:514", "example.com", ""]) {
       expect(isPrivateIPv4(no)).toBe(false);
     }
   });
@@ -289,21 +289,21 @@ describe("set_remote_logging (crash-log capture)", () => {
 
   it("enables both syslog and netconsole to a LAN collector, preserving siblings", async () => {
     const calls = mock([rsyslogd()]);
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBeFalsy();
     const body = putBody(calls);
-    expect(body.ip).toBe("192.168.0.32");
+    expect(body.ip).toBe("192.168.1.40");
     expect(body.enabled).toBe(true);
     expect(body.this_controller).toBe(true);
     expect(body.port).toBe("514");
     expect(body.netconsole_enabled).toBe(true);
-    expect(body.netconsole_host).toBe("192.168.0.32");
+    expect(body.netconsole_host).toBe("192.168.1.40");
     expect(body.netconsole_port).toBe("6666");
     expect(body.log_all_contents).toBe(true); // sibling untouched
     expect(res.text).toContain("CONFIGURED");
     expect(res.text).toContain("delivery isn't verified"); // honest about netconsole/UDP reachability
-    expect(res.text).toContain("syslog→192.168.0.32:514");
-    expect(res.text).toContain("netconsole→192.168.0.32:6666");
+    expect(res.text).toContain("syslog→192.168.1.40:514");
+    expect(res.text).toContain("netconsole→192.168.1.40:6666");
     expect(res.text).toContain("Revert with enabled=false");
   });
 
@@ -312,14 +312,14 @@ describe("set_remote_logging (crash-log capture)", () => {
     // because the netconsole fields aren't in `need` when doNet is false.
     const noNet = { key: "rsyslogd", _id: "r1", site_id: "s", enabled: true, this_controller: true, ip: "", log_all_contents: true, port: "514" };
     const calls = mock([noNet]);
-    const res = await run({ enabled: true, host: "192.168.0.32", mode: "syslog", syslogPort: 5514 });
+    const res = await run({ enabled: true, host: "192.168.1.40", mode: "syslog", syslogPort: 5514 });
     expect(res.isError).toBeFalsy();
     const body = putBody(calls);
-    expect(body.ip).toBe("192.168.0.32");
+    expect(body.ip).toBe("192.168.1.40");
     expect(body.enabled).toBe(true);
     expect(body.port).toBe("5514");
     expect(body.netconsole_enabled).toBeUndefined(); // netconsole branch never ran
-    expect(res.text).toContain("syslog→192.168.0.32:5514");
+    expect(res.text).toContain("syslog→192.168.1.40:5514");
     expect(res.text).not.toContain("netconsole→");
   });
 
@@ -337,7 +337,7 @@ describe("set_remote_logging (crash-log capture)", () => {
   });
 
   it("disable clears both targets", async () => {
-    const active = { ...rsyslogd(), ip: "192.168.0.32", netconsole_enabled: true, netconsole_host: "192.168.0.32" };
+    const active = { ...rsyslogd(), ip: "192.168.1.40", netconsole_enabled: true, netconsole_host: "192.168.1.40" };
     const calls = mock([active]);
     const res = await run({ enabled: false });
     expect(res.isError).toBeFalsy();
@@ -368,7 +368,7 @@ describe("set_remote_logging (crash-log capture)", () => {
 
   it("rejects an out-of-range port before any network I/O", async () => {
     const calls = mock([rsyslogd()]);
-    const res = await run({ enabled: true, host: "192.168.0.32", syslogPort: 70000 });
+    const res = await run({ enabled: true, host: "192.168.1.40", syslogPort: 70000 });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("Invalid syslogPort");
     expect(calls.length).toBe(0); // validated before the GET
@@ -376,7 +376,7 @@ describe("set_remote_logging (crash-log capture)", () => {
 
   it("fails closed when the rsyslogd group is absent", async () => {
     const calls = mock([{ key: "dpi", _id: "d1", enabled: true }]);
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("no 'rsyslogd'");
     expect(wrote(calls)).toBe(false);
@@ -385,7 +385,7 @@ describe("set_remote_logging (crash-log capture)", () => {
   it("fails closed on schema drift (netconsole_host missing) instead of writing", async () => {
     const drifted = { key: "rsyslogd", _id: "r1", site_id: "s", enabled: true, this_controller: true, ip: "", log_all_contents: true, netconsole_enabled: false, netconsole_port: "6666", port: "514" }; // no netconsole_host
     const calls = mock([drifted]);
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("expected shape");
     expect(res.text).toContain("netconsole_host");
@@ -409,7 +409,7 @@ describe("set_remote_logging (crash-log capture)", () => {
         return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
       }),
     );
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("changed under us");
     expect(calls.some((c) => (c.init?.method ?? "GET") === "PUT")).toBe(false);
@@ -430,7 +430,7 @@ describe("set_remote_logging (crash-log capture)", () => {
         return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
       }),
     );
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("did not hold");
     expect(calls.some((c) => c.init.method === "PUT")).toBe(true);
@@ -438,7 +438,7 @@ describe("set_remote_logging (crash-log capture)", () => {
 
   it("surfaces a meta.rc='error' envelope on the PUT as a failure", async () => {
     const calls = mock([rsyslogd()], { status: 200, json: { meta: { rc: "error", msg: "api.err.NoSiteContext" } } });
-    const res = await run({ enabled: true, host: "192.168.0.32" });
+    const res = await run({ enabled: true, host: "192.168.1.40" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("api.err.NoSiteContext");
     expect(wrote(calls)).toBe(true); // it did attempt the write
@@ -458,7 +458,7 @@ describe("set_remote_logging (crash-log capture)", () => {
         return { ok: true, status: 200, statusText: "", headers: { get: () => null, getSetCookie: () => [] }, text: async () => JSON.stringify(json) } as any;
       }),
     );
-    const res = await run({ enabled: true, host: "192.168.0.32", mode: "netconsole" });
+    const res = await run({ enabled: true, host: "192.168.1.40", mode: "netconsole" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("did not hold");
   });
@@ -466,7 +466,7 @@ describe("set_remote_logging (crash-log capture)", () => {
   it("disable succeeds even when the gateway normalizes a cleared target to null", async () => {
     // Fix for the string-field held regression: a cleared host coming back as null
     // (not "") after the write must NOT throw a phantom "did not hold".
-    const active = { ...rsyslogd(), ip: "192.168.0.32", enabled: true, netconsole_enabled: true, netconsole_host: "192.168.0.32" };
+    const active = { ...rsyslogd(), ip: "192.168.1.40", enabled: true, netconsole_enabled: true, netconsole_host: "192.168.1.40" };
     let put = false;
     vi.stubGlobal(
       "fetch",
@@ -490,8 +490,8 @@ describe("set_remote_logging (crash-log capture)", () => {
 
   it("confirmation names the collector and the group rewrite", () => {
     const c = tool("set_remote_logging").confirm!;
-    expect(c({ enabled: true, host: "192.168.0.32" }, target())).toContain("Enable UniFi remote logging (both) → 192.168.0.32 on unifi");
-    expect(c({ enabled: true, host: "192.168.0.32" }, target())).toContain("rewrites the rsyslogd settings group");
+    expect(c({ enabled: true, host: "192.168.1.40" }, target())).toContain("Enable UniFi remote logging (both) → 192.168.1.40 on unifi");
+    expect(c({ enabled: true, host: "192.168.1.40" }, target())).toContain("rewrites the rsyslogd settings group");
     expect(c({ enabled: false }, target())).toContain("Disable UniFi remote logging");
   });
 });
@@ -979,7 +979,7 @@ describe("snapshot (disaster-recovery backup)", () => {
  *  Skeleton Key container in the reference deployment. */
 const PROTECTED: ProtectedHost[] = [
   { host: "192.168.1.20", why: "Portainer / container host (target 'nas1-portainer')" },
-  { host: "192.168.0.1", why: "the UniFi gateway itself (target 'unifi')" },
+  { host: "192.168.1.1", why: "the UniFi gateway itself (target 'unifi')" },
   { host: "192.168.1.20", why: "the Skeleton Key server itself" },
 ];
 
@@ -1065,15 +1065,15 @@ describe("port-forward pure helpers", () => {
       "WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim')",
     );
     // tcp_udp reads as TCP/UDP; a missing fwd_port falls back to the WAN port.
-    expect(describePortForward({ name: "web", proto: "tcp_udp", dst_port: "8081", fwd: "192.168.0.50" })).toBe(
-      "WAN TCP/UDP 8081 → 192.168.0.50:8081 ('web')",
+    expect(describePortForward({ name: "web", proto: "tcp_udp", dst_port: "8081", fwd: "192.168.1.50" })).toBe(
+      "WAN TCP/UDP 8081 → 192.168.1.50:8081 ('web')",
     );
   });
 
   it("summarizePortForwards whitelists fields and flags disabled / non-default src", () => {
     const out = summarizePortForwards([
       { _id: "pf2", name: "valheim", proto: "udp", dst_port: "2456-2458", fwd: "192.168.1.48", fwd_port: "2456", src: "any", enabled: true },
-      { _id: "pf3", name: "old", proto: "tcp", dst_port: "9999", fwd: "192.168.0.7", fwd_port: "80", src: "10.0.0.0/8", enabled: false, pfwd_interface: "wan2" },
+      { _id: "pf3", name: "old", proto: "tcp", dst_port: "9999", fwd: "192.168.1.7", fwd_port: "80", src: "10.0.0.0/8", enabled: false, pfwd_interface: "wan2" },
     ] as any);
     expect(out).toContain("- WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') [pf2]");
     expect(out).toContain("(disabled)");
@@ -1099,7 +1099,7 @@ describe("port-forward guardrails (assertForwardAllowed)", () => {
 
   it("rejects a destination on the control-plane deny-list, naming what it protects", () => {
     expect(() => assertForwardAllowed({ ...good, fwd: "192.168.1.20" }, PROTECTED)).toThrow(/Portainer \/ container host/);
-    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.0.1" }, PROTECTED)).toThrow(/the UniFi gateway itself/);
+    expect(() => assertForwardAllowed({ ...good, fwd: "192.168.1.1" }, PROTECTED)).toThrow(/the UniFi gateway itself/);
   });
 
   it("rejects an admin port on either side, including one swallowed by a range", () => {
@@ -1229,7 +1229,7 @@ describe("create_port_forward", () => {
   it("refuses a rule that would shadow an existing enabled rule on the same WAN port + protocol", async () => {
     const { calls } = mockPf();
     const res = await tool("create_port_forward").run(
-      { name: "valheim-2", proto: "udp", wanPort: "2457", destination: "192.168.0.50" },
+      { name: "valheim-2", proto: "udp", wanPort: "2457", destination: "192.168.1.50" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1289,15 +1289,15 @@ describe("create_port_forward", () => {
 describe("update_port_forward", () => {
   it("merges only the supplied fields, preserves the rest, and reports prior → new", async () => {
     const { calls } = mockPf();
-    const res = await tool("update_port_forward").run({ rule: "pf2", destination: "192.168.0.50" }, pfCtx());
+    const res = await tool("update_port_forward").run({ rule: "pf2", destination: "192.168.1.50" }, pfCtx());
     expect(res.isError).toBeFalsy();
-    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') → WAN UDP 2456-2458 → 192.168.0.50:2456 ('valheim')");
-    expect(res.text).toContain('fwd: "192.168.1.48" → "192.168.0.50"');
+    expect(res.text).toContain("WAN UDP 2456-2458 → 192.168.1.48:2456 ('valheim') → WAN UDP 2456-2458 → 192.168.1.50:2456 ('valheim')");
+    expect(res.text).toContain('fwd: "192.168.1.48" → "192.168.1.50"');
     expect(res.text).toContain("force_provision");
     const put = writes(calls).find((c) => c.init.method === "PUT")!;
     expect(put.url).toMatch(/\/rest\/portforward\/pf2$/);
     const body = JSON.parse(put.init.body);
-    expect(body.fwd).toBe("192.168.0.50");
+    expect(body.fwd).toBe("192.168.1.50");
     // untouched fields survive the read-modify-write
     expect(body).toMatchObject({ _id: "pf2", site_id: "s1", src_limiting_enabled: false, log: false, dst_port: "2456-2458" });
   });
@@ -1312,7 +1312,7 @@ describe("update_port_forward", () => {
   it("applies the guardrails to the MERGED rule, so a partial change can't sidestep them", async () => {
     const { calls } = mockPf();
     // Only the destination changes — the ports come from the stored rule.
-    const res = await tool("update_port_forward").run({ rule: "pf2", destination: "192.168.0.1" }, pfCtx());
+    const res = await tool("update_port_forward").run({ rule: "pf2", destination: "192.168.1.1" }, pfCtx());
     expect(res.isError).toBe(true);
     expect(res.text).toContain("the UniFi gateway itself");
     expect(writes(calls)).toHaveLength(0);
@@ -1349,7 +1349,7 @@ describe("update_port_forward", () => {
       expect(res.text).toContain("WAN port 443 (HTTPS admin / reverse proxy)");
     }
     // A disable that also points the rule at a protected host is still refused.
-    const res = await tool("update_port_forward").run({ rule: "pf2", enabled: false, destination: "192.168.0.1" }, pfCtx());
+    const res = await tool("update_port_forward").run({ rule: "pf2", enabled: false, destination: "192.168.1.1" }, pfCtx());
     expect(res.isError).toBe(true);
     expect(res.text).toContain("the UniFi gateway itself");
     expect(writes(calls)).toHaveLength(1);
@@ -1370,7 +1370,7 @@ describe("update_port_forward", () => {
     expect(isDisableOnlyPatch({ fwd: "x" }, { enabled: false })).toBe(true); // enabled missing = on
     expect(isDisableOnlyPatch(cur, { enabled: true })).toBe(false);
     expect(isDisableOnlyPatch(cur, { fwd: "192.168.1.21" })).toBe(false);
-    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.0.231" })).toBe(false);
+    expect(isDisableOnlyPatch(cur, { enabled: false, fwd: "192.168.1.231" })).toBe(false);
     expect(isDisableOnlyPatch(cur, { enabled: false, log: true })).toBe(false); // a field the rule lacks
   });
 
@@ -1402,8 +1402,8 @@ describe("update_port_forward", () => {
 
   it("confirm names the rule and every field being changed", () => {
     const c = tool("update_port_forward").confirm!;
-    expect(c({ rule: "valheim", destination: "192.168.0.50", enabled: false }, target())).toBe(
-      'Update UniFi port-forward \'valheim\' on unifi (destination → "192.168.0.50", enabled → false)',
+    expect(c({ rule: "valheim", destination: "192.168.1.50", enabled: false }, target())).toBe(
+      'Update UniFi port-forward \'valheim\' on unifi (destination → "192.168.1.50", enabled → false)',
     );
   });
 });
@@ -1426,7 +1426,7 @@ describe("delete_port_forward", () => {
   it("refuses when the echo doesn't match the live rule (stale id / renamed rule)", async () => {
     const { calls } = mockPf();
     const res = await tool("delete_port_forward").run(
-      { rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.0.99" },
+      { rule: "valheim", expectWanPort: "2456-2458", expectDestination: "192.168.1.99" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);
@@ -1438,7 +1438,7 @@ describe("delete_port_forward", () => {
   it("errors on an unknown rule without deleting anything", async () => {
     const { calls, state } = mockPf();
     const res = await tool("delete_port_forward").run(
-      { rule: "ghost", expectWanPort: "1", expectDestination: "192.168.0.1" },
+      { rule: "ghost", expectWanPort: "1", expectDestination: "192.168.1.1" },
       pfCtx(),
     );
     expect(res.isError).toBe(true);

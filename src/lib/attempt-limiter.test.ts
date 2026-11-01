@@ -251,8 +251,8 @@ describe("RefusalCoalescer", () => {
 
 describe("clientKey", () => {
   it("keeps IPv4 as is and unwraps IPv4-mapped IPv6", () => {
-    expect(clientKey("192.168.0.20")).toBe("192.168.0.20");
-    expect(clientKey("::ffff:192.168.0.20")).toBe("192.168.0.20");
+    expect(clientKey("192.168.1.20")).toBe("192.168.1.20");
+    expect(clientKey("::ffff:192.168.1.20")).toBe("192.168.1.20");
     expect(clientKey("::FFFF:10.0.0.1")).toBe("10.0.0.1");
   });
 

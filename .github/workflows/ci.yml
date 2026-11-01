@@ -34,6 +34,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The repo is public: no real hostnames, LAN addresses or personal
+      # identifiers, in files or in the PR text that becomes the squash commit.
+      # The private denylist is a secret, which fork and Dependabot runs don't
+      # get, so only those runs may proceed without it (the public LAN-address
+      # rule still applies to them). The script never prints a matched entry.
+      - name: No homelab data
+        env:
+          SKELETON_KEY_DENYLIST: ${{ secrets.SKELETON_KEY_DENYLIST }}
+          PR_TEXT: |
+            ${{ github.event.pull_request.title }}
+            ${{ github.event.pull_request.body }}
+          REQUIRE_DENYLIST: ${{ github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: |
+          args=()
+          if [ "$REQUIRE_DENYLIST" = "true" ]; then args+=(--require-denylist); fi
+          node scripts/check-homelab-data.mjs "${args[@]}"
+          node scripts/check-homelab-data.mjs --text-env PR_TEXT "${args[@]}"
+
       - name: Typecheck
         run: npm run typecheck
 

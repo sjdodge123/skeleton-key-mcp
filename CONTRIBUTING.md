@@ -29,8 +29,12 @@ A PR that breaks one of these will not be merged, however useful the feature is.
 6. **The vault scope never widens.** The service identity can read only the
    infrastructure collection it was given. Don't add code that logs in as a personal
    account or asks for broader access.
-7. **No real hostnames, IPs, or personal data** in code, tests, fixtures, or docs. Use
-   placeholders (`nas1`, `192.168.1.x`, `example.com`).
+7. **No real hostnames, IPs, or personal data** in code, tests, fixtures, docs, commit
+   messages, or PR text. Use placeholders (`nas1`, `192.168.1.x`, `10.0.0.x`,
+   `example.com`). `npm run check:homelab` checks the tree; `npm install` enables the
+   pre-commit and commit-msg hooks that run it, and CI runs it as part of the required
+   check. Full `192.168.0.N` addresses are refused outright, so pick a placeholder from
+   another range.
 
 ## Development setup
 

@@ -8,7 +8,7 @@ function storeAt(start = 1_000_000): { store: CredentialRequestStore; tick: (ms:
   return { store, tick: (ms: number) => (now += ms) };
 }
 
-const sample = { name: "nas1", host: "192.168.0.50", kind: "password" as const, reason: "onboard nas1" };
+const sample = { name: "nas1", host: "192.168.1.50", kind: "password" as const, reason: "onboard nas1" };
 
 describe("CredentialRequestStore", () => {
   it("creates a pending request with a unique id and a form (CSRF) token", () => {
@@ -79,7 +79,7 @@ describe("CredentialRequestStore", () => {
       { name: "DISCORD_BOT_TOKEN", label: "From the developer portal", secret: true },
       { name: "SXM_USERNAME", secret: false },
     ];
-    const req = store.create({ name: "sxm-bot", host: "fly-app", fields, reason: "migrate off fly.io" });
+    const req = store.create({ name: "example-bot", host: "fly-app", fields, reason: "migrate off fly.io" });
     expect(store.get(req.id)!.fields).toEqual(fields);
     // Multi-field replaces the single-value mode rather than coexisting with it.
     expect(store.get(req.id)!.kind).toBeUndefined();
