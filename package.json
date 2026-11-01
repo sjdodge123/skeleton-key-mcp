@@ -26,6 +26,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "manifest": "tsx scripts/tool-manifest.ts",
+    "new:connector": "node scripts/new-connector.mjs",
     "check:homelab": "node scripts/check-homelab-data.mjs",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },

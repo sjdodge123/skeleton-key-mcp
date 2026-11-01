@@ -59,7 +59,7 @@ Consistent names let dozens of adapters coexist without collisions.
 | Tool name | `snake_case`, verb first | `list_vms`, `get_settings`, `restart_service` |
 | Tool verbs | read: `list_` `get_` `read_` `tail_` `grep_` `search_` `show_` `describe_` `inspect_` `check_`; execute: `set_` `create_` `update_` `delete_` `remove_` `restart_` `start_` `stop_` `write_` `rename_` `import_` `assign_` `pull_` `install_` `upgrade_` `enable_` `disable_` `pause_` `resume_` `reboot_` `exec_` … (the full lists live in `src/connectors/conformance.test.ts`) | A read verb on an execute tool, or the reverse, fails CI |
 | Qualified tool name | `${type}.${target}.${tool}`, assembled by the registry, never by hand | `proxmox.pve1.list_guests` |
-| Connector files | `src/connectors/<type>.ts` + `<type>.test.ts` (moving to `src/connectors/<type>/` soon) | `src/connectors/unifi.ts` |
+| Connector files | one folder per connector: `src/connectors/<type>/index.ts` (exports the `Connector`), `index.test.ts`, `README.md`, plus any helpers it alone uses (`client.ts`, `host.ts`) | `src/connectors/unifi/` |
 | Branch | `<kind>/<scope>-<short-description>` | `feat/opnsense-connector`, `fix/ssh-quote-parsing` |
 | Commit / PR title | [Conventional Commits](https://www.conventionalcommits.org): `<kind>(<scope>): <summary>` | `feat(opnsense): list firewall rules` |
 
@@ -77,8 +77,10 @@ hypervisor should look like it does on `proxmox`. This lets the agent learn a fa
    use, how it authenticates, and which tools are `read` vs `execute`. Confirm the API
    exists by watching the product's own UI make the calls; an unauthenticated probe can't
    prove a route exists.
-2. Implement the `Connector` interface (`src/connectors/types.ts`) and register it in
-   `src/connectors/index.ts`.
+2. Scaffold it with `npm run new:connector -- <type> "<Label>"`, which creates
+   `src/connectors/<type>/` with `index.ts`, `index.test.ts` and `README.md`, then register
+   it in `src/connectors/index.ts`. The step-by-step is in
+   [`docs/CONNECTOR_GUIDE.md`](docs/CONNECTOR_GUIDE.md).
 3. Start **read-only**. Add `execute` tools in a follow-up PR once the read side is merged.
 4. Validate `options` with a plain `z.object` `configSchema` whose fields are all optional
    or defaulted. Registration (`register_target`, `update_target`, the web form) refuses any
@@ -89,7 +91,8 @@ hypervisor should look like it does on `proxmox`. This lets the agent learn a fa
    error path when the credential is missing or wrong.
 7. Run `npm run manifest` and commit `tools.manifest.json`. CI fails when it is stale. The
    diff is how a reviewer sees every new tool, tier and input at a glance.
-8. Add a row to the connector table in `README.md`.
+8. Fill in the connector's own `README.md` (the conformance suite checks it names every
+   tool) and add a row to the connector table in the top-level `README.md`.
 
 **The conformance suite** (`src/connectors/conformance.test.ts`) runs against every
 registered connector automatically, so your connector is checked the moment you register it:
@@ -103,10 +106,14 @@ registered connector automatically, so your connector is checked the moment you 
   fake of `fetch` and SSH, and any non-GET request fails the suite unless it is a login
   listed in `READ_TOOL_AUTH_REQUESTS`.
 
-Its exception lists (legacy names, login requests) are maintainer-owned and may shrink but
-not grow without review.
+**Import boundaries** (`src/connectors/boundaries.test.ts`): a connector imports only its
+own folder, `../types.ts`, `../shared/*`, `zod` and `js-yaml`. No `child_process`, `fs`, raw
+sockets, the secrets store, the audit log, config, the web layer, or another connector.
 
-**Dependencies.** Prefer `undici`/`fetch` and the shared helpers in `src/connectors/net.ts`
+The exception lists in both files (legacy names, login requests, import exceptions) are
+maintainer-owned and may shrink but not grow without review.
+
+**Dependencies.** Prefer `undici`/`fetch` and the shared helpers in `src/connectors/shared/net.ts`
 over new packages. A new runtime dependency needs a maintainer's agreement in the issue:
 every package runs inside a process that can read the vault.
 

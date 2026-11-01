@@ -1,6 +1,6 @@
 name: Connector request / proposal
 description: Propose support for a new service (router, hypervisor, NAS, app, tool...) or new tools on an existing connector.
-labels: ["connector", "needs-triage"]
+labels: ["connector:new", "needs-triage"]
 body:
   - type: markdown
     attributes:

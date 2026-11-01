@@ -1,0 +1,293 @@
+import { z } from "zod";
+import type { Connector, ConnectorTool, SnapshotArtifact, Target, ToolContext, ToolResult } from "../types.js";
+import { runSsh, shellQuote, MAX_SSH_TIMEOUT_MS, firstWord, looksLikeSudoPasswordFailure, sudoHint } from "../shared/ssh-exec.js";
+import { checkCommand, checkReadonly, type CommandPolicyOptions } from "../shared/command-policy.js";
+
+const optionsSchema = z
+  .object({
+    /** Extra denied command patterns for this host. */
+    denyPatterns: z.array(z.string()).optional(),
+    /** Restrict `run_command` to an allowlist (in addition to run_readonly). */
+    allowPatterns: z.array(z.string()).optional(),
+    /** Config-dump commands run by `form_skeleton` for this host. Each becomes one
+     *  artifact. If unset, a default read-only system profile is captured. */
+    snapshotCommands: z.array(z.string()).optional(),
+    /** Per-target default for how long a single SSH command may run before it's
+     *  killed, in ms. Unset preserves today's ~20s default (`DEFAULT_SSH_TIMEOUT_MS`).
+     *  Capped at `MAX_SSH_TIMEOUT_MS` (10 minutes) so a long-running migration
+     *  command (docker compose pull, large file ops) doesn't need an unbounded wait. */
+    commandTimeoutMs: z.number().int().positive().max(MAX_SSH_TIMEOUT_MS).optional(),
+    /** Command names that must run as root on this host, e.g. `["docker", "synopkg"]`
+     *  on a Synology NAS where the SSH user is a non-root admin and the docker
+     *  socket is root-only. When a command's first word (after any leading
+     *  `VAR=value` assignments) matches, `sudo -n` is prefixed to that FIRST
+     *  command only (a pipeline's later stages run unprivileged). Requires a
+     *  NOPASSWD sudoers rule for the SSH user scoped to that binary; when sudo
+     *  asks for a password the result carries a hint with the exact rule. Applies
+     *  to `run_command`, `run_readonly`, and the snapshot's `docker ps` profile. */
+    sudoPrefixes: z.array(z.string().regex(/^[A-Za-z0-9._\/-]+$/, "a plain command name, e.g. docker")).optional(),
+  })
+  .prefault({});
+
+/** Target `sudoPrefixes` (or undefined). */
+function sudoPrefixesFor(target: Target): string[] | undefined {
+  return optionsSchema.parse(target.options ?? {}).sudoPrefixes;
+}
+
+function policyFor(target: Target): CommandPolicyOptions {
+  const opts = optionsSchema.parse(target.options ?? {});
+  return { deny: opts.denyPatterns, allow: opts.allowPatterns };
+}
+
+/** The target's configured `commandTimeoutMs`, or undefined to fall back to
+ *  `runSsh`'s own default. */
+function targetTimeoutMs(target: Target): number | undefined {
+  return optionsSchema.parse(target.options ?? {}).commandTimeoutMs;
+}
+
+/**
+ * Run a command over SSH. `timeoutMs`, when given (a per-call override, e.g.
+ * `run_command`'s `timeoutSeconds`), wins over the target's `commandTimeoutMs`
+ * option, which in turn wins over `runSsh`'s own default.
+ */
+async function exec(ctx: ToolContext, command: string, timeoutMs?: number, sudoPrefixes?: string[]): Promise<ToolResult> {
+  const cred = await ctx.getCredential();
+  const effectiveTimeoutMs = timeoutMs ?? targetTimeoutMs(ctx.target);
+  const { stdout, stderr, code } = await runSsh(ctx.target, cred, command, { timeoutMs: effectiveTimeoutMs, ...(sudoPrefixes ? { sudoPrefixes } : {}) });
+  let body = stdout || stderr || "(no output)";
+  if (code !== 0 && sudoPrefixes?.length && looksLikeSudoPasswordFailure(stderr)) {
+    body += `\n${sudoHint(firstWord(command), cred.username ?? cred.fields["username"] ?? "<ssh-user>")}`;
+  }
+  return {
+    text: code === 0 ? body : `exit ${code}\n${body}`,
+    isError: code !== 0,
+  };
+}
+
+function buildTools(target: Target): ConnectorTool[] {
+  const readTools: ConnectorTool[] = [
+    {
+      name: "tail_log",
+      description: `Tail the last N lines of a log file on ${target.name}.`,
+      tier: "read",
+      inputSchema: z.object({
+        path: z.string().describe("Absolute path to the log file."),
+        lines: z.number().int().positive().max(2000).default(200),
+      }),
+      run: (input, ctx) => {
+        const { path, lines } = input as { path: string; lines: number };
+        return exec(ctx, `tail -n ${lines} ${shellQuote(path)}`);
+      },
+    },
+    {
+      name: "journalctl",
+      description: `Read systemd journal entries on ${target.name}.`,
+      tier: "read",
+      inputSchema: z.object({
+        unit: z.string().optional().describe("Restrict to a systemd unit."),
+        lines: z.number().int().positive().max(2000).default(200),
+        since: z.string().optional().describe('e.g. "1 hour ago", "2024-01-01".'),
+      }),
+      run: (input, ctx) => {
+        const { unit, lines, since } = input as { unit?: string; lines: number; since?: string };
+        let cmd = `journalctl -n ${lines} --no-pager`;
+        if (unit) cmd += ` -u ${shellQuote(unit)}`;
+        if (since) cmd += ` --since ${shellQuote(since)}`;
+        return exec(ctx, cmd);
+      },
+    },
+    {
+      name: "service_status",
+      description: `Show status of a systemd service on ${target.name}.`,
+      tier: "read",
+      inputSchema: z.object({ unit: z.string() }),
+      run: (input, ctx) => {
+        const { unit } = input as { unit: string };
+        return exec(ctx, `systemctl status ${shellQuote(unit)} --no-pager`);
+      },
+    },
+    {
+      name: "disk_usage",
+      description: `Show filesystem usage (df -h) on ${target.name}.`,
+      tier: "read",
+      inputSchema: z.object({}),
+      run: (_input, ctx) => exec(ctx, "df -h"),
+    },
+    {
+      name: "grep_logs",
+      description: `grep a pattern across files or a directory on ${target.name}.`,
+      tier: "read",
+      inputSchema: z.object({
+        pattern: z.string(),
+        path: z.string().describe("File or directory to search."),
+        recursive: z.boolean().default(false),
+      }),
+      run: (input, ctx) => {
+        const { pattern, path, recursive } = input as {
+          pattern: string;
+          path: string;
+          recursive: boolean;
+        };
+        const flags = recursive ? "-rn" : "-n";
+        return exec(ctx, `grep ${flags} -- ${shellQuote(pattern)} ${shellQuote(path)}`);
+      },
+    },
+    {
+      name: "run_readonly",
+      description: `Run a read-only inspection command on ${target.name} (allowlisted: cat, ls, grep, ps, journalctl, systemctl status, ip, ss, lsblk, lspci, docker ps/logs, read-only qm/pct/pvesm/pvesh get, pve8to9/pve7to8 [--full], systemctl --failed, modinfo, dkms status, upsc/apcaccess, ...; every command of a pipeline or ;/&& chain must be allowlisted, and $(…), subshells and file redirects are refused).`,
+      tier: "read",
+      inputSchema: z.object({ command: z.string() }),
+      run: (input, ctx) => {
+        const { command } = input as { command: string };
+        // Policy runs on the RAW command; the PATH/sudo wrapping happens inside runSsh afterwards.
+        const verdict = checkReadonly(command);
+        if (!verdict.allowed) {
+          return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
+        }
+        return exec(ctx, command, undefined, sudoPrefixesFor(ctx.target));
+      },
+    },
+  ];
+
+  const executeTools: ConnectorTool[] = [
+    {
+      name: "run_command",
+      description:
+        `Run an arbitrary shell command on ${target.name}. Destructive commands are refused by policy. Long-running commands (e.g. docker compose pull, large file ops) can raise the timeout with 'timeoutSeconds'. ` +
+        "The session PATH is extended with /usr/local/bin, /usr/local/sbin, /usr/sbin, /sbin (Synology/embedded hosts hide docker, synopkg there). " +
+        "If a command needs root (e.g. docker on a Synology as a non-root user), set the target option `sudoPrefixes` (e.g. [\"docker\"]) via update_target so `sudo -n` is prefixed automatically; a failed sudo returns a hint with the sudoers rule to add.",
+      tier: "execute",
+      inputSchema: z.object({
+        command: z.string(),
+        timeoutSeconds: z
+          .number()
+          .int()
+          .positive()
+          .max(MAX_SSH_TIMEOUT_MS / 1000)
+          .optional()
+          .describe(`How long to let this command run before it's killed, in seconds (max ${MAX_SSH_TIMEOUT_MS / 1000}). Overrides the target's default.`),
+      }),
+      confirm: (input, t) =>
+        `Run on ${t.name} (${t.host}): ${(input as { command: string }).command}`,
+      run: (input, ctx) => {
+        const { command, timeoutSeconds } = input as { command: string; timeoutSeconds?: number };
+        // Policy runs on the RAW command; the PATH/sudo wrapping happens inside runSsh afterwards.
+        const verdict = checkCommand(command, policyFor(ctx.target));
+        if (!verdict.allowed) {
+          return Promise.resolve({ text: `Refused: ${verdict.reason}`, isError: true });
+        }
+        return exec(ctx, command, timeoutSeconds ? timeoutSeconds * 1000 : undefined, sudoPrefixesFor(ctx.target));
+      },
+    },
+    {
+      name: "restart_service",
+      description: `Restart a systemd service on ${target.name}.`,
+      tier: "execute",
+      inputSchema: z.object({ unit: z.string() }),
+      confirm: (input, t) => `Restart service '${(input as { unit: string }).unit}' on ${t.name} (${t.host})`,
+      run: (input, ctx) => {
+        const { unit } = input as { unit: string };
+        return exec(ctx, `systemctl restart ${shellQuote(unit)}`);
+      },
+    },
+  ];
+
+  return [...readTools, ...executeTools];
+}
+
+/** Read-only host profile captured when a target defines no `snapshotCommands`.
+ *  Each yields one artifact; failures are skipped (a partial profile is fine). */
+const DEFAULT_PROFILE: { name: string; cmd: string }[] = [
+  { name: "uname.txt", cmd: "uname -a" },
+  { name: "os-release.txt", cmd: "cat /etc/os-release 2>/dev/null" },
+  { name: "ip-addr.txt", cmd: "ip a 2>/dev/null || ifconfig -a 2>/dev/null" },
+  { name: "packages.txt", cmd: "dpkg -l 2>/dev/null || rpm -qa 2>/dev/null || apk info -v 2>/dev/null" },
+  { name: "crontab.txt", cmd: "crontab -l 2>/dev/null" },
+  { name: "docker-ps.txt", cmd: "docker ps -a 2>/dev/null" },
+];
+
+/**
+ * Capture a config skeleton of an SSH host: the operator's `snapshotCommands`
+ * if set, else a read-only system profile — plus a Pi-hole teleporter backup
+ * when `pihole` is present. Uses `runSsh` directly (fixed backup commands, not
+ * subject to the interactive command policy). Every step is best-effort so one
+ * failing command never aborts the whole target's snapshot.
+ */
+async function snapshot(ctx: ToolContext): Promise<SnapshotArtifact[]> {
+  const cred = await ctx.getCredential();
+  const target = ctx.target;
+  const opts = optionsSchema.parse(target.options ?? {});
+  const arts: SnapshotArtifact[] = [];
+
+  const custom = !!opts.snapshotCommands?.length;
+  const commands = custom ? opts.snapshotCommands!.map((cmd, i) => ({ name: `cmd-${i + 1}.txt`, cmd })) : DEFAULT_PROFILE;
+  const policy = policyFor(target);
+
+  for (const { name, cmd } of commands) {
+    // Operator-supplied snapshotCommands are a model-influenceable command path,
+    // so they MUST honor the same deny-list as run_command (rm -rf / mkfs / dd …);
+    // the fixed read-only DEFAULT_PROFILE is trusted and skips the check.
+    if (custom) {
+      const verdict = checkCommand(cmd, policy);
+      if (!verdict.allowed) {
+        arts.push({ name, data: Buffer.from(`Refused by command policy: ${verdict.reason}`, "utf8") });
+        continue;
+      }
+    }
+    try {
+      // The docker-ps profile line honors `sudoPrefixes` (root-only docker socket
+      // on a Synology); custom snapshotCommands do too, since they're operator-set.
+      const { stdout, stderr, code } = await runSsh(target, cred, cmd, opts.sudoPrefixes ? { sudoPrefixes: opts.sudoPrefixes } : {});
+      const body = stdout || (code !== 0 ? `exit ${code}\n${stderr}` : "");
+      // `note` is written UNENCRYPTED into the manifest, so never store an
+      // operator's custom command there (it can embed inline credentials, e.g.
+      // `mysqldump -pPASS`); the fixed profile commands are safe to label.
+      if (body.trim()) arts.push({ name, data: Buffer.from(body, "utf8"), ...(custom ? {} : { note: cmd }) });
+    } catch {
+      /* skip a failing command — a partial profile is acceptable */
+    }
+  }
+
+  // Pi-hole: the teleporter tarball is the real one-click restore artifact.
+  try {
+    const { stdout: hasPihole } = await runSsh(target, cred, "command -v pihole 2>/dev/null");
+    if (hasPihole.trim()) {
+      // Create the teleporter in a temp dir, base64 it back over the (text-only)
+      // ssh channel with a portable encoder (BSD base64 has no GNU -w0), clean up.
+      const teleporterCmd =
+        'd=$(mktemp -d) && cd "$d" && pihole -a -t >/dev/null 2>&1 && ' +
+        'f=$(ls -1 *.tar.gz 2>/dev/null | head -1) && [ -n "$f" ] && ' +
+        "base64 \"$f\" | tr -d '\\n'; cd / && rm -rf \"$d\"";
+      const { stdout: b64 } = await runSsh(target, cred, teleporterCmd);
+      const trimmed = b64.trim();
+      if (trimmed) {
+        arts.push({ name: "teleporter.tar.gz", data: Buffer.from(trimmed, "base64"), note: "Pi-hole teleporter backup (contains secrets)" });
+      } else {
+        // Pi-hole present but no teleporter produced (Pi-hole v6 replaced
+        // `pihole -a -t`) — surface the gap instead of silently omitting a backup.
+        arts.push({
+          name: "pihole-BACKUP-MISSING.txt",
+          data: Buffer.from("Pi-hole detected but `pihole -a -t` produced no teleporter archive (Pi-hole v6 changed this command). Capture a backup manually.", "utf8"),
+          note: "teleporter capture failed",
+        });
+      }
+      const { stdout: setupVars } = await runSsh(target, cred, "cat /etc/pihole/setupVars.conf 2>/dev/null");
+      if (setupVars.trim()) {
+        arts.push({ name: "pihole-setupVars.conf", data: Buffer.from(setupVars, "utf8"), note: "Pi-hole config reference" });
+      }
+    }
+  } catch {
+    /* pihole capture is best-effort */
+  }
+
+  return arts;
+}
+
+export const sshConnector: Connector = {
+  type: "ssh",
+  label: "SSH host",
+  configSchema: optionsSchema,
+  requiresCredential: true,
+  buildTools,
+  snapshot,
+};

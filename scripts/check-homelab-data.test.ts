@@ -38,6 +38,14 @@ describe("check-homelab-data", () => {
     expect(scan("box770 and mybox77x are different names", { denylist }).code).toBe(0);
   });
 
+  it("treats hyphens and dots as separators, catching derived names", () => {
+    const denylist = "box77\nabcd1234";
+    expect(scan("vault item box77-ssh", { denylist }).code).toBe(1);
+    expect(scan("old-box77 decommissioned", { denylist }).code).toBe(1);
+    expect(scan("box77.local", { denylist }).code).toBe(1);
+    expect(scan("uuid ABCD1234-1111-2222-3333-444444444444", { denylist }).code).toBe(1);
+  });
+
   it("does not match an address entry inside a longer address", () => {
     const denylist = "10.9.9.9";
     expect(scan("host 10.9.9.9", { denylist }).code).toBe(1);
