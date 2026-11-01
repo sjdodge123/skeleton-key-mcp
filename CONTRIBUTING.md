@@ -57,7 +57,7 @@ Consistent names let dozens of adapters coexist without collisions.
 |---|---|---|
 | Connector `type` | lowercase kebab-case, `^[a-z][a-z0-9-]*$`, named for the product | `opnsense`, `truenas`, `home-assistant` |
 | Tool name | `snake_case`, verb first | `list_vms`, `get_settings`, `restart_service` |
-| Tool verbs | `list_` `get_` read; `set_` `create_` `update_` `delete_` `restart_` `start_` `stop_` execute | |
+| Tool verbs | read: `list_` `get_` `read_` `tail_` `grep_` `search_` `show_` `describe_` `inspect_` `check_`; execute: `set_` `create_` `update_` `delete_` `remove_` `restart_` `start_` `stop_` `write_` `rename_` `import_` `assign_` `pull_` `install_` `upgrade_` `enable_` `disable_` `pause_` `resume_` `reboot_` `exec_` … (the full lists live in `src/connectors/conformance.test.ts`) | A read verb on an execute tool, or the reverse, fails CI |
 | Qualified tool name | `${type}.${target}.${tool}`, assembled by the registry, never by hand | `proxmox.pve1.list_guests` |
 | Connector files | `src/connectors/<type>.ts` + `<type>.test.ts` (moving to `src/connectors/<type>/` soon) | `src/connectors/unifi.ts` |
 | Branch | `<kind>/<scope>-<short-description>` | `feat/opnsense-connector`, `fix/ssh-quote-parsing` |
@@ -80,12 +80,31 @@ hypervisor should look like it does on `proxmox`. This lets the agent learn a fa
 2. Implement the `Connector` interface (`src/connectors/types.ts`) and register it in
    `src/connectors/index.ts`.
 3. Start **read-only**. Add `execute` tools in a follow-up PR once the read side is merged.
-4. Validate `options` with a strict zod `configSchema`. Don't accept unknown keys silently.
+4. Validate `options` with a plain `z.object` `configSchema` whose fields are all optional
+   or defaulted. Registration (`register_target`, `update_target`, the web form) refuses any
+   key the schema doesn't declare, so a typo fails loudly instead of being dropped.
 5. Keep destructive endpoints (factory reset, disk wipe, firmware flash, delete pool) out
    unless a maintainer explicitly agrees to them in the issue.
 6. Tests: cover every tool, including the `confirm()` text of each execute tool, and the
    error path when the credential is missing or wrong.
-7. Add a row to the connector table in `README.md`.
+7. Run `npm run manifest` and commit `tools.manifest.json`. CI fails when it is stale. The
+   diff is how a reviewer sees every new tool, tier and input at a glance.
+8. Add a row to the connector table in `README.md`.
+
+**The conformance suite** (`src/connectors/conformance.test.ts`) runs against every
+registered connector automatically, so your connector is checked the moment you register it:
+
+- the type is kebab-case and tool names are snake_case, verb-first and unique;
+- a tool's verb matches its tier (`delete_*` must be `execute`, `list_*` must be `read`);
+- the tool set doesn't change with the target;
+- every execute tool has a `confirm()` that names the target;
+- the `configSchema` is introspectable and refuses unknown keys at registration;
+- **read tools make no state-changing request.** Each read tool runs against a recording
+  fake of `fetch` and SSH, and any non-GET request fails the suite unless it is a login
+  listed in `READ_TOOL_AUTH_REQUESTS`.
+
+Its exception lists (legacy names, login requests) are maintainer-owned and may shrink but
+not grow without review.
 
 **Dependencies.** Prefer `undici`/`fetch` and the shared helpers in `src/connectors/net.ts`
 over new packages. A new runtime dependency needs a maintainer's agreement in the issue:

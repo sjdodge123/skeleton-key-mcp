@@ -23,6 +23,9 @@
 /src/connectors/index.ts        @sjdodge123
 /src/connectors/command-policy* @sjdodge123
 /src/connectors/net.ts          @sjdodge123
+/src/connectors/conformance.test.ts @sjdodge123
+/tools.manifest.json            @sjdodge123
+/test/helpers/sample-input.ts   @sjdodge123
 /scripts/host/                  @sjdodge123
 /scripts/check-homelab-data.mjs  @sjdodge123
 /.githooks/                     @sjdodge123

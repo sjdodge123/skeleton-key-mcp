@@ -1208,10 +1208,10 @@ describe("panel version comparison", () => {
 });
 
 describe("panel_upgrade confirm (the sequence itself lives in the host helper — see pelican-host.test.ts)", () => {
-  it("names the host, the version, the target release, the backup choice and the helper", () => {
+  it("names the panel target, the host, the version, the target release, the backup choice and the helper", () => {
     const t = target({ ownerUserId: 7, sshTarget: "panel-host" });
     const confirm = pelicanConnector.buildTools(t).find((x) => x.name === "panel_upgrade")!.confirm!;
-    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself on host 'panel-host'");
+    expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("UPGRADE the Pelican panel itself (pelican '" + t.name + "') on host 'panel-host'");
     expect(confirm({ expectVersion: "1.0.0-beta35" }, t)).toContain("from 1.0.0-beta35 to the latest release");
     expect(confirm({ expectVersion: "1.0.0-beta35", release: "v1.0.0-rc.1" }, t)).toContain("to v1.0.0-rc.1");
     expect(confirm({ expectVersion: "1.0.0-beta35", skipBackup: true }, t)).toMatch(/SKIPS the database backup/);

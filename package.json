@@ -25,6 +25,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "manifest": "tsx scripts/tool-manifest.ts",
     "check:homelab": "node scripts/check-homelab-data.mjs",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },
