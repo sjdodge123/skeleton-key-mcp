@@ -331,7 +331,7 @@ describe("client-API access visibility", () => {
 
   it("a client 404 on a server path explains the ownership requirement", async () => {
     mockFetch([{ match: (u) => u.includes("/api/client/servers/"), reply: { status: 404, json: { errors: [{ detail: "The requested resource does not exist on this server." }] } } }]);
-    const res = await tool("server_resources").run({ server: "f83cc148" }, ctx());
+    const res = await tool("server_resources").run({ server: "9z8y7x6w" }, ctx());
     expect(res.isError).toBe(true);
     expect(res.text).toContain("only sees servers its key's user OWNS or is a subuser on");
     expect(res.text).toContain("subuser");
