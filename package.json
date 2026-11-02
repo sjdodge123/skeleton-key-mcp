@@ -1,6 +1,6 @@
 {
   "name": "skeleton-key-mcp",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "MCP server that unlocks your homelab: read logs everywhere, execute changes with approval, backed by a scoped credential vault.",
   "license": "Apache-2.0",
   "repository": {

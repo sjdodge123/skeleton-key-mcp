@@ -47,6 +47,9 @@ const SERVER_INSTRUCTIONS = [
  */
 export const PROGRESS_HEARTBEAT_MS = 5_000;
 
+/** The version advertised to MCP clients. Kept equal to package.json by a test. */
+export const SERVER_VERSION = "0.4.0";
+
 /**
  * The JSON Schema a client sees for a tool's input. `io: "input"` describes what
  * the caller sends, so a field with a `.default()` stays optional (the output
@@ -72,7 +75,7 @@ export function toolInputJsonSchema(schema: z.ZodType): Tool["inputSchema"] {
 export function buildMcpServer(app: AppState, opts: { heartbeatMs?: number } = {}): Server {
   const heartbeatMs = opts.heartbeatMs ?? PROGRESS_HEARTBEAT_MS;
   const server = new Server(
-    { name: "skeleton-key", version: "0.1.0" },
+    { name: "skeleton-key", version: SERVER_VERSION },
     { capabilities: { tools: { listChanged: true } }, instructions: SERVER_INSTRUCTIONS },
   );
 

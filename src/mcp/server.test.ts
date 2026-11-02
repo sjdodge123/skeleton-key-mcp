@@ -3,7 +3,9 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import { listConnectors } from "../connectors/index.js";
 import { buildGlobalTools } from "./builtin-tools.js";
-import { toolInputJsonSchema } from "./server.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { SERVER_VERSION, toolInputJsonSchema } from "./server.js";
 
 /** Every advertised input schema: the global tools plus one target per connector type. */
 function allToolSchemas(): [string, z.ZodType][] {
@@ -45,5 +47,12 @@ describe("toolInputJsonSchema", () => {
     expect(js.properties.inner.additionalProperties).toBe(false);
     expect(js.properties.rec.additionalProperties).toEqual({ type: "string" });
     expect(js.properties.loose.additionalProperties).toEqual({});
+  });
+});
+
+describe("SERVER_VERSION", () => {
+  it("matches package.json, so clients see the release they are talking to", () => {
+    const pkg = JSON.parse(readFileSync(path.resolve(import.meta.dirname, "..", "..", "package.json"), "utf8")) as { version: string };
+    expect(SERVER_VERSION).toBe(pkg.version);
   });
 });

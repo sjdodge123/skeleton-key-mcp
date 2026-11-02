@@ -133,7 +133,9 @@ the design in an issue first.
 
 ## Releases
 
-Maintainers cut releases by tagging `vX.Y.Z` on `main`. Tags publish the `:latest`,
+Maintainers cut releases by tagging `vX.Y.Z` on `main`, after a PR that bumps
+`package.json` (`npm version X.Y.Z --no-git-tag-version`) and `SERVER_VERSION` in
+`src/mcp/server.ts` (a test keeps the two equal). Tags publish the `:latest`,
 `:X.Y.Z`, and `:X.Y` images. Every merge to `main` publishes `:main` and `:sha-<short>`
 for testing, but never `:latest`. That way a merged PR doesn't reach anyone's homelab
 until a release is cut deliberately.
