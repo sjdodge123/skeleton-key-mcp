@@ -1,10 +1,10 @@
 import { z } from "zod";
 import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
-import { generateSshKey } from "../connectors/ssh-keygen.js";
+import { generateSshKey } from "../lib/ssh-keygen.js";
 import { scanLan } from "../discovery/scan.js";
 import { assertKnownOptionKeys, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
-import { runSsh, shellQuote } from "../connectors/ssh-exec.js";
+import { runSsh, shellQuote } from "../connectors/shared/ssh-exec.js";
 import { startSkeletonJob, waitForSkeletonJob, getSkeletonJob, describeSkeletonJob } from "../snapshots/jobs.js";
 import { DEFAULT_TTL_MINUTES, MAX_TTL_MINUTES, MIN_TTL_MINUTES, safeHost } from "../web/credential-requests.js";
 import { compileFullMatch, DEFAULT_VERIFY_TIMEOUT_MS, MAX_VERIFY_TIMEOUT_MS, templatePlaceholders, validateVerifyUrl } from "../web/credential-verify.js";

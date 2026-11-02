@@ -1,14 +1,14 @@
 import { z } from "zod";
 import type { Connector } from "./types.js";
 import { UserFacingError } from "../lib/errors.js";
-import { sshConnector } from "./ssh.js";
-import { httpConnector } from "./http.js";
-import { portainerConnector } from "./portainer.js";
-import { unifiConnector } from "./unifi.js";
-import { homeAssistantConnector } from "./home-assistant.js";
-import { proxmoxConnector } from "./proxmox.js";
-import { pelicanConnector } from "./pelican.js";
-import { uptimeKumaConnector } from "./uptime-kuma.js";
+import { sshConnector } from "./ssh/index.js";
+import { httpConnector } from "./http/index.js";
+import { portainerConnector } from "./portainer/index.js";
+import { unifiConnector } from "./unifi/index.js";
+import { homeAssistantConnector } from "./home-assistant/index.js";
+import { proxmoxConnector } from "./proxmox/index.js";
+import { pelicanConnector } from "./pelican/index.js";
+import { uptimeKumaConnector } from "./uptime-kuma/index.js";
 
 /**
  * Registry of available connector *types*. Adding support for a new service

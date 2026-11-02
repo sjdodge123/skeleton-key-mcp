@@ -34,8 +34,8 @@ vi.mock("undici", () => ({
   fetch: (url: unknown, init?: { method?: string }) => record(url, init),
   Agent: class {},
 }));
-vi.mock("./ssh-exec.js", async () => {
-  const actual = await vi.importActual<typeof import("./ssh-exec.js")>("./ssh-exec.js");
+vi.mock("./shared/ssh-exec.js", async () => {
+  const actual = await vi.importActual<typeof import("./ssh-exec.js")>("./shared/ssh-exec.js");
   return {
     ...actual,
     runSsh: vi.fn(async (_t: unknown, _c: unknown, command: string) => {
@@ -50,6 +50,8 @@ vi.mock("socket.io-client", () => ({
   },
 }));
 
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import type { Connector, ConnectorTool, Credential, Target, ToolContext } from "./types.js";
 import { connectorAliases, declaredOptionKeys, listConnectors, validateTargetOptions } from "./index.js";
 import { buildGlobalTools } from "../mcp/builtin-tools.js";
@@ -100,6 +102,16 @@ describe.each(connectors.map((c) => [c.type, c] as const))("connector %s", (_typ
 
   it("has a kebab-case type", () => {
     expect(c.type).toMatch(TYPE_RE);
+  });
+
+  it("lives in src/connectors/<type>/ with a README naming every tool", () => {
+    const dir = path.join(import.meta.dirname, c.type);
+    expect(existsSync(path.join(dir, "index.ts")), `${dir}/index.ts`).toBe(true);
+    const readme = path.join(dir, "README.md");
+    expect(existsSync(readme), `${readme} is missing`).toBe(true);
+    const text = readFileSync(readme, "utf8");
+    const missing = tools.filter((t) => !text.includes(`\`${t.name}\``)).map((t) => t.name);
+    expect(missing, "add these tools to the connector README").toEqual([]);
   });
 
   it("names every tool in snake_case, uniquely", () => {

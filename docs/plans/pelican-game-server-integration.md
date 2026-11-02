@@ -106,7 +106,7 @@ five admin panels the way the Palworld server was set up.
   - Only a **remotely-managed** tunnel honors the configurations API; a
     locally-managed (`config.yml`) tunnel ignores it. Which one this account
     runs is not yet confirmed — **blocking for the cloudflare step**.
-- No UniFi port-forward CRUD exists yet in `src/connectors/unifi.ts` (only
+- No UniFi port-forward CRUD exists yet in `src/connectors/unifi/index.ts` (only
   gateway feature toggles, IPv6, remote logging, force-provision). Read tools
   for existing forwarding rules also don't exist. The classic REST endpoint is
   `/proxy/network/api/s/{site}/rest/portforward` on UniFi OS — confirm the

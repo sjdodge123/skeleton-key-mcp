@@ -67,9 +67,11 @@ function loadDenylist() {
 }
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-// Whole token: not glued to a word character or hyphen on either side, and an
-// address entry doesn't match a longer address (…0.9 must not hit …0.90).
-const tokenRe = (entry) => new RegExp(`(?<![A-Za-z0-9_-])${escapeRe(entry)}(?![A-Za-z0-9_-]|\\.[0-9])`, "gi");
+// Whole token: not glued to a letter, digit or underscore on either side.
+// Hyphens and dots are separators, so a host's derived names (`<host>-ssh`,
+// `<host>.local`, a UUID starting with an id) still match. An address entry
+// doesn't match a longer address (…0.9 must not hit …0.90 or …0.9.1).
+const tokenRe = (entry) => new RegExp(`(?<![A-Za-z0-9_]|[0-9]\\.)${escapeRe(entry)}(?![A-Za-z0-9_]|\\.[0-9])`, "gi");
 
 const denylist = loadDenylist();
 const denyRes = denylist.map((entry, i) => ({ entry, index: i + 1, re: tokenRe(entry) }));
