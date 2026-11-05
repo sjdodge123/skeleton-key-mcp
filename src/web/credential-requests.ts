@@ -15,9 +15,9 @@ export type CredentialKind = "password" | "token";
 export type RequestStatus = "pending" | "fulfilled" | "expired" | "declined";
 
 /**
- * Shape constraints for one value. The Discord migration stored an OAuth2
- * Client Secret (32 chars, no dots) where a Bot Token (~70 chars, two dots) was
- * expected because the form had no way to say "that's not it" — these let the
+ * Shape constraints for one value. Without them an OAuth2 Client Secret (32
+ * chars, no dots) is accepted where a Bot Token (~70 chars, two dots) was
+ * expected, because the form has no way to say "that's not it" — these let the
  * agent describe the expected shape AND where to get it, and the form/server
  * refuse a value that doesn't match before anything reaches the vault.
  */
@@ -32,7 +32,7 @@ export interface FieldConstraints {
 
 /**
  * One named value in a multi-field request (e.g. migrating an app's env secrets:
- * DISCORD_BOT_TOKEN, SXM_USERNAME, SXM_PASSWORD). This is *metadata only* — the
+ * DISCORD_BOT_TOKEN, APP_USERNAME, APP_PASSWORD). This is *metadata only* — the
  * name/label describe the input to render; the value the user types is written
  * straight to the vault and never stored here.
  */

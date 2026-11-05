@@ -18,7 +18,7 @@ import {
 } from "./client.js";
 import type { Credential, Target, ToolContext } from "../types.js";
 
-/** The owner's shape: game-server monitors tagged managed:pelican and named after the server. */
+/** The conventional shape: game-server monitors tagged managed:pelican and named after the server. */
 const MONITORS: FakeMonitor[] = [
   { id: 12, name: "Valheim", type: "port", hostname: "192.168.1.48", port: 2456, active: 1, tags: [{ name: "managed", value: "pelican" }, { name: "wing", value: "node" }] },
   { id: 13, name: "Palworld", type: "port", hostname: "192.168.1.48", port: 8211, active: 1, tags: [{ name: "managed", value: "pelican" }] },

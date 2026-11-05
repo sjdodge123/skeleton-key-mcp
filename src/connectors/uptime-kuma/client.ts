@@ -233,7 +233,7 @@ export function norm(s: string | undefined | null): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-/** The tag the owner puts on every monitor of a Pelican-managed game server. */
+/** The tag an operator puts on every monitor of a Pelican-managed game server. */
 export const MANAGED_PELICAN_TAG = "managed:pelican";
 
 export function isManagedByPelican(m: KumaMonitor): boolean {

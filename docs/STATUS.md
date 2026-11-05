@@ -1,81 +1,122 @@
-# Status & Handoff
+# Status & Roadmap
 
-Living status doc. Update it as work lands. For architecture see `docs/ARCHITECTURE.md`; for rules/commands see `CLAUDE.md`.
+Where the project stands and what's next. Update it as work lands. For the module map see
+`docs/ARCHITECTURE.md`; for product scope and the security model see `docs/SCOPE.md`; for
+rules and commands see `CLAUDE.md`. Per-release detail lives in the GitHub releases and PRs.
 
-_Last updated: 2026-10-22._
+_Last updated: 2026-11-05 (v0.4.0)._
 
 ## TL;DR
 
-Phase 1 is **complete and deployed**. A real MCP client (Claude Code) is connected over OAuth against a live instance on the owner's NAS and has driven the conversational onboarding tools end-to-end (network scan, key generation, target registration, validation). Everything below "Done" is merged to `main`; the image auto-publishes to GHCR and is picked up by Watchtower.
+- **Phase 1 (the server) is complete.** A real MCP client connects over OAuth, onboards a
+  homelab conversationally (scan → credential → register → validate), and drives read and
+  approval-gated execute tools across eight connectors.
+- **Phase 2 (contributor readiness) shipped in v0.4.0.** One folder per connector, a committed
+  tool manifest, a conformance suite, import boundaries, a scaffold, and a connector guide.
+- **Phase 3 (pluggability) is next.** See "Next" below.
+
+Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`; only a pushed
+`vX.Y.Z` tag moves `:latest` (see CONTRIBUTING "Releases").
 
 ## Done (merged to `main`)
 
-- **Core skeleton** — Express app, stateful Streamable-HTTP MCP endpoint, dynamic tool registry (global ⊕ per-target), append-only audit log.
-- **Secrets** — libsodium bootstrap store; scoped-Vaultwarden client over the `bw` CLI with offline cache; secrets kept off argv/logs; `reestablish()` unlock logic.
-- **Vault URL repair + https requirement (#70 → follow-up)** — bumping the bundled Bitwarden CLI (2024.9.0 → 2026.9.1, needed because Vaultwarden 2026.x rejects item creates without `encryptedFor`) surfaced a second CLI change: it refuses plain-http vault servers, so the stored LAN `http://nas:5555` URL stopped unlocking after the deploy. Added `AppState.changeVaultServer` + TOTP-gated `POST /api/vault/server` (logout → reestablish on the new https URL → sync → persist, fails closed), `vaultError` on `/api/status` (URLs redacted), a non-fatal `/store/unlock` that reports the vault state instead of bouncing the user to the passphrase box, an admin-page "Vault connection" repair card, and https validation in the wizard. Lesson recorded: the pinned `bw` CLI must track the Vaultwarden version Watchtower ships.
-- **Generic SSH connector** — read tools + gated execute with a command deny-list; generic HTTP connector.
-- **`run_readonly` hardening** — the read-only allowlist only checked a command's first word, so a no-approval read tool could run `ls; systemctl stop x` or `cat f | tee /etc/…`. Allowlist mode now vets every command of a compound line (quote-aware split), refuses substitution/subshells/backgrounding/file redirects, refuses the write modes of allowlisted commands (`find -delete`, `ip l s`, `date -s`, `dmesg -c`, `smartctl -t`, `env CMD`, …), and adds read-only PVE/hardware inspection (`qm config`, `pvesm status`, `pvesh get`, `lsblk`, `lspci`, `findmnt`, …). Found while investigating a stale `nvme` storage entry on a Proxmox host (2026-10-22). Also tightens target `allowPatterns` the same way. UPS status queries (`upsc`, `apcaccess`) were added later for a buzzing-UPS check (2026-10-24); `upscmd`/`upsrw` stay off the read tier.
-- **First-run wizard** — passphrase, vault connect + scoping/durability checks, LAN discovery, TOTP, connect-Claude step; clickable steps, submit spinners.
-- **OAuth 2.1 auth** — discovery, dynamic client registration, PKCE, TOTP-gated consent, rotating refresh tokens, per-client revocation; static bearer retained as fallback.
-- **Conversational onboarding tools** — `get_started`, `network_scan`, `vault_generate_ssh_key`, `vault_store_login`, `vault_list_credentials`, `vault_validate_ssh`, `register_target`, `list_targets`.
-- **Self-guiding onboarding** — server `instructions` on connect + live `tools/list_changed` push on target registration.
-- **LAN discovery fingerprinting** — SSH banner + HTTP content match with confidence levels (replaces port-only guessing).
-- **Packaging & CI** — multi-stage Dockerfile, Portainer compose, CI on every PR, GHCR publish on merge, branch protection.
-- **Exact-name credential lookup (#14)** — `getCredential` resolves refs by exact item name → id → case-insensitive → unique-substring (`bw get item` substring-matched, so `PiHole` broke when `pihole-ssh` was created; found live during onboarding). Bounded via `bw list items --search` (id-shaped refs use a direct `bw get item`).
-- **Locked-vault UX (#13/#14)** — a locked vault no longer 503s authenticated clients; sessions connect and a banner-only `get_started` tells the user how to unlock, while every other tool is withheld from **both** `tools/call` and `tools/list` so a leaked token can't enumerate/scan before unlock. Unlock emits `tools/list_changed` so live sessions recover. Auth routing is lock-independent (expired token → 401→refresh, not a dead 503); unlock URLs come from the pinned/auto-detected public URL only, never the client Host header. Reworked twice after adversarial `/code-review` (first cut removed the restart kill-switch; second missed the `tools/list` gate).
-- **Credential lifecycle (#15–#18)** — `update_target` re-points a target's credentialRef (options shallow-merged so the SSH deny-list survives); `vault_delete_credential` retires an item (guarded against deleting one a target still uses); **`request_credential`/`credential_request_status`** hand off secrets via a one-time, TOTP-gated web form (`src/web/credential-routes.ts`) so passwords/tokens never transit the chat/MCP channel; `get_started`/instructions now teach both onboarding flows and the never-ask-secrets-in-chat rule.
-- **Public URL auto-detect (#21)** — the base URL for user-facing (secret-asking) links is auto-detected from the LAN on first boot and persisted, with `SKELETON_KEY_PUBLIC_URL` as override; never derived from the client Host header.
-- **Wizard-managed boot auto-unlock (keyslots)** — the bootstrap store moved to a keyslot format (`SKMCP2`: random data key wrapped by the argon2 passphrase KEK and, optionally, by a random machine unlock key; v1 stores migrate on first passphrase unlock). Enabling auto-unlock (wizard step or the TOTP-gated post-setup unlock page) writes the random key — never the passphrase — to a host-mounted file (`SKELETON_KEY_UNLOCK_KEY_FILE`), which boot prefers. `SKELETON_KEY_PASSPHRASE` / `_FILE` are **deprecated** (still honored with a boot warning).
-- **Bespoke connectors — UniFi, Home Assistant, Proxmox** — `unifi` (surgical gateway/network writes: `set_network_ipv6`, `set_gateway_feature`, key-redacted reads; **`set_remote_logging` (#47)** — server-side read-modify-write of the gateway's rsyslogd group to stream userspace syslog and/or kernel netconsole off-box to a LAN collector, with an RFC1918-only egress guard (`isPrivateIPv4`), built to capture a gateway crash's own logs; **`force_provision` (#48)** — `POST /cmd/devmgr {cmd:'force-provision', mac}` so a `/rest/setting` write actually applies on the device rather than only the controller DB, defaulting to the gateway identified positively by device role/model, not IP; plus a `get_settings` redaction fix widening the `SECRET_KEY` denylist — token / `*_key` / passwd / psk / secret / cert families — after it leaked the gateway API token, SSH password hash, mgmt key, IPS token, and a PSK). **`home-assistant` (#44)** — REST + long-lived token; read `ha_states`/`ha_get`/`ha_logbook`, execute `ha_call_service` (+`return_response`) and `ha_backup`. Fixes the long-standing programmatic-HA **POST 400** at the root: the generic `http` connector's untyped `body` was transmitted as a JSON string and double-encoded, so HA saw a string where it wanted an object; the bespoke connector sends typed, single-encoded service data. Diagnosed live, 16 adversarial-review rounds, deployed, and confirmed against the live instance (`update_entity` → HTTP 200, previously 400). **`proxmox` (#45)** — PVE REST; read nodes/guests/tasks + task logs, execute `guest_power` (name+node re-verified against the live lookup before acting); HTTPS-enforced, API-token/ticket auth. 5 review rounds, deployed (no `proxmox` target registered yet — needs a PVE API token).
-- **Verify bearer while locked (#20)** — `src/config/bearer-hash.ts` persists a lock-independent SHA-256 of the bearer so a valid legacy bearer is admitted to the banner-only `get_started` (not 401'd) after a restart.
-- **Encrypted disaster-recovery skeletons (`form_skeleton`, #49)** — new `src/snapshots/` (`crypto.ts` snapshotKey lifecycle + `crypto_aead_xchacha20poly1305_ietf`; `tar.ts` a hand-rolled streaming ustar writer, no dependency; `snapshot-service.ts` orchestration + manifest + streaming download) plus an optional `Connector.snapshot?(ctx)` hook / `SnapshotArtifact` type implemented per connector (unifi scrubbed settings/networks/devices + native `.unf` backup; ssh/pihole read-only system profile + Pi-hole teleporter; proxmox guest/storage/network configs; portainer stack compose + container inspects; home-assistant triggered backup + `/api/config` reference). The global execute tool `form_skeleton` (`src/mcp/builtin-tools.ts`) iterates every registered target, encrypts each artifact under a `snapshotKey` in the bootstrap store, writes `data/skeletons/<id>/<target>/<artifact>.enc` + `manifest.json` + `RESTORE.md`, and returns a summary only; per-target failures are isolated (partial skeleton, never a hard fail). New TOTP-gated web routes (`src/web/routes.ts`) `POST /api/snapshots` (list, metadata only) and `POST /api/snapshots/:id/download` (decrypt + stream a `.tar.gz`) are the **only** plaintext egress (locked → 409, bad TOTP → 403). **Load-bearing invariant:** artifact bytes never reach a ToolResult / manifest / audit log / model context — encrypted at rest under a key wrapped by the off-volume auto-unlock key, so a copy of `/data` alone can't decrypt a skeleton. No new dependencies (`node:zlib` gzip + the ustar writer). Merged, deployed, and smoke-tested against all 8 targets.
+**Core**
+- Express app, stateful Streamable-HTTP MCP endpoint, and a dynamic tool registry (global
+  tools ⊕ per-target connector tools) that pushes `tools/list_changed` when targets change.
+- Append-only audit log for every tool call.
+- Server `instructions` on connect plus a live `get_started` tool make a fresh session
+  self-guiding.
 
-- **Pelican Panel connector (#60–#66)** — `src/connectors/pelican/index.ts`: inventory (eggs/nodes/allocations/users/servers, with the client key's reach marked per server), provisioning (`import_egg`, `create_allocations`, `create_server` — owner fixed to the target's dedicated panel user, COMPLETE egg variable set sent so nothing is blanked), power, startup variables (admin + client routes, vault-backed `secretVariables` so a game password never enters chat), build limits (`update_server_build` — backup/database/allocation and resource limits over the full-payload build route, read-merge-write so a backups change can't zero the rest), schedules, `panel_version` / guarded `panel_upgrade` over a registered ssh target, and **server files** (`list_files`, `read_file`, `write_file`, `create_folder`, `pull_file`, `decompress_file`, `rename_files`, `delete_files` — the panel's client file API, so mods and configs reach a game server's volume with correct ownership and no shell access to the node; built for the Valheim BepInEx mod install, where `/var/lib/pelican` is root-only and the node's sudo needs a password). Details in ARCHITECTURE.md.
+**Secrets and auth**
+- libsodium bootstrap store with keyslots: a passphrase slot (argon2) and an optional random
+  machine-unlock key on a host mount, so boot auto-unlock never writes the passphrase to disk.
+  `SKELETON_KEY_PASSPHRASE` / `_FILE` are deprecated but honored.
+- Scoped Vaultwarden client over the `bw` CLI with an offline cache; targets pin the vault
+  item's immutable id, trashed items never satisfy a ref, deploy-time reads re-sync first.
+- OAuth 2.1 (dynamic client registration, PKCE, TOTP-gated consent, rotating refresh tokens,
+  per-client revocation), with the static bearer as a fallback.
+- Locked vault is a kill-switch: every tool except a banner-only `get_started` is withheld
+  from `tools/list` and `tools/call`.
+- TOTP and passphrase attempt limiting on every gated route.
+- `request_credential`: a one-time, TOTP-gated web form so secrets never transit chat. Per-field
+  shape checks, a pre-store `verify` probe, overwrite-in-place, link TTLs, an open-links admin
+  page, and keyed fingerprints for comparing vault and deployed values.
+- LAN TLS on by default (self-signed, auto-renewed) or a user-mounted cert.
 
-- **Pelican panel-host prerequisites without general sudo (2026-10-11)** — Pelican v1.0.0-rc.1 raised the PHP floor to 8.4 (`composer.json` `require.php` = `^8.4 || ^8.5`; the installed beta35 declares `^8.3 || ^8.4 || ^8.5`), so `panel_upgrade` would have taken the panel down and died at `composer install` on PHP 8.3. New: a root-owned, fixed-purpose helper shipped in the repo (`scripts/host/skeleton-key-pelican-host.sh`, install steps in `scripts/host/README.md`) that the owner installs once with ONE NOPASSWD sudoers rule for that path only — subcommands `status`, `php-prepare <8.N>`, `wings-update <vTAG>`, anything else exits 2, arguments strictly validated on both sides, self-integrity check (root-owned, not writable), idempotent, nginx socket rewritten only in files that mention the panel root. New Pelican execute tools `panel_prepare_runtime` (release constraint fetched from the tag's composer.json; refuses a non-satisfying PHP, refuses if the installed panel could not run on it, no-op when already met) and `wings_update` (stale-guarded by the helper-read Wings version, checksum-verified atomic swap with rollback); `panel_version` now reports PHP vs requirement, the nginx socket, Wings vs latest and the helper/sudo state in one read; `panel_upgrade` refuses before maintenance mode when the PHP floor is not met and fails closed when it cannot tell. `compareVersions` now orders alpha < beta < rc so beta35 → rc.1 reads as "behind" instead of "could not compare". Pure logic lives in `src/connectors/pelican/host.ts`; tests mock SSH and assert that no command string outside the fixed set is ever sent. **Same day:** the helper gained `panel-upgrade <version> <vTAG> [--skip-backup]` and `panel_upgrade` was rewired to it (optional `release` pin), so the whole upgrade — download + checksum, `composer check-platform-reqs` on the new lock file before maintenance mode, DB backup, Pelican's documented sequence as the panel user, a root-only step log under `/var/log/skeleton-key/`, SIGHUP-proof — runs under the single sudoers rule; the per-step `sudo -n -u www-data` path is gone. **Operator steps done 2026-10-11:** helper + rule installed on the panel host by hand and verified with `status` (Skeleton Key's SSH user there is the owner's own account). Next: merge → deploy → `panel_version` → `panel_prepare_runtime` (phpVersion 8.4) → `panel_upgrade` → `wings_update`, off-hours, with the pending host reboot folded in.
+**Connectors** (`src/connectors/<type>/`; tools listed in `tools.manifest.json`)
+- `ssh` — logs, journal, service status; gated `run_command` behind a deny-list; a
+  quote-aware read-only allowlist for `run_readonly`.
+- `http` — generic REST reads and gated requests.
+- `portainer` — containers, stacks, inspect, logs; `create_stack` / `update_stack` with
+  `secretEnv` resolved server-side; `remove_stack` only for stacks Skeleton Key created.
+- `unifi` — UniFi OS gateways: devices, clients, networks, scrubbed settings; surgical
+  revertable writes (gateway features, per-network IPv6, remote logging, port forwards,
+  force-provision).
+- `home-assistant` — states, logbook, service calls, backups.
+- `proxmox` — nodes, guests, tasks; guest power with live re-verification.
+- `pelican` — game-server panel: inventory, provisioning, power, startup variables, build
+  limits, schedules, server files, and panel/Wings upgrades through a root-owned host helper
+  with one sudoers rule (`scripts/host/`).
+- `uptime-kuma` — monitor inventory and audited pause/resume/maintenance windows; Pelican's
+  `power_action` can wrap a manual bounce in them (`suppressMonitors`).
 
-- **Uptime Kuma connector + the white-glove rule (2026-10-11)** — `src/connectors/uptime-kuma/index.ts` (+ `uptime-kuma-client.ts`, a minimal socket.io client, since Kuma has no REST API for monitor control): read `list_monitors` / `monitor_status`; execute `pause_monitor` / `resume_monitor` / `maintenance` (pause a set by id/name/tag, returns a persisted handle) / `end_maintenance` (resumes exactly what the handle paused; idempotent; stays open on a partial failure). Login comes from the vault at call time; 2FA accounts are refused clearly. Pelican's `power_action` gained `suppressMonitors: true` (+ `waitSeconds`): finds the registered uptime-kuma target via the new `ToolContext.targetsOfType`, pauses the monitors matching the server (`managed:pelican` + name, or a `server:<identifier>` tag), acts, polls `server_resources` for the expected state, and **always resumes in a `finally`** — the fix for the 2026-10-11 incident where every Valheim test boot posted "DOWN/UP" to Discord. Tested against a real socket.io fake (`test/helpers/fake-uptime-kuma.ts`). Not yet registered live — one-time setup: a Kuma login in the vault via `request_credential` (fields `username` + `password`), then `register_target` type `uptime-kuma` with `baseUrl`.
+**Global tools**
+- LAN discovery with content fingerprinting (`network_scan`).
+- Vault and registry management (`vault_*`, `register_target`, `update_target`, `list_targets`).
+- `form_skeleton`: encrypted disaster-recovery snapshots of every target, run as a background
+  job, downloadable only through a TOTP-gated route.
 
-- **Fly.io → Portainer migration toolkit** — everything an agent needs to stand up a new app from a compose file, built to dogfood the Stella / coworker-bot fly.io exits. Portainer connector: **`create_stack`** (POST `/api/stacks/create/standalone/string`, injects a `# x-skeleton-key-managed: true` marker), **`remove_stack`** (refuses stacks without the marker; verifies id↔name; never touches volumes/bind mounts), **`container_inspect`** (curated state/health/mounts/ports read tool, env values redacted), **`exec_container` now gated by the command deny-list** (was unpoliced), and `list_stacks` redacts stack env values. **`secretEnv` vault bridge** on `create_stack`/`update_stack`: `[{name, credentialRef, field?}]` resolved server-side (new optional `ToolContext.resolveCredential`) into the stack's substitution env — secret values never transit chat/results/audit, and Portainer error bodies are scrubbed of resolved values. **Multi-field `request_credential`**: a `fields` list (≤10, env-var-style names, masked when `secret`) collects an app's whole secret set on ONE TOTP link into ONE vault item (custom fields; a `username` field also fills the login username). **SSH timeouts configurable**: per-target `commandTimeoutMs` and per-call `timeoutSeconds` on `run_command` (precedence per-call > per-target > 20s default, max 10 min) for long `docker compose pull`-style operations.
+**Repo and CI**
+- Apache-2.0, security policy, issue/PR templates, CODEOWNERS, rulesets on `main`.
+- CI: typecheck, tests, build, CodeQL, dependency review, image build + scan, workflow lint,
+  signed images.
+- `check-homelab-data` keeps real hostnames and addresses out of tracked files, commits and
+  PR text (git hooks plus the required CI check).
+- Phase 2 contributor tooling (v0.4.0): connector folders, `tools.manifest.json` with a
+  drift test, the conformance suite, import-boundary test, registration-time option
+  validation, `npm run new:connector`, and `docs/CONNECTOR_GUIDE.md`.
 
-- **LAN TLS for the web UI + MCP endpoint** — native HTTPS **on by default** (`src/web/tls.ts`): a self-signed cert (RSA-2048, CA:TRUE so it's its own trust anchor, 825-day validity to stay inside Apple's locally-trusted cap) is generated via the openssl CLI into `data/tls/` on first boot, reused across restarts, and re-issued automatically near expiry or when the pinned public-URL host leaves its SANs (the regen check deliberately ignores the container's churning interface IPs so a Watchtower recreate never forces a re-trust). A user-mounted pair (`SKELETON_KEY_TLS_CERT_FILE`/`_KEY_FILE`, must be set together, fails boot loudly if broken) takes precedence; `SKELETON_KEY_TLS=off` opts out; generation failure degrades to plain HTTP with a loud warning so an auto-upgraded container always comes up. The persisted `data/public-url` scheme migrates in place (http ↔ https, only with an explicit port so 80/443 defaults can't shift), the OAuth issuer follows `req.protocol` automatically, the cert is downloadable unauthenticated at `/tls/cert.pem` for the one-time trust step (fingerprint printed in the boot log to close the TOFU gap), failed handshakes from `http://`-configured clients get a throttled diagnostic log, and the Docker healthcheck tries HTTPS then HTTP. This unblocks direct HTTPS connections from Claude Code (which refuses OAuth token requests to non-HTTPS endpoints) via `NODE_EXTRA_CA_CERTS` — documented in README "LAN TLS" — retiring the `mcp-remote --allow-http` bridge workaround.
+## Next
 
-- **Post-deploy TLS acceptance (2026-08-20)** — the TLS release deployed via Watchtower and came up HTTPS-only; the boot log prints the cert SHA-256 fingerprint (verified identical to what the live socket presents), and `/api/status` + OAuth discovery advertise `https://`. Claude Code now connects **directly** to `https://<NAS_LAN_IP>:8787/mcp` over OAuth with `NODE_EXTRA_CA_CERTS` pointing at the downloaded cert — set in both the shell profile **and** the `env` block of `~/.claude/settings.json` (the desktop app doesn't read the shell profile) — retiring the `mcp-remote --allow-http` stdio bridge. Acceptance checklist ran over the live session: `list_targets` (all 8 targets), an SSH read tool, and `container_logs` on the server's own container, confirming the boot-log fingerprint and that the current boot has no public-URL-migration or scheme-mismatch warnings. **Deploy gotcha:** a pinned `SKELETON_KEY_PUBLIC_URL` env var **overrides the automatic http→https scheme migration and the OAuth issuer** — the stack had it pinned as `http://`, so OAuth metadata kept advertising plain-HTTP endpoints (client saw ECONNRESET) until the env var was hand-edited to `https://` in Portainer and the stack redeployed. If that var is pinned, any future scheme change must update it too.
+Roughly in priority order.
 
-- **Post-migration hardening (from the coworker-bot fly.io exit, 2026-08-21)** — the migration worked but burned hours on three things, each now guarded. (1) *Wrong credential stored twice* (Discord's OAuth2 Client Secret where the Bot Token belonged): `request_credential` takes per-field `pattern`/`minLength`/`maxLength`/`hint` enforced in the browser and re-checked server-side, an optional pre-store `verify` HTTP probe with `{{FIELD}}`-templated headers (probe host named in the approval prompt and on the form, since the secret is sent there), `overwrite: true` to refill an existing item in place (new `VaultwardenClient.updateLoginItem` via `bw edit item`), a `ttlMinutes` / `SKELETON_KEY_CREDENTIAL_TTL_MINUTES` link lifetime (default 30 min), a TOTP-gated `/admin/credentials` page listing open links for when a chat client fails to render one, and keyed per-field fingerprints (`src/lib/fingerprint.ts`, HMAC under a per-install key) reported by `credential_request_status`. (2) *A vault rename raced a redeploy*: targets pin the item's immutable `credentialId` at register/update time and read by id (falling back to name and re-pinning if the id vanished), trashed items are ignored everywhere, and deploy-time `secretEnv` reads re-sync the cache first (bounded, degrades to cache). `create_stack`/`update_stack` report a fingerprint per injected secret and `container_inspect`/`list_stacks` per env var, so vault↔deployed mismatches are a comparison. (3) *Client-side friction*: `form_skeleton` is a background job (returns a job id, `skeleton_status` polls; a second call joins the running job instead of re-triggering every native backup; optional `waitSeconds`), `CallTool` sends `notifications/progress` heartbeats when the client supplies a `progressToken`, and SSH commands get a sane `PATH` plus a per-target `sudoPrefixes` option for Synology's root-only docker socket (policy still checks the raw command). Limitation stated in code: the server cannot signal "waiting on the client's approval prompt" — that happens before the request is sent.
+1. **Code-scanning triage.** Work through the open CodeQL and image-scan alerts: fix or dismiss
+   each with a written reason (the rate-limiting and user-controlled-bypass findings on the
+   OAuth and credential routes, clear-text logging, the scan's TLS opt-out, Dockerfile pinning,
+   CVEs in the bundled `bw` CLI). Then make CodeQL, dependency review and the image scan
+   required checks.
+2. **Phase 3 — pluggable secret providers.** A `SecretsProvider` interface so vaults other
+   than Vaultwarden can back a deployment, with the scoping guarantee stated per provider.
+3. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
+   hypervisors, routers and NAS, checked by the conformance suite.
+4. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and
+   reusable allowlist packs for the SSH connector.
+5. **New connectors.** `synology` (DSM Web API, multi-host incl. VirtualDSM) and `pihole`
+   (stats, blocklists); discovery already detects both and falls back to `http` today.
+6. **Admin console.** Grow the web UI past the first-run wizard: audit-log viewer, target CRUD,
+   OAuth client list/revoke, token rotation, vault re-unlock, and a snapshots page to list and
+   download DR skeletons ([#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50)).
+7. **Dry-run for execute tools**, starting with a compose preview for `create_stack` /
+   `update_stack`.
+8. **Monitor-suppression audit detail.** `power_action … suppressMonitors` pauses and resumes
+   monitors on the uptime-kuma target under the Pelican tool's single approval; the audit row
+   records the call but not which monitor ids were touched. A per-pause/resume audit row
+   would close the gap.
+9. **Smaller follow-ups.**
+   - The web-UI target form doesn't pin `credentialId` (it pins lazily on first read).
+   - `verify` URLs over plain http are allowed for literal LAN IPs only, not LAN hostnames.
+   - `overwrite` replaces named fields but never removes stale ones.
+   - `container_inspect` fingerprints every env var, not just secrets.
+   - Scan accuracy: secondary probes for SPA shells that don't self-identify, and a progress
+     indicator.
 
-Each feature PR went through an adversarial `/code-review`; findings were fixed before merge (notably: OAuth secret-leak/refresh-rotation, provisioning secret-in-argv leak + shell-injection, stateful-transport teardown recursion + session leak, scan httpProbe hang, locked-state kill-switch gaps, credential-delete guard bypass).
+## Working agreements
 
-## Open PRs
-
-None. `main` is the source of truth. (Home Assistant #44 and Proxmox #45 merged and deployed via Watchtower on 2026-07-06; UniFi `set_remote_logging` #47, `force_provision` #48, and `form_skeleton` #49 all merged and deployed since.)
-
-## Active investigation — "an HA update darkens the whole LAN"
-
-Narrowed. The trigger is deterministic: an HA-originated `ghcr.io` update-image pull crash-reboots the UniFi Cloud Gateway Ultra ~3s after the DNS resolve. **Ruled out:** multicast storm, IPv6, UPnP, DPI. **Leading suspects now:** the GeoIP firewall mis-geolocating the specific `ghcr.io` edge IP, with hardware-offload acting as the amplifier. Tooling to run the decisive GeoIP A/B (with crash-log capture) is deployed, and a DR skeleton (`form_skeleton`) is in place as the safety net before running it. Crash-log capture relies on kernel **netconsole** (best-effort): the UCG doesn't forward its own OS syslog externally (a firmware quirk), so `set_remote_logging`'s userspace path can't see the gateway's own crash.
-
-## Known gaps / good next tasks
-
-Roughly in priority order — pick up any of these:
-
-1. **Run the GeoIP A/B for the HA-update crash** (next task). Toggle the GeoIP firewall off/on across an HA-triggered `ghcr.io` pull and confirm whether the Cloud Gateway Ultra still crash-reboots, capturing the crash via netconsole. The safety net (a fresh `form_skeleton` DR skeleton) and the capture tooling are already deployed; this is the decisive experiment to confirm/deny the GeoIP + hardware-offload hypothesis.
-2. **Bespoke connectors** (the biggest value). Done: **`portainer`**, **`unifi`**, **`home-assistant`** (#44), **`proxmox`** (#45), **`pelican`** (#60–#68), **`uptime-kuma`** — plus the generic `ssh`/`http`. Discovery routes `portainer`/`unifi`/`home-assistant`/`proxmox` detections to their real connectors; **`synology`** and **`pihole`** still fall back to `http` and are the next candidates — **Synology DSM** (multi-host, DSM Web API) and **Pi-hole** (stats/blocklists). Each is a `Connector` in `src/connectors/` (see the merged connectors for the pattern).
-3. **Admin console** — the web UI is first-run-wizard only. Grow it into an authenticated admin page: audit-log viewer, target CRUD, OAuth client list/revoke (endpoints already exist under `/api/oauth/clients`), token rotation, vault re-unlock, and a **snapshots page to list + download DR skeletons** (the `form_skeleton` download is API-only today — tracked in [#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50)). Reuse the wizard's TOTP/verify components.
-4. **Scan accuracy round 2** — fingerprints are content-based now but still imperfect (e.g., SPA shells that don't self-identify show as "likely"/"open"). Consider secondary probes (Portainer `/api/status`, Pi-hole `/admin`) and de-noising the results list.
-5. **Operational polish** — consider a scan progress indicator (the fingerprinting scan is slower than the old port scan).
-6. **Operator-side follow-ups from the hardening release** — the web-UI target form (`POST /api/targets`) doesn't pin `credentialId` (such targets pin lazily on first read); `verify` URLs over plain http are allowed only for literal LAN IPs, not LAN hostnames; `overwrite` replaces named fields but never removes stale ones; `container_inspect` fingerprints every env var, not just secrets (harmless, a little noisy).
-7. **White-glove audit detail** — the Pelican `power_action … suppressMonitors` cycle pauses/resumes monitors on the *uptime-kuma* target under the Pelican tool's single approval; the audit row records the args + confirm text, but not which monitor ids were paused/resumed (that is only in the returned text). A `ToolContext.audit?` hook (or result→detail capture) would close the gap; so would a first-class `uptime-kuma` audit row per pause/resume.
-8. **Per-target command policies & dry-run** — per-target `allowPatterns`/`denyPatterns` now exist on ssh AND portainer (`exec_container`); still open: dry-run for execute tools (esp. a `create_stack`/`update_stack` compose preview).
-
-## Environment notes (not in the repo on purpose)
-
-- The repo is **public** and carries **no real hostnames, IPs or personal identifiers**: use placeholders (`<NAS_LAN_IP>:8787`, `192.168.1.x`). Enforced by `scripts/check-homelab-data.mjs` (git hooks + the required CI check, with a private denylist secret). Deployment-specific notes and rules never go in this file or CLAUDE.md; see CLAUDE.md "Public-repo hygiene".
-- The live deployment specifics (actual LAN IP, Vaultwarden internal URL, which hosts exist) live only with the owner. Don't hard-code them.
-- Watchtower on the NAS auto-pulls new `:latest`, which now moves only when a `vX.Y.Z` release is tagged (merges publish `:main`); a container restart re-locks the vault (unlock via the web UI unless `SKELETON_KEY_PASSPHRASE` is set).
-
-## Working agreements (how this project has been run)
-
-- **Every non-trivial change:** branch → PR → CI green. Merges are the owner's call.
-- **Security-sensitive PRs** (anything touching auth, secrets, the connection path) get an adversarial `/code-review` and are **not** auto-merged — leave them for the owner to review/merge. Docs/mechanical changes may auto-merge after CI.
+- **Every non-trivial change:** branch → PR → CI green. Merges are a maintainer's call.
+- **Security-sensitive PRs** (auth, secrets, the MCP gate, the connection path) get an
+  adversarial review and are never auto-merged.
 - **`main` is protected** (PR + passing CI required, linear history). Don't push to it directly.
-- Verify behavior, don't just typecheck — the review passes have repeatedly caught runtime bugs that compiled fine (transport teardown recursion, scan hang). Add tests that exercise the real path.
+- **Verify behavior, don't just typecheck.** Review passes have repeatedly caught runtime bugs
+  that compiled fine; add tests that exercise the real path.
+- **No real homelab data in the repo**, and no rules about one particular deployment. See
+  CLAUDE.md "Public-repo hygiene".

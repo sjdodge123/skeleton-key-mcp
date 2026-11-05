@@ -44,7 +44,7 @@ describe("global tool registry", () => {
 
 describe("request_credential input schema", () => {
   const schema = byName.get("request_credential")!.inputSchema;
-  const base = { name: "example-bot", host: "fly-app", reason: "migrate off fly.io" };
+  const base = { name: "example-bot", host: "example-app", reason: "migrate" };
   const field = { name: "DISCORD_BOT_TOKEN" };
 
   const parse = (input: unknown): { success: boolean; data?: any } => schema.safeParse(input) as { success: boolean; data?: any };
@@ -58,10 +58,10 @@ describe("request_credential input schema", () => {
   it("accepts a multi-field set, keeping an explicit secret:false", () => {
     const parsed = parse({
       ...base,
-      fields: [field, { name: "SXM_USERNAME", secret: false, label: "SiriusXM login" }],
+      fields: [field, { name: "APP_USERNAME", secret: false, label: "Service login" }],
     });
     expect(parsed.success).toBe(true);
-    expect(parsed.data.fields.map((f: { name: string }) => f.name)).toEqual(["DISCORD_BOT_TOKEN", "SXM_USERNAME"]);
+    expect(parsed.data.fields.map((f: { name: string }) => f.name)).toEqual(["DISCORD_BOT_TOKEN", "APP_USERNAME"]);
     expect(parsed.data.fields[1].secret).toBe(false);
   });
 
@@ -98,7 +98,7 @@ describe("request_credential input schema", () => {
     } as unknown as AppState;
 
     const out = await byName.get("request_credential")!.run(
-      { ...base, fields: [field, { name: "SXM_USERNAME", secret: false }] },
+      { ...base, fields: [field, { name: "APP_USERNAME", secret: false }] },
       fakeApp,
     );
     // The link always comes from the configured public URL (anti-phishing).
@@ -106,7 +106,7 @@ describe("request_credential input schema", () => {
     const id = out.text.match(/\/credential\/([0-9a-f-]{36})/)![1]!;
     expect(requests.get(id)!.fields).toEqual([
       { name: "DISCORD_BOT_TOKEN", label: undefined, secret: true }, // secret defaults to true
-      { name: "SXM_USERNAME", label: undefined, secret: false },
+      { name: "APP_USERNAME", label: undefined, secret: false },
     ]);
 
     const status = byName.get("credential_request_status")!;
@@ -115,7 +115,7 @@ describe("request_credential input schema", () => {
     const fulfilled = (await status.run({ id }, fakeApp)).text;
     expect(fulfilled).toContain("fulfilled");
     expect(fulfilled).toContain("DISCORD_BOT_TOKEN");
-    expect(fulfilled).toContain("SXM_USERNAME");
+    expect(fulfilled).toContain("APP_USERNAME");
     expect(fulfilled).toContain("credentialRef 'example-bot'");
   });
 });
@@ -359,7 +359,7 @@ describe("credentialId pinning across register / update / delete / list", () => 
 describe("request_credential — validation / verify / overwrite / ttl schema", () => {
   const tool = byName.get("request_credential")!;
   const schema = tool.inputSchema;
-  const base = { name: "coworker-bot", host: "discord", reason: "migrate" };
+  const base = { name: "example-bot", host: "discord", reason: "migrate" };
   const ok = (input: unknown) => expect(schema.safeParse(input).success).toBe(true);
   const bad = (input: unknown, msg?: RegExp) => {
     const r = schema.safeParse(input);
@@ -408,7 +408,7 @@ describe("request_credential — validation / verify / overwrite / ttl schema", 
       overwrite: true,
       verify: { method: "GET", url: "https://discord.com/api/v10/users/@me" },
     });
-    expect(text).toContain("REPLACES the values of existing vault item 'coworker-bot'");
+    expect(text).toContain("REPLACES the values of existing vault item 'example-bot'");
     expect(text).toContain("SENT to discord.com");
   });
 });

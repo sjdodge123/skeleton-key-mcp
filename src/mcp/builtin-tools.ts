@@ -28,9 +28,9 @@ const MAX_REQUEST_FIELDS = 10;
 const MAX_VALUE_LENGTH = 4096;
 
 /**
- * Shape constraints the agent can attach to a value. These exist because the
- * Discord migration stored a Client Secret where a Bot Token was expected and
- * the form had no way to refuse it — when the agent KNOWS the expected shape
+ * Shape constraints the agent can attach to a value. Without them a form can't
+ * refuse a look-alike value (a Discord OAuth2 Client Secret where the Bot Token
+ * was expected is the classic case) — when the agent KNOWS the expected shape
  * it should say so, and the form + server reject a mismatch before anything
  * reaches the vault.
  */
@@ -550,7 +550,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       name: "request_credential",
       description:
         "Ask the user to provide credentials for a host WITHOUT them passing through the chat. Returns a one-time, TOTP-gated web link; the user types the value(s) in their browser and they are stored straight in the vault. " +
-        "Single-secret mode: pass `kind` (password or token). Multi-field mode: pass `fields` to collect a NAMED SET of values (e.g. an app's env secrets DISCORD_BOT_TOKEN / SXM_USERNAME / SXM_PASSWORD) onto ONE vault item — each becomes a custom field of that name. " +
+        "Single-secret mode: pass `kind` (password or token). Multi-field mode: pass `fields` to collect a NAMED SET of values (e.g. an app's env secrets DISCORD_BOT_TOKEN / APP_USERNAME / APP_PASSWORD) onto ONE vault item — each becomes a custom field of that name. " +
         "WHENEVER you know what the value should look like, pass `pattern`/`minLength`/`maxLength` and a `hint` naming the shape AND where to get it (per field, or top-level in single-secret mode) — the form refuses a non-matching value before it reaches the vault. " +
         "When the credential has a cheap authenticated endpoint, pass `verify` so the value is tested against it BEFORE being stored (the user sees the host and can override a failure). " +
         "To fix a wrong value already in the vault, pass `overwrite: true` to re-fill the existing item instead of inventing a new name. " +
