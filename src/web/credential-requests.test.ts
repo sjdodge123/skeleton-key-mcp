@@ -77,9 +77,9 @@ describe("CredentialRequestStore", () => {
     const { store } = storeAt();
     const fields = [
       { name: "DISCORD_BOT_TOKEN", label: "From the developer portal", secret: true },
-      { name: "SXM_USERNAME", secret: false },
+      { name: "APP_USERNAME", secret: false },
     ];
-    const req = store.create({ name: "example-bot", host: "fly-app", fields, reason: "migrate off fly.io" });
+    const req = store.create({ name: "example-bot", host: "example-app", fields, reason: "migrate" });
     expect(store.get(req.id)!.fields).toEqual(fields);
     // Multi-field replaces the single-value mode rather than coexisting with it.
     expect(store.get(req.id)!.kind).toBeUndefined();

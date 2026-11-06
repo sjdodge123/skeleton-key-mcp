@@ -1832,7 +1832,7 @@ describe("files — client API tools", () => {
 // The rule: pause → act → verify → ALWAYS resume. "No pause, no test."
 // ---------------------------------------------------------------------------
 
-describe("power_action with suppressMonitors (the white-glove rule)", () => {
+describe("power_action with suppressMonitors (white-glove suppression)", () => {
   let fake: FakeKuma;
   const WAIT_DEFAULTS = { ...POWER_WAIT };
 
@@ -2107,7 +2107,7 @@ describe("power_action with suppressMonitors (the white-glove rule)", () => {
       "RESTART Pelican server '1a2b3c4d' on pelican-panel — white-glove: pause its matching Uptime Kuma monitors first, resume them once it reports 'running' (or on failure)",
     );
     expect(tool("power_action").confirm!({ server: "1a2b3c4d", signal: "stop", suppressMonitors: true }, t)).toContain("once it reports 'offline'");
-    expect(tool("power_action").description).toMatch(/WHITE-GLOVE RULE/);
+    expect(tool("power_action").description).toMatch(/White-glove monitor suppression/);
     expect(tool("power_action").description).toMatch(/Scheduled starts\/stops .* never suppressed/);
   });
 

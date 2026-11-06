@@ -81,32 +81,32 @@ function postForm(id: string, body: Record<string, string>): Promise<Response> {
 
 const FIELDS = [
   { name: "DISCORD_BOT_TOKEN", label: "From the Discord developer portal", secret: true },
-  { name: "SXM_USERNAME", secret: false },
-  { name: "SXM_PASSWORD", secret: true },
+  { name: "APP_USERNAME", secret: false },
+  { name: "APP_PASSWORD", secret: true },
 ];
 
 describe("credential hand-off — multi-field mode", () => {
   it("renders one input per field, masked only for secret ones", async () => {
-    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "example-app", fields: FIELDS, reason: "migrate" });
     const html = await (await fetch(`${root}/credential/${req.id}`)).text();
     expect(html).toContain('name="f_DISCORD_BOT_TOKEN"');
-    expect(html).toContain('name="f_SXM_USERNAME"');
-    expect(html).toContain('name="f_SXM_PASSWORD"');
+    expect(html).toContain('name="f_APP_USERNAME"');
+    expect(html).toContain('name="f_APP_PASSWORD"');
     expect(html).toContain("From the Discord developer portal"); // label is help text
     expect(html).toMatch(/type="password" name="f_DISCORD_BOT_TOKEN"/);
-    expect(html).toMatch(/type="text" name="f_SXM_USERNAME"/); // non-secret stays visible
+    expect(html).toMatch(/type="text" name="f_APP_USERNAME"/); // non-secret stays visible
     expect(html).toContain("3 values");
   });
 
   it("writes ONE vault item carrying every field, hidden per the field's secret flag", async () => {
-    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate off fly.io" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "example-app", fields: FIELDS, reason: "migrate" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
       totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: "discord-value",
-      f_SXM_USERNAME: "sxm-user",
-      f_SXM_PASSWORD: "sxm-pass",
+      f_APP_USERNAME: "app-user",
+      f_APP_PASSWORD: "app-pass",
     });
     expect(res.status).toBe(200);
 
@@ -116,8 +116,8 @@ describe("credential hand-off — multi-field mode", () => {
     expect(item.collectionName).toBe("Homelab");
     expect(item.fields).toEqual([
       { name: "DISCORD_BOT_TOKEN", value: "discord-value", hidden: true },
-      { name: "SXM_USERNAME", value: "sxm-user", hidden: false },
-      { name: "SXM_PASSWORD", value: "sxm-pass", hidden: true },
+      { name: "APP_USERNAME", value: "app-user", hidden: false },
+      { name: "APP_PASSWORD", value: "app-pass", hidden: true },
     ]);
     // Not an SSH password login: no login password / ssh:// URI mislabeling.
     expect(item.password).toBeUndefined();
@@ -137,7 +137,7 @@ describe("credential hand-off — multi-field mode", () => {
   it("promotes a field literally named 'username' to the item's login username", async () => {
     const req = app.credentialRequests.create({
       name: "app-creds",
-      host: "fly-app",
+      host: "example-app",
       fields: [
         { name: "username", secret: false },
         { name: "API_KEY", secret: true },
@@ -156,23 +156,23 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("requires every field and stays claimable after the rejection", async () => {
-    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "example-app", fields: FIELDS, reason: "migrate" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
       totp: generateTotpCode(TOTP_SECRET),
       f_DISCORD_BOT_TOKEN: "discord-value",
-      f_SXM_USERNAME: "sxm-user",
+      f_APP_USERNAME: "app-user",
     });
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain("SXM_PASSWORD");
+    expect(await res.text()).toContain("APP_PASSWORD");
     expect(created).toHaveLength(0);
     expect(app.credentialRequests.get(req.id).status).toBe("pending");
   });
 
   it("is TOTP-gated and CSRF-gated like the single-secret form", async () => {
-    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
-    const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
+    const req = app.credentialRequests.create({ name: "example-bot", host: "example-app", fields: FIELDS, reason: "migrate" });
+    const values = { f_DISCORD_BOT_TOKEN: "a", f_APP_USERNAME: "b", f_APP_PASSWORD: "c" };
 
     const noCsrf = await postForm(req.id, { formToken: "wrong", action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values });
     expect(noCsrf.status).toBe(403);
@@ -185,8 +185,8 @@ describe("credential hand-off — multi-field mode", () => {
   });
 
   it("is single-use — a replay of the same link cannot write a second item", async () => {
-    const req = app.credentialRequests.create({ name: "example-bot", host: "fly-app", fields: FIELDS, reason: "migrate" });
-    const values = { f_DISCORD_BOT_TOKEN: "a", f_SXM_USERNAME: "b", f_SXM_PASSWORD: "c" };
+    const req = app.credentialRequests.create({ name: "example-bot", host: "example-app", fields: FIELDS, reason: "migrate" });
+    const values = { f_DISCORD_BOT_TOKEN: "a", f_APP_USERNAME: "b", f_APP_PASSWORD: "c" };
     const body = { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), ...values };
     expect((await postForm(req.id, body)).status).toBe(200);
     const replay = await postForm(req.id, body);
@@ -229,7 +229,7 @@ describe("credential hand-off — single-secret mode (unchanged)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Hardening after the Discord migration: per-field shape validation, a pre-store
+// Credential hardening: per-field shape validation, a pre-store
 // verification probe, overwrite-in-place, fingerprints, and the pending-links
 // admin endpoint. Throughout: submitted values never appear in a page, the
 // request store, or the audit log.
@@ -254,7 +254,7 @@ describe("credential hand-off — per-field validation", () => {
   ];
 
   it("renders the hint and pattern/minlength attributes under each constrained input", async () => {
-    const req = app.credentialRequests.create({ name: "coworker-bot", host: "discord", fields, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "discord", fields, reason: "migrate" });
     const html = await (await fetch(`${root}/credential/${req.id}`)).text();
     expect(html).toContain("NOT the OAuth2 Client Secret");
     expect(html).toContain("Copy Server ID");
@@ -264,7 +264,7 @@ describe("credential hand-off — per-field validation", () => {
   });
 
   it("rejects a value that fails its pattern (400), names the field + hint, never echoes the value, and stays claimable", async () => {
-    const req = app.credentialRequests.create({ name: "coworker-bot", host: "discord", fields, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "discord", fields, reason: "migrate" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
@@ -284,7 +284,7 @@ describe("credential hand-off — per-field validation", () => {
   });
 
   it("accepts values that satisfy their constraints", async () => {
-    const req = app.credentialRequests.create({ name: "coworker-bot", host: "discord", fields, reason: "migrate" });
+    const req = app.credentialRequests.create({ name: "example-bot", host: "discord", fields, reason: "migrate" });
     const res = await postForm(req.id, {
       formToken: req.formToken,
       action: "submit",
@@ -424,7 +424,7 @@ describe("credential hand-off — overwrite an existing item in place", () => {
       return { id: "item-id", name: ref };
     });
     const req = app.credentialRequests.create({
-      name: "coworker-bot",
+      name: "example-bot",
       host: "discord",
       fields: [{ name: "DISCORD_BOT_TOKEN", secret: true }],
       reason: "fix wrong token",
@@ -443,7 +443,7 @@ describe("credential hand-off — overwrite an existing item in place", () => {
     expect(await res.text()).toContain("Updated");
     expect(created).toHaveLength(0);
     expect(updates).toEqual([
-      { ref: "coworker-bot", patch: { username: undefined, password: undefined, fields: [{ name: "DISCORD_BOT_TOKEN", value: GOOD_TOKEN, hidden: true }] } },
+      { ref: "example-bot", patch: { username: undefined, password: undefined, fields: [{ name: "DISCORD_BOT_TOKEN", value: GOOD_TOKEN, hidden: true }] } },
     ]);
     const entry = app.audit.recent(10).find((e: any) => e.tool === "credential.provide");
     expect(entry.detail).toContain("updated");

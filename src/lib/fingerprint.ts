@@ -5,9 +5,9 @@ import type { AppState } from "../app.js";
 /**
  * Keyed value fingerprints — a way to tell whether two secrets are the SAME
  * value without revealing either. Used to compare what landed in the vault with
- * what a stack was deployed with (the coworker-bot migration carried a wrong
- * credential through two vault round-trips and a deploy before anyone noticed;
- * comparing fingerprints would have caught it in seconds).
+ * what a stack was deployed with (a wrong credential can survive several vault
+ * round-trips and a deploy unnoticed; comparing fingerprints catches it in
+ * seconds).
  *
  * The fingerprint is `len=<n> fp=<8 hex>` where the hex is the prefix of an
  * HMAC-SHA256 under a per-install key held in the encrypted bootstrap store.

@@ -22,12 +22,12 @@ import {
  * Uptime Kuma connector — monitor inventory and **notification suppression**.
  *
  * Why it exists: game servers are often watched by Uptime Kuma monitors
- * that post "X is DOWN / UP" to Discord. Every deliberate bounce (a test boot, a
+ * that post "X is DOWN / UP" to a chat channel. Every deliberate bounce (a test boot, a
  * mod install, a world swap) therefore pages the whole channel unless the
  * monitors are paused first. This connector makes that pause/resume a first-
  * class, audited, approval-gated action — and the Pelican connector's
  * `power_action` drives it automatically via `suppressMonitors` (the
- * **white-glove rule**, see `docs/ARCHITECTURE.md`).
+ * **white-glove** suppression, see `docs/ARCHITECTURE.md`).
  *
  * Transport: socket.io, because Kuma has no REST API for monitor control (see
  * `client.ts`). The vault item holds a Kuma **login** (username +
@@ -290,8 +290,8 @@ export function summarizeStatus(target: string, m: KumaMonitor, beats: KumaBeat[
 const ok = (text: string): ToolResult => ({ text });
 
 const WHITE_GLOVE =
-  "WHITE-GLOVE RULE: before any MANUAL (out-of-schedule) start/stop/restart/reinstall/world swap of a monitored game server, or a reboot of its node, pause its monitors " +
-  "and resume them once the action is verified — otherwise Discord gets 'DOWN/UP' posts for a deliberate bounce. Scheduled starts/stops must NOT be suppressed; those alerts are the feature. " +
+  "White-glove suppression: around a MANUAL (out-of-schedule) start/stop/restart/reinstall/world swap of a monitored game server, or a reboot of its node, pause its monitors " +
+  "and resume them once the action is verified, so a deliberate bounce raises no DOWN/UP alerts. Scheduled starts/stops are never suppressed; those alerts are the feature. " +
   "For a Pelican power action prefer power_action with suppressMonitors:true, which does the pause → act → verify → resume cycle itself.";
 
 /**

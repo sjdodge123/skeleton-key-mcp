@@ -95,7 +95,7 @@ export interface ToolContext {
   /**
    * Every registered target of ONE connector type — for a connector that must
    * find a *service* rather than a name it was told. The motivating case is the
-   * white-glove rule: a manual Pelican power action has to find the registered
+   * white-glove monitor suppression: a manual Pelican power action has to find the registered
    * Uptime Kuma instance so it can silence that server's monitors around the
    * bounce, and the operator should not have to wire the two together by hand
    * when there is exactly one.

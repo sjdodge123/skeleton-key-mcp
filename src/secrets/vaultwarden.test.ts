@@ -193,13 +193,13 @@ describe("buildLoginItemJson", () => {
     const item = buildLoginItemJson({
       name: "example-bot",
       username: "svc-account",
-      notes: "migrated off fly.io",
+      notes: "migrated",
       organizationId: "org-1",
       collectionId: "col-1",
       fields: [
         { name: "DISCORD_BOT_TOKEN", value: "d", hidden: true },
-        { name: "SXM_USERNAME", value: "svc-account", hidden: false },
-        { name: "SXM_PASSWORD", value: "p", hidden: true },
+        { name: "APP_USERNAME", value: "svc-account", hidden: false },
+        { name: "APP_PASSWORD", value: "p", hidden: true },
       ],
     }) as any;
 
@@ -207,8 +207,8 @@ describe("buildLoginItemJson", () => {
     expect(item.login.uris).toEqual([]); // not an SSH login — no mislabeled URI
     expect(item.fields).toEqual([
       { name: "DISCORD_BOT_TOKEN", value: "d", type: 1 },
-      { name: "SXM_USERNAME", value: "svc-account", type: 0 },
-      { name: "SXM_PASSWORD", value: "p", type: 1 },
+      { name: "APP_USERNAME", value: "svc-account", type: 0 },
+      { name: "APP_PASSWORD", value: "p", type: 1 },
     ]);
   });
 
@@ -304,7 +304,7 @@ describe("getCredential options", () => {
 describe("mergeLoginItem", () => {
   const item = {
     id: "id-1",
-    name: "coworker-bot",
+    name: "example-bot",
     organizationId: "org",
     collectionIds: ["col"],
     notes: "keep me",
@@ -323,7 +323,7 @@ describe("mergeLoginItem", () => {
       ],
     }) as any;
     expect(merged.id).toBe("id-1");
-    expect(merged.name).toBe("coworker-bot");
+    expect(merged.name).toBe("example-bot");
     expect(merged.collectionIds).toEqual(["col"]);
     expect(merged.notes).toBe("keep me");
     expect(merged.login).toEqual(item.login);
@@ -345,15 +345,15 @@ describe("mergeLoginItem", () => {
 
 describe("updateLoginItem", () => {
   it("resolves the ref, fetches the full item, and feeds the merged JSON to `bw edit item <id>` on stdin", async () => {
-    const full = { id: "id-1", name: "coworker-bot", notes: "n", login: { username: "u" }, fields: [{ name: "DISCORD_BOT_TOKEN", value: "wrong", type: 1 }] };
+    const full = { id: "id-1", name: "example-bot", notes: "n", login: { username: "u" }, fields: [{ name: "DISCORD_BOT_TOKEN", value: "wrong", type: 1 }] };
     const { client, calls } = clientWithItems([full]);
     const stdinCalls: { args: string[]; input: string }[] = [];
     (client as any).runWithStdin = async (args: string[], input: string) => {
       stdinCalls.push({ args, input });
       return "";
     };
-    const result = await client.updateLoginItem("coworker-bot", { fields: [{ name: "DISCORD_BOT_TOKEN", value: "right", hidden: true }] });
-    expect(result).toEqual({ id: "id-1", name: "coworker-bot" });
+    const result = await client.updateLoginItem("example-bot", { fields: [{ name: "DISCORD_BOT_TOKEN", value: "right", hidden: true }] });
+    expect(result).toEqual({ id: "id-1", name: "example-bot" });
     expect(stdinCalls).toHaveLength(1);
     expect(stdinCalls[0]!.args).toEqual(["edit", "item", "id-1"]);
     const payload = JSON.parse(Buffer.from(stdinCalls[0]!.input, "base64").toString());

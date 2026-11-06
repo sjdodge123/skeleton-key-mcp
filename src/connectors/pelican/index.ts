@@ -94,7 +94,7 @@ const optionsSchema = z
     /**
      * Name of the registered **uptime-kuma** target whose monitors watch this
      * panel's game servers — for `power_action`'s `suppressMonitors` (the
-     * white-glove rule). Optional: with exactly one uptime-kuma target
+     * white-glove monitor suppression). Optional: with exactly one uptime-kuma target
      * registered it is found automatically; this disambiguates when there are
      * several.
      */
@@ -2569,10 +2569,10 @@ async function wingsUpdate(ctx: ToolContext, input: { expectVersion: string; tag
 
 // --- White-glove power actions ---------------------------------------------------
 //
-// The owner's game servers are watched by Uptime Kuma monitors that post
-// "X is DOWN / UP" to Discord. A deliberate bounce (test boot, mod install,
+// Game servers are often watched by Uptime Kuma monitors that post
+// "X is DOWN / UP" to a chat channel. A deliberate bounce (test boot, mod install,
 // world swap) therefore pages the channel unless the monitors are paused first.
-// The **white-glove rule**: a MANUAL power action on a monitored server pauses
+// **White-glove suppression**: a MANUAL power action on a monitored server pauses
 // its monitors, acts, waits until the server reports the expected state, and
 // resumes them — in every case, including failure, because a monitor left
 // paused is a blind spot nobody asked for. Scheduled starts/stops (Pelican
@@ -2653,8 +2653,8 @@ async function monitorsTargetFor(ctx: ToolContext): Promise<{ target: Target; cr
     const all = ctx.targetsOfType("uptime-kuma");
     if (all.length === 0) {
       throw new Error(
-        `suppressMonitors was requested but no uptime-kuma target is registered, so nothing could be silenced. The white-glove rule says a monitored game server is ` +
-          `not bounced without suppression, so this refuses rather than proceeding noisily. Register the Uptime Kuma instance (register_target type 'uptime-kuma'), ` +
+        `suppressMonitors was requested but no uptime-kuma target is registered, so nothing could be silenced. A requested suppression ` +
+          `is never silently skipped, so this refuses rather than proceeding noisily. Register the Uptime Kuma instance (register_target type 'uptime-kuma'), ` +
           `or — only if this server is genuinely unmonitored — run power_action without suppressMonitors.`,
       );
     }
@@ -3236,10 +3236,10 @@ function buildTools(target: Target): ConnectorTool[] {
       description:
         `Start, stop, restart or kill a Pelican server on ${target.name}. 'kill' terminates the process ungracefully and can lose ` +
         `unsaved world state — prefer 'stop'. Power changes are asynchronous; confirm with server_resources. ` +
-        `WHITE-GLOVE RULE — pass suppressMonitors:true for any MANUAL (out-of-schedule) action on a server that Uptime Kuma monitors: it finds the registered ` +
+        `White-glove monitor suppression — pass suppressMonitors:true for a MANUAL (out-of-schedule) action on a server that Uptime Kuma monitors: it finds the registered ` +
         `uptime-kuma target, pauses every monitor matching this server (tag '${MANAGED_PELICAN_TAG}' + the server's name, or a tag naming the server), performs the action, ` +
         `waits up to waitSeconds (default ${POWER_WAIT.defaultSeconds}) for server_resources to report the expected state, and resumes the monitors in every case ` +
-        `including failure — so Discord never gets 'DOWN/UP' posts for a deliberate bounce. It refuses, and sends nothing, when no uptime-kuma target or no matching ` +
+        `including failure — so a deliberate bounce raises no DOWN/UP alerts. It refuses, and sends nothing, when no uptime-kuma target or no matching ` +
         `monitor exists. Scheduled starts/stops run inside the panel and are never suppressed — those alerts are the feature.`,
       tier: "execute",
       inputSchema: z.object({
@@ -3248,7 +3248,7 @@ function buildTools(target: Target): ConnectorTool[] {
         suppressMonitors: z
           .boolean()
           .optional()
-          .describe("White-glove: pause this server's Uptime Kuma monitors around the action and resume them after. Required for manual actions on monitored game servers; never for scheduled ones."),
+          .describe("White-glove: pause this server's Uptime Kuma monitors around the action and resume them after. Meant for manual actions on monitored game servers; never for scheduled ones."),
         waitSeconds: z
           .number()
           .int()
