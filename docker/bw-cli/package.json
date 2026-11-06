@@ -1,0 +1,13 @@
+{
+  "name": "skeleton-key-bw-cli",
+  "private": true,
+  "description": "The Bitwarden CLI as installed in the runtime image, with a lock file so the install is reproducible. Keep @bitwarden/cli in step with the Vaultwarden server version; overrides pin patched transitive dependencies until upstream picks them up.",
+  "dependencies": {
+    "@bitwarden/cli": "2026.9.1"
+  },
+  "overrides": {
+    "node-forge": "^1.4.3",
+    "multer": "^2.5.0",
+    "tmp": "^0.2.6"
+  }
+}
