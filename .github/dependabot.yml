@@ -22,6 +22,19 @@ updates:
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
+  # The Bitwarden CLI baked into the runtime image (docker/bw-cli). A stale CLI
+  # breaks vault writes once the Vaultwarden server moves ahead of it, so take
+  # these updates promptly; drop an override in package.json once upstream
+  # ships the patched dependency itself.
+  - package-ecosystem: npm
+    directory: /docker/bw-cli
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
