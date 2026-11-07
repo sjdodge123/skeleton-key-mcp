@@ -149,6 +149,10 @@ export function httpProbe(
       }
       resolve(v);
     };
+    // Certificate checks are off for this probe on purpose: almost every LAN
+    // appliance serves a self-signed certificate, and the probe only reads the
+    // landing page to fingerprint the service. It sends no credentials, and
+    // nothing it receives is trusted beyond picking a connector type.
     const req = mod.request(
       { host, port, path: "/", method: "GET", timeout: timeoutMs, rejectUnauthorized: false, headers: { "user-agent": "skeleton-key-scan" } },
       (res) => {
