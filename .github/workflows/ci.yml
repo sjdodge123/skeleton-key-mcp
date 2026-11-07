@@ -117,9 +117,10 @@ jobs:
           image: skeleton-key:ci
           only-fixed: true
           severity-cutoff: critical
-          # Report-only until the baseline is clean; then flip to true so a PR
-          # that introduces a fixable critical CVE fails.
-          fail-build: false
+          # The baseline is clean, so a fixable critical CVE in the image fails
+          # this required check. Lower-severity findings still land as code
+          # scanning alerts without blocking.
+          fail-build: true
           output-format: sarif
 
       - name: Upload scan results
