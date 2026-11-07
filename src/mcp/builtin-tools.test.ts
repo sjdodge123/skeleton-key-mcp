@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import type { AppState } from "../app.js";
 import type { Target } from "../connectors/types.js";
 import { buildGlobalTools } from "./builtin-tools.js";
+import { SERVER_VERSION } from "../version.js";
 import { scanLan } from "../discovery/scan.js";
 import { CredentialRequestStore } from "../web/credential-requests.js";
 
@@ -39,6 +40,24 @@ describe("global tool registry", () => {
     expect(t.tier).toBe("execute");
     expect(typeof t.confirm).toBe("function");
     expect(t.availableWhenLocked).toBeFalsy();
+  });
+});
+
+describe("get_started", () => {
+  const run = (app: Partial<AppState>) => byName.get("get_started")!.run({}, app as AppState);
+
+  it("reports the running version once unlocked, so an agent can tell whether an update exists", async () => {
+    const empty = await run({ locked: false, registry: { list: () => [] } } as unknown as Partial<AppState>);
+    expect(empty.text).toContain(`Skeleton Key v${SERVER_VERSION}.`);
+    const some = await run({ locked: false, registry: { list: () => [{ name: "nas1", type: "ssh", host: "10.0.0.5" }] } } as unknown as Partial<AppState>);
+    expect(some.text).toContain(`Skeleton Key v${SERVER_VERSION}.`);
+    expect(some.text).toContain("nas1 (ssh)");
+  });
+
+  it("shows only the unlock guidance while locked", async () => {
+    const locked = await run({ locked: true, unlockGuidance: () => "Locked: unlock at the web UI." } as unknown as Partial<AppState>);
+    expect(locked.text).toContain("Locked: unlock at the web UI.");
+    expect(locked.text).not.toContain("target(s) registered");
   });
 });
 

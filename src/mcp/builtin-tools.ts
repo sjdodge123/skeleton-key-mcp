@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../lib/ssh-keygen.js";
+import { SERVER_VERSION } from "../version.js";
 import { scanLan } from "../discovery/scan.js";
 import { assertKnownOptionKeys, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
 import { runSsh, shellQuote } from "../connectors/shared/ssh-exec.js";
@@ -209,9 +210,11 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
               "Until then, no targets or tools are available. Once unlocked, call get_started again to see what's registered.",
           );
         }
+        const version = `Skeleton Key v${SERVER_VERSION}.\n\n`;
         const targets = a.registry.list();
         if (targets.length === 0) {
           return ok(
+            version +
             "No targets are registered yet — nothing to manage until you add some.\n\n" +
               "Recommended onboarding (offer to do this with the user):\n" +
               "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services. If it finds the router/gateway (e.g. UniFi), start there — its API names every other device on the network, so the rest of the scan stops being anonymous IPs.\n" +
@@ -226,6 +229,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         }
         const lines = targets.map((t) => `- ${t.name} (${t.type}) → ${t.host}`);
         return ok(
+          version +
           `${targets.length} target(s) registered:\n${lines.join("\n")}\n\n` +
             "Their per-target tools (e.g. ssh.<name>.tail_log) are available. " +
             "Use network_scan to find more, or list_targets / vault_list_credentials to review.",

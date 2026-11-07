@@ -23,10 +23,11 @@ Unknown options are refused at registration.
 The authoritative list (tiers and inputs) is [`tools.manifest.json`](../../../tools.manifest.json).
 
 - **read:** `list_endpoints`, `list_containers`, `container_logs`, `list_stacks`, `container_inspect`, `get_stack_file`
-- **execute** (approval-gated, audited): `restart_container`, `stop_container`, `start_container`, `create_stack`, `update_stack`, `remove_stack`, `exec_container`
+- **execute** (approval-gated, audited): `restart_container`, `stop_container`, `start_container`, `create_stack`, `update_stack`, `update_stack_images`, `remove_stack`, `exec_container`
 - **snapshot:** contributes artifacts to `form_skeleton` disaster-recovery snapshots.
 
 ## Safety notes
 
 - Stack secrets go in `secretEnv` as vault item references, resolved at deploy time; values never reach the chat, a tool result or an error. Reads report env var **names** with redacted values, plus keyed fingerprints for comparison.
 - `remove_stack` only removes stacks Skeleton Key created.
+- `update_stack_images` re-pulls and redeploys a stack without touching its compose file or env, so it is allowed on any stack. It is how an agent updates Skeleton Key itself when its stack runs on a registered Portainer.

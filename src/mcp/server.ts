@@ -7,6 +7,7 @@ import {
 import { z } from "zod";
 import type { AppState } from "../app.js";
 import { resolveTools, findTool } from "./tool-registry.js";
+import { SERVER_VERSION } from "../version.js";
 import { annotationsFor, confirmationText, EXECUTE_DISABLED } from "./approval.js";
 
 /**
@@ -31,6 +32,8 @@ const SERVER_INSTRUCTIONS = [
   "",
   "Game servers (Pelican) — monitor suppression (\"white-glove\"): when Uptime Kuma monitors a server, a MANUAL start/stop/restart can pass `suppressMonitors: true` to `power_action`, which pauses the server's monitors (tag managed:pelican + name), acts, waits for server_resources to report the expected state, and resumes them even on failure — so a deliberate bounce doesn't raise DOWN/UP alerts. For any other window (node reboot, reinstall, world swap) the uptime-kuma `maintenance` → `end_maintenance` pair does the same. Scheduled starts/stops are never suppressed. Whether to suppress is the deployment's policy; follow the operator's instructions when they have one.",
   "",
+  "Updating Skeleton Key itself: `get_started` reports the running version. Compare it with the latest release at https://github.com/sjdodge123/skeleton-key-mcp/releases (check that yourself; the server never phones home) and summarize what changed. To update, find the Portainer stack that runs ghcr.io/sjdodge123/skeleton-key-mcp (a registered Portainer target's `list_stacks` / `list_containers`) and call `update_stack_images` on it — it re-pulls the image and redeploys without touching the compose file or env. If the operator runs Watchtower instead, `exec_container` on the watchtower container with `/watchtower --run-once <container name>` does the same. Either call drops while the server restarts: don't retry it. Wait ~30 s, then call `get_started` to confirm the new version; if it reports the vault locked, the operator unlocks it in the web UI (or enables boot auto-unlock).",
+  "",
   "Before risky changes: `form_skeleton` starts an encrypted config snapshot of every target as a BACKGROUND job and returns a job id — poll `skeleton_status`; never re-call `form_skeleton` because a call seemed slow (a second call while one runs just returns the same job).",
   "",
   "Never ask the user to paste a password, token, or private key into the chat — always route secrets through `request_credential` or the web UI. Tool tiers: 'read' tools are safe; 'execute' tools change state and require the user's approval. Credentials come from a scoped vault; you cannot see their personal passwords.",
@@ -47,8 +50,8 @@ const SERVER_INSTRUCTIONS = [
  */
 export const PROGRESS_HEARTBEAT_MS = 5_000;
 
-/** The version advertised to MCP clients. Kept equal to package.json by a test. */
-export const SERVER_VERSION = "0.4.0";
+/** Re-exported for callers that already import it from here. */
+export { SERVER_VERSION } from "../version.js";
 
 /**
  * The JSON Schema a client sees for a tool's input. `io: "input"` describes what

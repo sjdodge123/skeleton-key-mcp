@@ -334,6 +334,31 @@ class Portainer {
     );
   }
 
+  /** Re-pull a stack's images and redeploy it with its compose file and
+   *  environment exactly as they are — the update path for a stack that tracks
+   *  a moving tag such as `:latest`. Nothing the caller sends reaches the
+   *  compose file or env, so this is safe on human-authored stacks too. */
+  async updateStackImages(id: number, expectedName: string): Promise<string> {
+    const cur = await this.get<PortainerStack>(`/api/stacks/${id}`);
+    if (cur.Name !== expectedName) {
+      throw new Error(`Refusing to update stack #${id}: it is named '${cur.Name}', not '${expectedName}'. Re-check the id with list_stacks.`);
+    }
+    const file = await this.stackFile(id);
+    const env = cur.Env ?? [];
+    const res = await this.fetch(`/api/stacks/${id}?endpointId=${cur.EndpointId}`, {
+      method: "PUT",
+      body: { stackFileContent: file, env, prune: false, pullImage: true },
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} updating images of stack #${id}: ${redactSecrets(res.text.slice(0, 400), env.map((e) => e.value))}`);
+    }
+    const images = composeImages(file);
+    return (
+      `Stack '${cur.Name}' (#${id}) redeployed with freshly pulled images${images.length ? ` (${images.join(", ")})` : ""}; ` +
+      `compose file and environment unchanged.`
+    );
+  }
+
   /** Delete a stack and its containers. Guarded: only stacks carrying the
    *  skeleton-key managed marker in their compose file can be removed. */
   async removeStack(id: number, expectedName: string): Promise<string> {
@@ -738,6 +763,27 @@ function buildTools(target: Target): ConnectorTool[] {
         const result = await p.updateStack(i.stackId, i.stackFileContent, i.pullImage, i.env ?? [], secret);
         return result + (await secretFingerprintBlock(secret, ctx.fingerprint));
       }),
+    },
+    {
+      name: "update_stack_images",
+      description:
+        `Update a Portainer stack on ${target.name} to the newest images for the tags it already uses: re-pull and redeploy, ` +
+        `with its compose file and environment left exactly as they are (use update_stack to change those). Works on any stack, ` +
+        `including one Skeleton Key did not create. If the stack runs Skeleton Key itself, this call drops while the server ` +
+        `restarts — do not retry it; wait ~30 s and call get_started to confirm the new version.`,
+      tier: "execute",
+      inputSchema: z.object({
+        stackId: z.number().int().positive(),
+        stackName: z.string().min(1).describe("The stack's name, as shown by list_stacks. Verified against the id before redeploying."),
+      }),
+      confirm: (input, t) => {
+        const i = input as { stackId: number; stackName: string };
+        return (
+          `Pull the newest images and redeploy Portainer stack '${i.stackName}' (#${i.stackId}) on ${t.name} — ` +
+          `recreates its containers; compose file and environment unchanged`
+        );
+      },
+      run: run((p, i) => p.updateStackImages(i.stackId, i.stackName)),
     },
     {
       name: "remove_stack",
