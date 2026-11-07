@@ -481,6 +481,50 @@ describe("env redaction on read paths", () => {
   });
 });
 
+describe("update_stack_images", () => {
+  it("re-pulls and redeploys with the stack's own compose file and env", async () => {
+    const compose = "services:\n  app:\n    image: ghcr.io/example/app:latest";
+    const calls = mockFetch([
+      { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "app", EndpointId: 2, Env: [{ name: "TOKEN", value: "s3cr3t" }] } } },
+      { match: (u) => u.includes("/api/stacks/3/file"), reply: { json: { StackFileContent: compose } } },
+      { match: (u, i) => u.includes("/api/stacks/3?endpointId=2") && i.method === "PUT", reply: { json: {} } },
+    ]);
+    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+    expect(res.isError).toBeFalsy();
+    const put = calls.find((c) => c.init.method === "PUT")!;
+    expect(JSON.parse(put.init.body)).toEqual({ stackFileContent: compose, env: [{ name: "TOKEN", value: "s3cr3t" }], prune: false, pullImage: true });
+    expect(res.text).toContain("ghcr.io/example/app:latest");
+    expect(res.text).toMatch(/compose file and environment unchanged/);
+    expect(res.text).not.toContain("s3cr3t");
+  });
+
+  it("refuses when the given name does not match the id", async () => {
+    const calls = mockFetch([
+      { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "other", EndpointId: 2 } } },
+    ]);
+    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/named 'other'/);
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(false);
+  });
+
+  it("scrubs the stack's env values from a Portainer error", async () => {
+    mockFetch([
+      { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "app", EndpointId: 2, Env: [{ name: "TOKEN", value: "s3cr3t" }] } } },
+      { match: (u) => u.includes("/api/stacks/3/file"), reply: { json: { StackFileContent: "services: {}" } } },
+      { match: (u, i) => u.includes("/api/stacks/3?endpointId=2") && i.method === "PUT", reply: { status: 500, json: { message: "pull failed for TOKEN=s3cr3t" } } },
+    ]);
+    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+    expect(res.isError).toBe(true);
+    expect(res.text).not.toContain("s3cr3t");
+  });
+
+  it("names the stack, the target and what stays unchanged in the confirm text", () => {
+    const text = tool("update_stack_images").confirm!({ stackId: 3, stackName: "app" }, target({ endpointId: 1 }));
+    expect(text).toBe("Pull the newest images and redeploy Portainer stack 'app' (#3) on nas — recreates its containers; compose file and environment unchanged");
+  });
+});
+
 describe("remove_stack", () => {
   it("refuses a stack whose compose file has no skeleton-key marker", async () => {
     const calls = mockFetch([

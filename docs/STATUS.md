@@ -48,7 +48,8 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
   quote-aware read-only allowlist for `run_readonly`.
 - `http` — generic REST reads and gated requests.
 - `portainer` — containers, stacks, inspect, logs; `create_stack` / `update_stack` with
-  `secretEnv` resolved server-side; `remove_stack` only for stacks Skeleton Key created.
+  `secretEnv` resolved server-side; `remove_stack` only for stacks Skeleton Key created; `update_stack_images` re-pulls and redeploys any
+  stack unchanged, which is how an agent updates Skeleton Key itself (`get_started` reports the version).
 - `unifi` — UniFi OS gateways: devices, clients, networks, scrubbed settings; surgical
   revertable writes (gateway features, per-network IPv6, remote logging, port forwards,
   force-provision).

@@ -687,6 +687,15 @@
           ]
         },
         {
+          "name": "update_stack_images",
+          "tier": "execute",
+          "confirm": true,
+          "inputs": [
+            "stackId",
+            "stackName"
+          ]
+        },
+        {
           "name": "remove_stack",
           "tier": "execute",
           "confirm": true,
