@@ -72,7 +72,7 @@ USER node
 
 EXPOSE 8787
 # Liveness probe of /healthz; see docker/healthcheck.mjs for the scheme fallback
-# and why it skips certificate checks for its one localhost request.
+# and how it verifies the server's own certificate.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD ["node", "healthcheck.mjs"]
 
