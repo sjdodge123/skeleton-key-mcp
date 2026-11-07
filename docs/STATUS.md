@@ -4,7 +4,7 @@ Where the project stands and what's next. Update it as work lands. For the modul
 `docs/ARCHITECTURE.md`; for product scope and the security model see `docs/SCOPE.md`; for
 rules and commands see `CLAUDE.md`. Per-release detail lives in the GitHub releases and PRs.
 
-_Last updated: 2026-11-05 (v0.4.0)._
+_Last updated: 2026-11-07._
 
 ## TL;DR
 
@@ -70,6 +70,10 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
 - Apache-2.0, security policy, issue/PR templates, CODEOWNERS, rulesets on `main`.
 - CI: typecheck, tests, build, CodeQL, dependency review, image build + scan, workflow lint,
   signed images.
+- Code-scanning baseline is clean: the bundled Bitwarden CLI installs from a lock file with
+  patched dependencies, the runtime image carries no npm/yarn, and the base image is pinned
+  by digest. Typecheck/test/build, workflow lint, dependency review, the image build + scan
+  (fails on a fixable critical CVE) and CodeQL are all required checks.
 - `check-homelab-data` keeps real hostnames and addresses out of tracked files, commits and
   PR text (git hooks plus the required CI check).
 - Phase 2 contributor tooling (v0.4.0): connector folders, `tools.manifest.json` with a
@@ -80,29 +84,24 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
 
 Roughly in priority order.
 
-1. **Code-scanning triage.** Work through the open CodeQL and image-scan alerts: fix or dismiss
-   each with a written reason (the rate-limiting and user-controlled-bypass findings on the
-   OAuth and credential routes, clear-text logging, the scan's TLS opt-out, Dockerfile pinning,
-   CVEs in the bundled `bw` CLI). Then make CodeQL, dependency review and the image scan
-   required checks.
-2. **Phase 3 — pluggable secret providers.** A `SecretsProvider` interface so vaults other
+1. **Phase 3 — pluggable secret providers.** A `SecretsProvider` interface so vaults other
    than Vaultwarden can back a deployment, with the scoping guarantee stated per provider.
-3. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
+2. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
    hypervisors, routers and NAS, checked by the conformance suite.
-4. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and
+3. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and
    reusable allowlist packs for the SSH connector.
-5. **New connectors.** `synology` (DSM Web API, multi-host incl. VirtualDSM) and `pihole`
+4. **New connectors.** `synology` (DSM Web API, multi-host incl. VirtualDSM) and `pihole`
    (stats, blocklists); discovery already detects both and falls back to `http` today.
-6. **Admin console.** Grow the web UI past the first-run wizard: audit-log viewer, target CRUD,
+5. **Admin console.** Grow the web UI past the first-run wizard: audit-log viewer, target CRUD,
    OAuth client list/revoke, token rotation, vault re-unlock, and a snapshots page to list and
    download DR skeletons ([#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50)).
-7. **Dry-run for execute tools**, starting with a compose preview for `create_stack` /
+6. **Dry-run for execute tools**, starting with a compose preview for `create_stack` /
    `update_stack`.
-8. **Monitor-suppression audit detail.** `power_action … suppressMonitors` pauses and resumes
+7. **Monitor-suppression audit detail.** `power_action … suppressMonitors` pauses and resumes
    monitors on the uptime-kuma target under the Pelican tool's single approval; the audit row
    records the call but not which monitor ids were touched. A per-pause/resume audit row
    would close the gap.
-9. **Smaller follow-ups.**
+8. **Smaller follow-ups.**
    - The web-UI target form doesn't pin `credentialId` (it pins lazily on first read).
    - `verify` URLs over plain http are allowed for literal LAN IPs only, not LAN hostnames.
    - `overwrite` replaces named fields but never removes stale ones.
