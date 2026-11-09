@@ -1,4 +1,5 @@
 import { z } from "zod";
+import * as yaml from "js-yaml";
 import type { Connector, ConnectorTool, Credential, SnapshotArtifact, Target, ToolContext, ToolResult } from "../types.js";
 import { deriveBaseUrl, tlsFetch } from "../shared/net.js";
 // Vault-backed secret injection lives in one place now that Pelican needs it too.
@@ -107,6 +108,97 @@ export function composeImages(compose: string): string[] {
   return found;
 }
 
+/** Expand compose `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `$VAR` and `$$`
+ *  against the stack's substitution env, the way Compose does (unset → ""). */
+export function interpolateCompose(value: string, vars: Map<string, string>): string {
+  return value.replace(/\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?-)([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, braced, op, def, bare) => {
+    if (m === "$$") return "$";
+    const name = (braced ?? bare) as string;
+    const v = vars.get(name);
+    if (op === ":-") return v ? v : (def as string);
+    if (op === "-") return v !== undefined ? v : (def as string);
+    return v ?? "";
+  });
+}
+
+/** What one compose service's `environment:` would set. `envFile` marks a
+ *  service that also loads an env_file, whose contents we cannot see. */
+export interface DeclaredEnv {
+  env: Map<string, string>;
+  envFile: boolean;
+}
+
+/**
+ * The environment each service of a compose file would get, after `${VAR}`
+ * substitution from the stack's env. Handles both the map and the list form; a
+ * bare `KEY` (or `KEY:` with no value) takes the substitution value and is
+ * left out when that is unset, as Compose does.
+ */
+export function composeServiceEnv(compose: string, stackEnv: EnvEntry[]): Map<string, DeclaredEnv> {
+  const vars = new Map(stackEnv.map((e) => [e.name, e.value]));
+  const doc = yaml.load(compose) as { services?: Record<string, { environment?: unknown; env_file?: unknown }> } | undefined;
+  const out = new Map<string, DeclaredEnv>();
+  for (const [service, def] of Object.entries(doc?.services ?? {})) {
+    const env = new Map<string, string>();
+    const put = (key: string, raw: unknown) => {
+      if (raw === null || raw === undefined) {
+        const v = vars.get(key);
+        if (v !== undefined) env.set(key, v);
+      } else {
+        env.set(key, interpolateCompose(String(raw), vars));
+      }
+    };
+    const e = def?.environment;
+    if (Array.isArray(e)) {
+      for (const item of e) {
+        const str = String(item);
+        const i = str.indexOf("=");
+        if (i < 0) put(str, null);
+        else put(str.slice(0, i), str.slice(i + 1));
+      }
+    } else if (e && typeof e === "object") {
+      for (const [k, v] of Object.entries(e as Record<string, unknown>)) put(k, v);
+    }
+    out.set(service, { env, envFile: def?.env_file !== undefined });
+  }
+  return out;
+}
+
+/** One environment variable a redeploy would change. */
+export interface EnvDrift {
+  name: string;
+  /** changed: both set, values differ · container-only: set on the running
+   *  container but nowhere in the stack file or image, so a redeploy drops it ·
+   *  stack-only: the stack file sets it, the running container doesn't have it. */
+  kind: "changed" | "container-only" | "stack-only";
+  running?: string;
+  declared?: string;
+}
+
+/**
+ * Compare a running container's env with what its stack file would set.
+ * Variables the image itself defines (PATH, NODE_VERSION, …) are not drift
+ * unless the container overrides them.
+ */
+export function envDrift(declared: DeclaredEnv, running: EnvEntry[], imageEnv: EnvEntry[]): EnvDrift[] {
+  const out: EnvDrift[] = [];
+  const image = new Map(imageEnv.map((e) => [e.name, e.value]));
+  const seen = new Set<string>();
+  for (const { name, value } of running) {
+    seen.add(name);
+    const want = declared.env.get(name);
+    if (want !== undefined) {
+      if (want !== value) out.push({ name, kind: "changed", running: value, declared: want });
+    } else if (image.get(name) !== value && !declared.envFile) {
+      out.push({ name, kind: "container-only", running: value });
+    }
+  }
+  for (const [name, value] of declared.env) {
+    if (!seen.has(name)) out.push({ name, kind: "stack-only", declared: value });
+  }
+  return out;
+}
+
 /** Stack names Portainer accepts, restricted to a shape that is also safe to
  *  interpolate into a URL/compose project name. */
 export const STACK_NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
@@ -166,6 +258,25 @@ export function parseDockerEnv(env: string[] | undefined): EnvEntry[] {
     const i = kv.indexOf("=");
     return i < 0 ? { name: kv, value: "" } : { name: kv.slice(0, i), value: kv.slice(i + 1) };
   });
+}
+
+/** One line per drifted variable: container, name and kind, with keyed
+ *  fingerprints of the running and stack-file values. Never a value. */
+async function describeDrift(drift: [string, EnvDrift][], fp?: Fingerprinter): Promise<string> {
+  const tag = async (v: string | undefined) => {
+    if (v === undefined) return "unset";
+    if (!fp) return "set";
+    try {
+      return await fp(v);
+    } catch {
+      return "set";
+    }
+  };
+  const lines: string[] = [];
+  for (const [container, d] of drift) {
+    lines.push(`- ${container}: ${d.name} (${d.kind}) — running ${await tag(d.running)}, stack file ${await tag(d.declared)}`);
+  }
+  return lines.join("\n");
 }
 
 /** Portainer client bound to one target — resolves auth lazily per call. */
@@ -337,14 +448,34 @@ class Portainer {
   /** Re-pull a stack's images and redeploy it with its compose file and
    *  environment exactly as they are — the update path for a stack that tracks
    *  a moving tag such as `:latest`. Nothing the caller sends reaches the
-   *  compose file or env, so this is safe on human-authored stacks too. */
-  async updateStackImages(id: number, expectedName: string): Promise<string> {
+   *  compose file or env, so this is safe on human-authored stacks too.
+   *
+   *  It refuses first when the redeploy would change a running container's
+   *  environment (a value edited on the container but never in the stack file
+   *  would silently revert), unless `allowEnvDrift` is set. */
+  async updateStackImages(id: number, expectedName: string, allowEnvDrift: boolean, fp?: Fingerprinter): Promise<string> {
     const cur = await this.get<PortainerStack>(`/api/stacks/${id}`);
     if (cur.Name !== expectedName) {
       throw new Error(`Refusing to update stack #${id}: it is named '${cur.Name}', not '${expectedName}'. Re-check the id with list_stacks.`);
     }
     const file = await this.stackFile(id);
     const env = cur.Env ?? [];
+    const drift = await this.stackEnvDrift(cur, file).catch((err: unknown) => {
+      if (allowEnvDrift) return null;
+      throw new Error(
+        `Could not compare stack '${cur.Name}' (#${id}) with its running containers (${err instanceof Error ? err.message : String(err)}), ` +
+          `so nothing was redeployed. Pass allowEnvDrift: true to redeploy without the check.`,
+      );
+    });
+    const report = drift?.length ? await describeDrift(drift, fp) : "";
+    if (report && !allowEnvDrift) {
+      throw new Error(
+        `Refusing to redeploy stack '${cur.Name}' (#${id}): its stack file would change the environment of the running container(s):\n${report}\n` +
+          `A "changed" or "container-only" variable was most likely edited on the container directly and never saved to the stack file, ` +
+          `so this redeploy would silently undo it. Fix the stack file first (get_stack_file, then update_stack), or pass allowEnvDrift: true ` +
+          `to redeploy anyway and take the stack file's values. Nothing was changed.`,
+      );
+    }
     const res = await this.fetch(`/api/stacks/${id}?endpointId=${cur.EndpointId}`, {
       method: "PUT",
       body: { stackFileContent: file, env, prune: false, pullImage: true },
@@ -353,10 +484,34 @@ class Portainer {
       throw new Error(`HTTP ${res.status} updating images of stack #${id}: ${redactSecrets(res.text.slice(0, 400), env.map((e) => e.value))}`);
     }
     const images = composeImages(file);
+    const changed = report ? ` Environment drift was allowed, so these now follow the stack file:\n${report}` : "";
+    const unchecked = drift === null ? " The environment comparison could not run and was skipped (allowEnvDrift)." : "";
     return (
       `Stack '${cur.Name}' (#${id}) redeployed with freshly pulled images${images.length ? ` (${images.join(", ")})` : ""}; ` +
-      `compose file and environment unchanged.`
+      `compose file and stack environment unchanged.${changed}${unchecked}`
     );
+  }
+
+  /** Every env difference between a stack's running containers and what its
+   *  stack file would give them, as `[container, drift]` pairs. */
+  private async stackEnvDrift(stack: PortainerStack, file: string): Promise<[string, EnvDrift][]> {
+    const declared = composeServiceEnv(file, stack.Env ?? []);
+    const eid = stack.EndpointId;
+    const filters = encodeURIComponent(JSON.stringify({ label: [`com.docker.compose.project=${stack.Name}`] }));
+    const containers = await this.get<DockerContainer[]>(`/api/endpoints/${eid}/docker/containers/json?all=1&filters=${filters}`);
+    const out: [string, EnvDrift][] = [];
+    for (const c of containers) {
+      const service = c.Labels?.["com.docker.compose.service"];
+      const want = service ? declared.get(service) : undefined;
+      if (!want || !c.Id) continue;
+      const inspect = await this.get<DockerInspect>(`/api/endpoints/${eid}/docker/containers/${encodeURIComponent(c.Id)}/json`);
+      const image = inspect.Image
+        ? await this.get<{ Config?: { Env?: string[] } }>(`/api/endpoints/${eid}/docker/images/${encodeURIComponent(inspect.Image)}/json`)
+        : undefined;
+      const name = (inspect.Name ?? c.Names?.[0] ?? service ?? c.Id).replace(/^\//, "");
+      for (const d of envDrift(want, parseDockerEnv(inspect.Config?.Env), parseDockerEnv(image?.Config?.Env))) out.push([name, d]);
+    }
+    return out;
   }
 
   /** Delete a stack and its containers. Guarded: only stacks carrying the
@@ -461,7 +616,9 @@ export function toArgv(command: string): string[] {
 }
 
 interface DockerContainer {
+  Id?: string;
   Names?: string[];
+  Labels?: Record<string, string>;
   Image?: string;
   State?: string;
   Status?: string;
@@ -769,21 +926,29 @@ function buildTools(target: Target): ConnectorTool[] {
       description:
         `Update a Portainer stack on ${target.name} to the newest images for the tags it already uses: re-pull and redeploy, ` +
         `with its compose file and environment left exactly as they are (use update_stack to change those). Works on any stack, ` +
-        `including one Skeleton Key did not create. If the stack runs Skeleton Key itself, this call drops while the server ` +
-        `restarts — do not retry it; wait ~30 s and call get_started to confirm the new version.`,
+        `including one Skeleton Key did not create. It first compares each running container's environment with what the stack ` +
+        `file would set, and refuses (changing nothing) when a redeploy would alter or drop a variable — e.g. one edited on the ` +
+        `container but never saved to the stack file; fix the stack file, or pass allowEnvDrift: true to take its values anyway. ` +
+        `If the stack runs Skeleton Key itself, this call drops while the server restarts — do not retry it; wait ~30 s and call ` +
+        `get_started to confirm the new version.`,
       tier: "execute",
       inputSchema: z.object({
         stackId: z.number().int().positive(),
         stackName: z.string().min(1).describe("The stack's name, as shown by list_stacks. Verified against the id before redeploying."),
+        allowEnvDrift: z
+          .boolean()
+          .optional()
+          .describe("Redeploy even when the stack file would change a running container's environment. Default false: refuse and report the drift."),
       }),
       confirm: (input, t) => {
-        const i = input as { stackId: number; stackName: string };
+        const i = input as { stackId: number; stackName: string; allowEnvDrift?: boolean };
         return (
           `Pull the newest images and redeploy Portainer stack '${i.stackName}' (#${i.stackId}) on ${t.name} — ` +
-          `recreates its containers; compose file and environment unchanged`
+          `recreates its containers; compose file and stack environment unchanged` +
+          (i.allowEnvDrift ? `; ALLOWING environment drift: running containers take the stack file's values` : "")
         );
       },
-      run: run((p, i) => p.updateStackImages(i.stackId, i.stackName)),
+      run: run((p, i, ctx) => p.updateStackImages(i.stackId, i.stackName, i.allowEnvDrift ?? false, ctx.fingerprint)),
     },
     {
       name: "remove_stack",

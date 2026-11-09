@@ -692,7 +692,8 @@
           "confirm": true,
           "inputs": [
             "stackId",
-            "stackName"
+            "stackName",
+            "allowEnvDrift?"
           ]
         },
         {
