@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as age from "age-encryption";
-import { AgeFileBackend, AgeFileError, AgeFileSecretsProvider, validateRecipients } from "./age-file-provider.js";
+import { z } from "zod";
+import { AgeFileBackend, AgeFileError, AgeFileSecretsProvider, derivedId, validateRecipients } from "./age-file-provider.js";
 import { capabilitiesOf } from "./provider.js";
 import { selectedProviderKind } from "./select.js";
 import { UserFacingError } from "../lib/errors.js";
@@ -73,7 +74,7 @@ describe("age-file provider: reads", () => {
     await expect(p.get("CASE")).rejects.toThrow(/2 items .* match \(case-insensitively\) "CASE"/);
   });
 
-  it("resolveById matches ids only — never a name — except an id-less item, whose id is its name", async () => {
+  it("resolveById matches ids only — never a name; an id-less item's id is a UUID derived from its name", async () => {
     const { p } = await providerWith([
       { id: ID_A, name: ID_B, password: "named-like-an-id" },
       { id: ID_B, name: "real", password: "right" },
@@ -81,8 +82,12 @@ describe("age-file provider: reads", () => {
     ]);
     expect((await p.resolveById(ID_B)).password).toBe("right");
     await expect(p.resolveById("real")).rejects.toThrow(/No item with id "real"/);
-    expect((await p.resolveById("legacy")).password).toBe("no-id");
-    expect(await p.resolveRef("legacy")).toEqual({ id: "legacy", name: "legacy" });
+    await expect(p.resolveById("legacy")).rejects.toThrow(/No item with id "legacy"/);
+    const { id } = await p.resolveRef("legacy");
+    expect(id).toBe(derivedId("legacy"));
+    // The registry pins only UUIDs (targetSchema.credentialId), so this must be one.
+    expect(z.string().uuid().safeParse(id).success).toBe(true);
+    expect((await p.resolveById(id)).password).toBe("no-id");
   });
 
   it("maps an item to a Credential the way the Vaultwarden adapter does (notes are never the secret)", async () => {
@@ -122,14 +127,29 @@ describe("age-file provider: writes", () => {
     const created = doc.items.find((i: any) => i.name === "new");
     expect(created).toMatchObject({ username: "u", password: "p", notes: "n", uris: ["https://kuma1.example.com"], fields: { token: "T" } });
     expect(created.id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(doc.items.find((i: any) => i.name === "hand-written").id).toMatch(/^[0-9a-f-]{36}$/);
+    // The stored id is the derived one, so a pin taken before this write still matches.
+    expect(doc.items.find((i: any) => i.name === "hand-written").id).toBe(derivedId("hand-written"));
+  });
+
+  it("a pin taken on an id-less item survives the write that stores its id", async () => {
+    const { p } = await providerWith([{ name: "legacy", password: "v1" }]);
+    const pinned = (await p.resolveRef("legacy")).id;
+    await p.create({ name: "other" });
+    await p.update("legacy", { password: "v2" });
+    expect((await p.resolveById(pinned)).password).toBe("v2");
+  });
+
+  it("refuses a hand-written id that isn't a UUID (the registry couldn't pin it)", async () => {
+    const { p, recipient } = await providerWith([]);
+    await writeFile(file, await encryptTo(recipient, JSON.stringify({ version: 1, items: [{ id: "abc", name: "x" }] })));
+    await expect(p.list()).rejects.toThrow(/items\[0\]: invalid_format/);
   });
 
   it("update replaces only the listed values and keeps the rest; an id-less item gets an id", async () => {
     const { p, identity } = await providerWith([{ name: "app", username: "keep", password: "old", notes: "keep", fields: { A: "1", B: "2" } }]);
     const out = await p.update("app", { password: "new", fields: [{ name: "B", value: "20" }, { name: "C", value: "3" }] });
     expect(out.name).toBe("app");
-    expect(out.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(out.id).toBe(derivedId("app"));
     const [item] = (await decryptWith(identity)).items;
     expect(item).toEqual({ id: out.id, name: "app", username: "keep", password: "new", notes: "keep", fields: { A: "1", B: "20", C: "3" } });
   });
@@ -139,6 +159,20 @@ describe("age-file provider: writes", () => {
     expect(await p.delete("gone")).toEqual({ name: "gone" });
     expect(await p.list()).toEqual(["stays"]);
     await expect(p.resolveById(ID_A)).rejects.toThrow(/No item with id/);
+  });
+
+  it("writes through a symlinked path instead of replacing the link", async () => {
+    const { p } = await providerWith([]);
+    const mount = path.join(dir, "mount");
+    await mkdir(mount);
+    const real = path.join(mount, "secrets.age");
+    await writeFile(real, await readFile(file));
+    await rm(file);
+    await symlink(real, file);
+    await p.create({ name: "x", password: "p" });
+    expect((await lstat(file)).isSymbolicLink()).toBe(true);
+    expect(await p.list()).toEqual(["x"]);
+    expect(await readdir(mount)).toEqual(["secrets.age"]);
   });
 
   it("writes atomically: 0600, armored, no temp file left behind", async () => {
@@ -245,8 +279,12 @@ describe("age-file backend lifecycle", () => {
   it("setup with no identity generates one and creates an empty file; connect reopens it from the store", async () => {
     const b = new AgeFileBackend({ file, recipients: [] });
     expect(b.configured({})).toBe(false);
-    const { patch } = await b.setup({});
+    const { patch, finalize } = await b.setup({}, {});
     expect(patch.ageIdentity).toMatch(/^AGE-SECRET-KEY-1/);
+    // Nothing is created until the identity is persisted and finalize runs.
+    expect(b.provider.ready).toBe(false);
+    expect(await readdir(dir)).toEqual([]);
+    await finalize!();
     expect(b.provider.ready).toBe(true);
     expect(await b.provider.list()).toEqual([]);
     const checks = await b.verify({});
@@ -264,7 +302,7 @@ describe("age-file backend lifecycle", () => {
     await providerWith([{ id: ID_A, name: "precious", password: SECRET }]);
     const before = await readFile(file, "utf8");
     const b = new AgeFileBackend({ file, recipients: [] });
-    const err = await b.setup({}).catch((e: unknown) => e);
+    const err = await b.setup({}, {}).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(UserFacingError);
     expect((err as Error).message).toMatch(/cannot decrypt/);
     expect(await readFile(file, "utf8")).toBe(before);
@@ -274,13 +312,36 @@ describe("age-file backend lifecycle", () => {
   it("setup with a pasted identity opens the operator's existing file", async () => {
     const { identity } = await providerWith([{ id: ID_A, name: "nas1-ssh" }]);
     const b = new AgeFileBackend({ file, recipients: [] });
-    expect((await b.setup({ identity: `  ${identity}\n` })).patch.ageIdentity).toBe(identity);
+    const r = await b.setup({ identity: `  ${identity}\n` }, {});
+    expect(r.patch.ageIdentity).toBe(identity);
+    await r.finalize!();
     expect(await b.provider.list()).toEqual(["nas1-ssh"]);
   });
 
   it("setup rejects unknown input keys, so a typo can't be silently ignored", async () => {
     const b = new AgeFileBackend({ file, recipients: [] });
-    await expect(b.setup({ identiy: "x" })).rejects.toThrow();
+    await expect(b.setup({ identiy: "x" }, {})).rejects.toThrow();
+  });
+
+  it("re-running setup with a blank identity reuses the saved one instead of minting a key that can't open the file", async () => {
+    const b = new AgeFileBackend({ file, recipients: [] });
+    const first = await b.setup({}, {});
+    await first.finalize!();
+    const again = new AgeFileBackend({ file, recipients: [] });
+    const second = await again.setup({}, first.patch);
+    expect(second.patch.ageIdentity).toBe(first.patch.ageIdentity);
+    await second.finalize!();
+    expect(again.provider.ready).toBe(true);
+  });
+
+  it("a reconnect that can't read the file leaves the provider not-ready (fails closed)", async () => {
+    const b = new AgeFileBackend({ file, recipients: [] });
+    const r = await b.setup({}, {});
+    await r.finalize!();
+    expect(b.provider.ready).toBe(true);
+    await writeFile(file, "garbage");
+    await expect(b.connect(r.patch)).rejects.toMatchObject({ failure: "decrypt" });
+    expect(b.provider.ready).toBe(false);
   });
 
   it("connect without a saved identity throws not-configured", async () => {

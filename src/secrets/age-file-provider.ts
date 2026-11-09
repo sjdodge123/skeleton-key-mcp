@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import * as age from "age-encryption";
@@ -21,7 +21,9 @@ import { UserFacingError } from "../lib/errors.js";
  *                  "password": "…", "uris": ["https://nas1.example.com"],
  *                  "notes": "…", "fields": { "private_key": "…" } } ] }
  *
- * `id` may be left out of hand-written items; the next write fills it in.
+ * `id` (a UUID) may be left out of hand-written items: such an item's id is
+ * derived from its name (`derivedId`), and the next write stores that same
+ * id, so a pin taken before the write still matches after it.
  *
  * How it meets the provider security contract (`./provider.ts`):
  *
@@ -42,10 +44,11 @@ import { UserFacingError } from "../lib/errors.js";
  * 4. Resolution — exact name, then id, then a unique case-insensitive name;
  *    an ambiguous match is refused. Unlike Vaultwarden there is no substring
  *    fallback (that exists only to keep old `bw get` refs working).
- *    `resolveById` matches ids only. An item WITHOUT an id is matched by name
- *    as its id — pinning degrades to the name for that item until the first
- *    write gives it a UUID (then the target's pin misses once, falls back to
- *    its name and re-pins). There is no trash: a deleted item is gone.
+ *    `resolveById` matches ids only. An item WITHOUT a stored id has a
+ *    name-derived UUID, so until a write stores it, renaming that item by hand
+ *    changes its id (the target's pin misses once, falls back to its name and
+ *    re-pins) — pinning degrades to the name for such items, and only for
+ *    them. There is no trash: a deleted item is gone.
  * 5. No caller-chosen scope — the file path and the recipients writes encrypt
  *    to come from config only; no method takes a path or a recipient.
  * 6. Offline — the file is local, so there is no network dependency. A
@@ -60,7 +63,8 @@ import { UserFacingError } from "../lib/errors.js";
 
 const ItemSchema = z
   .object({
-    id: z.string().min(1).optional(),
+    // A UUID, like every pinned credentialId (the registry requires one).
+    id: z.string().uuid().optional(),
     name: z.string().min(1),
     username: z.string().optional(),
     password: z.string().optional(),
@@ -157,6 +161,18 @@ function toCredential(ref: string, item: AgeItem): Credential {
   };
 }
 
+/** The id of an item stored without one: a UUID (v5 layout) derived from its
+ *  name, so it is stable across reads and is what the next write stores. */
+export function derivedId(name: string): string {
+  const h = createHash("sha256").update(`skeleton-key/age-file/item\0${name}`).digest();
+  h[6] = (h[6]! & 0x0f) | 0x50;
+  h[8] = (h[8]! & 0x3f) | 0x80;
+  const x = h.subarray(0, 16).toString("hex");
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
+}
+
+const idOf = (i: AgeItem): string => i.id ?? derivedId(i.name);
+
 function ambiguous(n: number, ref: string, how: string): UserFacingError {
   return new UserFacingError(`${n} items in the age secrets file ${how} "${ref}" — rename them so the credentialRef is unique.`);
 }
@@ -166,7 +182,7 @@ function resolveItem(items: AgeItem[], ref: string): AgeItem {
   const exact = items.filter((i) => i.name === ref);
   if (exact.length === 1) return exact[0]!;
   if (exact.length > 1) throw ambiguous(exact.length, ref, "are named");
-  const byId = items.filter((i) => i.id !== undefined && i.id === ref);
+  const byId = items.filter((i) => idOf(i) === ref);
   if (byId.length === 1) return byId[0]!;
   if (byId.length > 1) throw ambiguous(byId.length, ref, "share the id");
   const ci = items.filter((i) => i.name.toLowerCase() === ref.toLowerCase());
@@ -175,9 +191,9 @@ function resolveItem(items: AgeItem[], ref: string): AgeItem {
   throw new UserFacingError(`No item named "${ref}" in the age secrets file.`);
 }
 
-/** Resolve a pinned id: the id only — an id-less item's id is its name. */
+/** Resolve a pinned id: the id only, never a name. */
 function resolveId(items: AgeItem[], id: string): AgeItem {
-  const hits = items.filter((i) => (i.id ?? i.name) === id);
+  const hits = items.filter((i) => idOf(i) === id);
   if (hits.length === 1) return hits[0]!;
   if (hits.length > 1) throw ambiguous(hits.length, id, "share the id");
   throw new UserFacingError(`No item with id "${id}" in the age secrets file (deleted or recreated).`);
@@ -209,6 +225,27 @@ export class AgeFileSecretsProvider implements SecretsProvider {
    * empty — never an existing one overwritten. On any failure the provider is
    * left exactly as it was. Returns the file's item count.
    */
+  /**
+   * Lifecycle (setup): check, without changing anything, that `identity` is
+   * valid and either decrypts the file or the file doesn't exist yet. The
+   * file is only created by `open(…, { createIfMissing })` once the identity
+   * is safely in the bootstrap store.
+   */
+  async probe(identity: string): Promise<void> {
+    await recipientOf(identity);
+    try {
+      await this.readDoc(identity);
+    } catch (err) {
+      if (!(err instanceof AgeFileError && err.failure === "missing")) throw err;
+    }
+  }
+
+  /** Lifecycle: forget the identity (a failed reconnect) — not ready until reopened. */
+  close(): void {
+    this.identity = null;
+    this.recipient = null;
+  }
+
   async open(identity: string, opts: { createIfMissing?: boolean } = {}): Promise<number> {
     const recipient = await recipientOf(identity);
     let doc: AgeDoc;
@@ -236,7 +273,7 @@ export class AgeFileSecretsProvider implements SecretsProvider {
 
   async resolveRef(ref: string): Promise<SecretIdentity> {
     const item = resolveItem((await this.readDoc()).items, ref);
-    return { id: item.id ?? item.name, name: item.name };
+    return { id: idOf(item), name: item.name };
   }
 
   async list(): Promise<string[]> {
@@ -273,7 +310,7 @@ export class AgeFileSecretsProvider implements SecretsProvider {
         item.fields = { ...(item.fields ?? {}) };
         for (const f of patch.fields) item.fields[f.name] = f.value;
       }
-      item.id ??= randomUUID();
+      item.id ??= derivedId(item.name);
       return { id: item.id, name: item.name };
     });
   }
@@ -299,7 +336,7 @@ export class AgeFileSecretsProvider implements SecretsProvider {
     const run = this.writes.then(async () => {
       const doc = await this.readDoc();
       const result = fn(doc);
-      for (const i of doc.items) i.id ??= randomUUID();
+      for (const i of doc.items) i.id ??= derivedId(i.name);
       await this.writeDoc(doc, this.writeRecipients);
       return result;
     });
@@ -353,7 +390,9 @@ export class AgeFileSecretsProvider implements SecretsProvider {
 /** Write `data` to `file` atomically: a 0600 temp file in the same directory,
  *  fsync'd, then renamed over the target. Any failure removes the temp file
  *  and leaves the target untouched. */
-async function atomicWrite(file: string, data: string): Promise<void> {
+async function atomicWrite(path_: string, data: string): Promise<void> {
+  // Write through a symlink (e.g. into a host mount) rather than replacing it.
+  const file = await realpath(path_).catch(() => path_);
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${randomBytes(6).toString("hex")}.tmp`);
   let fh: Awaited<ReturnType<typeof open>> | undefined;
@@ -403,24 +442,44 @@ export class AgeFileBackend implements SecretsBackend {
 
   async connect(s: Readonly<BootstrapSecrets>): Promise<void> {
     if (!s.ageIdentity) throw new AgeFileError("not-configured");
-    await this.provider.open(s.ageIdentity);
+    try {
+      await this.provider.open(s.ageIdentity);
+    } catch (err) {
+      // Fail closed: a reconnect that can't read the file leaves the provider
+      // not-ready (tools withheld), not serving on a stale "connected" state.
+      this.provider.close();
+      throw err;
+    }
   }
 
   /**
-   * Use a pasted identity, or generate one. A missing file is created empty;
-   * an existing file must decrypt with the identity (so setup can never
-   * overwrite a file it can't read).
+   * Use a pasted identity; else the one already saved (re-running the step
+   * must not mint a key that can't open the file the first run created);
+   * else generate one. An existing file must decrypt with the identity, so
+   * setup can never overwrite a file it can't read. A missing file is created
+   * empty only in `finalize`, after the identity is persisted — a failed store
+   * write can't strand a file encrypted to a lost key.
    */
-  async setup(input: unknown): Promise<BackendSetupResult> {
+  async setup(input: unknown, s: Readonly<BootstrapSecrets> = {}): Promise<BackendSetupResult> {
     const i = SetupInput.parse(input ?? {});
-    const identity = i.identity?.trim() || (await age.generateX25519Identity());
+    const identity = i.identity?.trim() || s.ageIdentity || (await age.generateX25519Identity());
     try {
-      await this.provider.open(identity, { createIfMissing: true });
+      await this.provider.probe(identity);
     } catch (err) {
       if (err instanceof AgeFileError) throw new UserFacingError(err.message);
       throw err;
     }
-    return { patch: { ageIdentity: identity } };
+    return {
+      patch: { ageIdentity: identity },
+      finalize: async () => {
+        try {
+          await this.provider.open(identity, { createIfMissing: true });
+        } catch (err) {
+          if (err instanceof AgeFileError) throw new UserFacingError(err.message);
+          throw err;
+        }
+      },
+    };
   }
 
   async verify(_s: Readonly<BootstrapSecrets>): Promise<CheckResult[]> {

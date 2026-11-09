@@ -137,6 +137,25 @@ describe("first-run wizard with the age-file provider", () => {
     expect((await post("/setup/complete", {})).status).toBe(200);
   });
 
+  it("register_target pins a hand-written (id-less) item, and the pin resolves", async () => {
+    await boot("age-file");
+    await post("/store/init", { passphrase: PASS });
+    const identity = await age.generateX25519Identity();
+    const e = new age.Encrypter();
+    e.addRecipient(await age.identityToRecipient(identity));
+    await writeFile(ageFile, age.armor.encode(await e.encrypt(JSON.stringify({ version: 1, items: [{ name: "nas1-ssh", username: "admin", password: "pw" }] }))));
+    expect((await post("/setup/vault", { identity })).status).toBe(200);
+
+    const { buildGlobalTools } = await import("../mcp/builtin-tools.js");
+    const { targetCredential } = await import("../mcp/tool-registry.js");
+    const register = buildGlobalTools(app).find((t) => t.name === "register_target")!;
+    const out = await register.run(register.inputSchema.parse({ name: "nas1", type: "ssh", host: "10.0.0.5", credentialRef: "nas1-ssh" }), app);
+    expect(out.isError).toBeFalsy();
+    const target = app.registry.get("nas1");
+    expect(target.credentialId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect((await targetCredential(app, target)).password).toBe("pw");
+  });
+
   it("a wrong pasted identity is refused with fixed text, and nothing is saved", async () => {
     await boot("age-file");
     await post("/store/init", { passphrase: PASS });
