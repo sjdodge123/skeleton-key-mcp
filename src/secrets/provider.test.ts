@@ -213,7 +213,7 @@ describe("secrets provider boundary", () => {
       const text = readFileSync(path.join(repo, f), "utf8");
       if (/from\s+["'][./]*(?:secrets\/)?vaultwarden\.js["']/.test(text)) bad.push(`${f}: imports secrets/vaultwarden.js`);
       // `app.vault`, `a.vault`, `this.app.vault`, `{ vault } = this.app` — but not `app.vaultError`.
-      if (/[\w)\]]\.vault\b(?!Error)/.test(text) || /\{\s*vault\b[^}]*\}\s*=/.test(text)) bad.push(`${f}: touches AppState.vault`);
+      if (/[\w)\]]\.vault\b(?!Error)/.test(text) || /\{[^}]*\bvault\b[^}]*\}\s*=/.test(text)) bad.push(`${f}: touches AppState.vault`);
     }
     expect(bad).toEqual([]);
   });

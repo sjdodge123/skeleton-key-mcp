@@ -2,7 +2,7 @@ import { access } from "node:fs/promises";
 import { BootstrapStore } from "./secrets/bootstrap-store.js";
 import { VaultwardenClient, describeVaultFailure } from "./secrets/vaultwarden.js";
 import { VaultwardenSecretsProvider } from "./secrets/vaultwarden-provider.js";
-import type { SecretsProvider } from "./secrets/provider.js";
+import type { ReadOptions, SecretsProvider } from "./secrets/provider.js";
 import type { Credential } from "./secrets/types.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
@@ -43,9 +43,7 @@ interface AuthGate {
 }
 
 /** Options for `AppState.credentialFor`. */
-export interface CredentialReadOptions {
-  /** Refresh the provider's cache first (bounded, best-effort) — deploy-time reads. */
-  fresh?: boolean;
+export interface CredentialReadOptions extends ReadOptions {
   /** The ref is a pinned immutable item id: match by id only. */
   byId?: boolean;
 }
@@ -66,7 +64,7 @@ export class AppState {
     readonly store: BootstrapStore,
     /** The concrete Vaultwarden client, for its connection LIFECYCLE only (the
      *  setup wizard, store unlock, vault-server repair). Credential reads and
-     *  writes go through `secrets`; `provider-boundary.test.ts` enforces it. */
+     *  writes go through `secrets`; `src/secrets/provider.test.ts` enforces it. */
     readonly vault: VaultwardenClient,
     readonly registry: TargetRegistry,
     readonly audit: AuditLog,
@@ -394,8 +392,8 @@ export class AppState {
     if (!this.secrets.ready) {
       throw new Error(this.unlockGuidance());
     }
-    const read = { fresh: opts.fresh };
-    return opts.byId ? this.secrets.resolveById(credentialRef, read) : this.secrets.get(credentialRef, read);
+    const { byId, ...read } = opts;
+    return byId ? this.secrets.resolveById(credentialRef, read) : this.secrets.get(credentialRef, read);
   }
 }
 

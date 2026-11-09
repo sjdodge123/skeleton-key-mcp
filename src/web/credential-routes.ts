@@ -5,7 +5,7 @@ import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
 import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
-import { requireCapability } from "../secrets/provider.js";
+import { requireCapability, type SecretsProvider } from "../secrets/provider.js";
 import { lockoutMessage, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
@@ -281,6 +281,16 @@ export function buildCredentialRouter(app: AppState): Router {
       return;
     }
 
+    // The provider must be able to store this before anything else happens —
+    // in particular before a `verify` probe sends the value to its host.
+    let store: NonNullable<SecretsProvider["create"]> | NonNullable<SecretsProvider["update"]>;
+    try {
+      store = requireCapability(app.secrets, request.overwrite ? "update" : "create");
+    } catch (err) {
+      res.status(409).type("html").send(formPage(request, { error: app.secrets.describeFailure(err) }));
+      return;
+    }
+
     const totp = firstStr(body.totp);
     const check = app.checkTotp(totp, clientAttempt(req));
     if (!check.ok) {
@@ -422,13 +432,13 @@ export function buildCredentialRouter(app: AppState): Router {
       if (request.overwrite) {
         // Re-fill the EXISTING item in place (same id): listed fields are
         // replaced by name, everything else on the item is kept.
-        await requireCapability(app.secrets, "update")(request.name, {
+        await (store as NonNullable<SecretsProvider["update"]>)(request.name, {
           username: loginUsername,
           password: !multi && request.kind === "password" ? secret : undefined,
           fields,
         });
       } else {
-        await requireCapability(app.secrets, "create")({
+        await (store as NonNullable<SecretsProvider["create"]>)({
           name: request.name,
           username: loginUsername,
           password: !multi && request.kind === "password" ? secret : undefined,
