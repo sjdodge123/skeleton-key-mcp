@@ -84,8 +84,11 @@ export const WIZARD_HTML = /* html */ `<!doctype html>
   <div class="err" id="err"></div>
 </main>
 <script>
-const S = { step:0, max:0, discovered:[], bearer:null };
+const S = { step:0, max:0, discovered:[], bearer:null, sp:null };
 const STEP_NAMES = ["Passphrase","Welcome","Vaultwarden","Connect","Verify","Discover","2FA","Auto-unlock","Claude","Done"];
+/** The selected secrets provider (from /api/status): kind, label, capabilities. */
+const isAge = ()=> !!(S.sp && S.sp.kind==="age-file");
+const spLabel = ()=> (S.sp && S.sp.label) || "Vaultwarden";
 const el = (id)=>document.getElementById(id);
 const err = (m)=>{ el("err").textContent = m || ""; };
 async function api(path, body){
@@ -127,12 +130,21 @@ const views = {
   },
   1: async ()=> card("Welcome — how Skeleton Key stays safe",
     '<p>Skeleton Key lets Claude read logs and (with your approval) act across your homelab.</p>'+
-    '<ul><li><b>Scoped vault:</b> it reads credentials only from a dedicated Vaultwarden collection — never your personal passwords.</li>'+
-    '<li><b>Offline cache:</b> it keeps working if your Vaultwarden server is down.</li>'+
+    (isAge()
+      ? '<ul><li><b>Scoped secrets:</b> it reads credentials only from one age-encrypted file that holds just your homelab secrets — never your personal passwords.</li>'+
+        '<li><b>No network dependency:</b> the file is local, so there is no vault server to be down.</li>'
+      : '<ul><li><b>Scoped vault:</b> it reads credentials only from a dedicated Vaultwarden collection — never your personal passwords.</li>'+
+        '<li><b>Offline cache:</b> it keeps working if your Vaultwarden server is down.</li>')+
     '<li><b>Approval + audit:</b> every state-changing action is confirmed and logged.</li>'+
     '<li><b>LAN only:</b> never expose this to the internet.</li></ul>'+
     btn("Get started", ()=>go(2))),
-  2: async ()=> card("Set up the scoped Vaultwarden account",
+  2: async ()=> isAge() ? card("Prepare the age secrets file",
+    '<p class="muted">This deployment keeps homelab credentials in one <a href="https://age-encryption.org">age</a>-encrypted file (set by <code>SKELETON_KEY_AGE_FILE</code>; by default <code>secrets.age</code> in the data volume). Skeleton Key can read only what that file holds, so keep personal secrets out of it.</p>'+
+    '<h3>Two ways to start</h3>'+
+    '<ul><li><b>Fresh:</b> leave the identity blank on the next step. Skeleton Key generates an age identity, keeps it in its encrypted store, and creates an empty file. Add credentials later in chat with <code>request_credential</code> — the secret goes straight into the file, never through the chat.</li>'+
+    '<li><b>Bring your own:</b> create the file yourself with the <code>age</code> CLI and paste the matching identity (<code>AGE-SECRET-KEY-1…</code>) on the next step. The plaintext is JSON: <code>{"version":1,"items":[{"name":"nas1-ssh","username":"admin","password":"…","fields":{"private_key":"…"}}]}</code>.</li></ul>'+
+    '<p class="muted">To keep your own access to the file after Skeleton Key rewrites it, list your public key in <code>SKELETON_KEY_AGE_RECIPIENTS</code>; every write is encrypted to it as well.</p>'+
+    btn("Continue", ()=>go(3))) : card("Set up the scoped Vaultwarden account",
     '<p class="muted">Do this once in the Vaultwarden <b>web vault</b> (your Vaultwarden URL in a browser). The service account <b>creates its own org</b>, so there are no org invites or SMTP to deal with. Replace <code>&lt;vaultwarden&gt;</code> below with your Vaultwarden URL.</p>'+
     '<h3>1 · Create a dedicated account</h3>'+
     '<p class="muted">Skeleton Key needs its own empty account, e.g. <code>skeleton-key@home.lan</code>, so it can never reach your personal vault.</p>'+
@@ -155,24 +167,17 @@ const views = {
     '<p class="muted">Go to <b>Settings → Security → Keys → View API Key</b> to reveal <code>client_id</code> / <code>client_secret</code>.</p>'+
     '<p class="muted">Because this account owns only this one org and holds no personal data, it is cryptographically unable to read your real passwords. Keep the API key and this account\\'s master password for the next step.</p>'+
     btn("I\\'ve done this", ()=>go(3))),
-  3: async ()=> card("Connect the vault",
-    field("serverUrl","Vaultwarden URL (https:// — the Bitwarden CLI refuses plain http://)","text","https://vault.example.net")+
-    field("collectionName","Collection name (optional)","text","Homelab")+
-    field("clientId","API key client_id","text")+
-    pwField("clientSecret","API key client_secret")+
-    pwField("masterPassword","Service account master password")+
+  3: async ()=> card(isAge() ? "Connect the age file" : "Connect the vault",
+    connectFieldsHtml("")+
     btn("Connect &amp; verify", async()=>{
-      const checks = (await api("/setup/vault",{
-        serverUrl:val("serverUrl"), collectionName:val("collectionName")||undefined,
-        clientId:val("clientId"), clientSecret:val("clientSecret"), masterPassword:val("masterPassword")
-      })).checks;
+      const checks = (await api("/setup/vault", connectBody(""))).checks;
       S.checks = checks; go(4);
     })),
   4: async ()=>{
     const checks = S.checks || (await api("/setup/checks")).checks;
     const allPass = checks.every(c=>c.passed);
     return card("Verify scoping &amp; durability", checksHtml(checks)+
-      '<p class="muted">'+(allPass?"All checks passed — the account is correctly scoped.":"Some checks failed. Fix them in Vaultwarden, then re-run.")+'</p>'+
+      '<p class="muted">'+(allPass?(isAge()?"All checks passed.":"All checks passed — the account is correctly scoped."):"Some checks failed. Fix them in "+esc(spLabel())+", then re-run.")+'</p>'+
       '<div class="row">'+btn("Re-run checks", async()=>{ S.checks=(await api("/setup/checks")).checks; render(); },"ghost")+
       btn("Continue", ()=>go(5))+'</div>');
   },
@@ -269,11 +274,53 @@ function vaultRepairHtml(st){
   // must be reachable without first breaking the session.
   return '<details><summary class="muted">Vault connection — change the Vaultwarden URL</summary>'+form+'</details><hr/>';
 }
+/** The selected provider's connect form fields; ids are prefixed so the
+ *  wizard and the admin page can't collide. */
+function connectFieldsHtml(p){
+  if(isAge()) return pwField(p+"identity","Existing age identity (AGE-SECRET-KEY-1…) — leave blank to generate a new one");
+  return field(p+"serverUrl","Vaultwarden URL (https:// — the Bitwarden CLI refuses plain http://)","text","https://vault.example.net")+
+    field(p+"collectionName","Collection name (optional)","text","Homelab")+
+    field(p+"clientId","API key client_id","text")+
+    pwField(p+"clientSecret","API key client_secret")+
+    pwField(p+"masterPassword","Service account master password");
+}
+function connectBody(p){
+  if(isAge()){ const id=val(p+"identity"); return id?{identity:id}:{}; }
+  return { serverUrl:val(p+"serverUrl"), collectionName:val(p+"collectionName")||undefined,
+    clientId:val(p+"clientId"), clientSecret:val(p+"clientSecret"), masterPassword:val(p+"masterPassword") };
+}
+/** Which provider is selected and what it can do (capabilitiesOf, via /api/status). */
+function providerLine(st){
+  const sp = st && st.secrets; if(!sp) return "";
+  const caps = sp.capabilities||[];
+  return '<p class="muted">Secrets provider: <b>'+esc(sp.label)+'</b> — can read'+(caps.length?", "+esc(caps.join(", ")):"")+'.'+
+    (caps.indexOf("create")<0 ? ' It cannot store new items, so credential links and SSH key generation will refuse; add items in '+esc(sp.label)+' directly.' : '')+'</p>';
+}
+/** Secrets-provider section of the admin page: connect a newly selected
+ *  provider, retry a failed one, or (Vaultwarden) change the server URL. */
+function secretsAdminHtml(st){
+  const sp = st && st.secrets;
+  if(!sp) return vaultRepairHtml(st);
+  if(sp.configured===false){
+    return '<div class="check bad"><div class="n">✗ '+esc(sp.label)+' not connected</div><div class="d">'+esc(st.vaultError||"")+'</div></div>'+
+      '<h3>Connect '+esc(sp.label)+'</h3>'+
+      '<p class="muted">This deployment is configured to use '+esc(sp.label)+' (<code>SKELETON_KEY_SECRETS_PROVIDER</code>), which has not been connected yet. Registered targets keep their credential names, so the items must exist there under the same names. Requires your authenticator code.</p>'+
+      connectFieldsHtml("cn_")+field("cn_totp","6-digit authenticator code","text")+
+      btn("Connect", async()=>{ const b=connectBody("cn_"); b.totp=val("cn_totp"); const r=await api("/vault/connect",b); render(); setTimeout(()=>err(r.vaultUnlocked?"Connected ✓ — MCP tools are available again.":"Still not connected."),0); })+'<hr/>';
+  }
+  if(sp.kind==="vaultwarden") return providerLine(st)+vaultRepairHtml(st);
+  if(st.vaultUnlocked!==false) return providerLine(st);
+  return providerLine(st)+
+    '<div class="check bad"><div class="n">✗ '+esc(sp.label)+' not connected</div><div class="d">'+esc(st.vaultError||"The secrets provider could not be connected.")+'</div></div>'+
+    '<p class="muted">Fix the cause (for the age file: restore it, or re-encrypt it to the recipient shown at setup), then retry. Requires your authenticator code.</p>'+
+    field("rc_totp","6-digit authenticator code","text")+
+    btn("Retry connection", async()=>{ const r=await api("/vault/reconnect",{totp:val("rc_totp")}); render(); setTimeout(()=>err(r.vaultUnlocked?"Connected ✓ — MCP tools are available again.":"Still not connected."),0); })+'<hr/>';
+}
 async function adminCard(st){
   if(!S.au){
     const vaultDown = !!(st && st.vaultUnlocked===false);
     return card(vaultDown ? "Unlocked — vault not connected" : "Unlocked ✓",
-      vaultRepairHtml(st)+
+      secretsAdminHtml(st)+
       '<p class="muted">'+(vaultDown ? 'The store is unlocked, but MCP tools stay withheld until the vault reconnects.' : 'Skeleton Key is unlocked and serving MCP clients at <code>/mcp</code>.')+'</p>'+
       '<h3>Boot auto-unlock</h3>'+
       '<p class="muted">Control whether the container unlocks itself after a restart (trading away the restart kill-switch for convenience). Enter your authenticator code to view or change it.</p>'+
@@ -335,7 +382,9 @@ const val = (id)=> (el(id)?.value||"").trim();
 async function registerTarget(t){ try{ await api("/targets",t); await refreshTargets(); }catch(e){ err(e.message); } }
 window.addSvc = async (i)=>{ const s=S.discovered[i]; const name=prompt("Name for "+s.host+":", s.host.replace(/\\./g,"-")); if(!name)return; const cred=prompt("Vault item name for credentials (blank if none):")||undefined; await registerTarget({name,type:(s.registerType||s.connectorType),host:s.host,port:s.port,credentialRef:cred}); };
 async function refreshTargets(){ const list=el("tlist"); if(!list)return; const r=await api("/targets"); list.innerHTML = r.targets.length? '<h3>Registered</h3>'+r.targets.map(t=>'<div class="svc"><code>'+t.name+'</code> ('+t.type+') → '+t.host+'</div>').join(""):""; }
-async function render(){ renderSteps(); try{ el("view").innerHTML = await views[S.step](); if(S.step===5) refreshTargets(); }catch(e){ err(e.message); } }
+async function render(){
+  if(!S.sp){ try{ S.sp=(await api("/status")).secrets||null; STEP_NAMES[2]=spLabel(); }catch(e){} }
+  renderSteps(); try{ el("view").innerHTML = await views[S.step](); if(S.step===5) refreshTargets(); }catch(e){ err(e.message); } }
 render();
 </script>
 </body>

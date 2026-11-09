@@ -178,6 +178,9 @@ All configuration is optional — the defaults work for a standard container dep
 | `SKELETON_KEY_TLS` | `auto` | [LAN TLS](#lan-tls). `auto` serves HTTPS with a mounted or self-managed certificate; `off` serves plain HTTP (passphrases and hand-off credentials then cross the LAN unencrypted). |
 | `SKELETON_KEY_TLS_CERT_FILE` / `SKELETON_KEY_TLS_KEY_FILE` | _(unset)_ | Mount your own PEM certificate + private key instead of the self-signed pair. Set both or neither; a broken pair fails the boot loudly rather than silently serving a different certificate. |
 | `SKELETON_KEY_CREDENTIAL_TTL_MINUTES` | `30` | Default lifetime of a `request_credential` hand-off link (clamped to 5–240). A single request can override it with `ttlMinutes`. |
+| `SKELETON_KEY_SECRETS_PROVIDER` | `vaultwarden` | Where homelab credentials come from: `vaultwarden` (a scoped collection) or `age-file` (one [age](https://age-encryption.org)-encrypted file; see [Using an age file instead of Vaultwarden](#using-an-age-file-instead-of-vaultwarden)). Anything else fails the boot. |
+| `SKELETON_KEY_AGE_FILE` | `<data dir>/secrets.age` | `age-file` provider: the encrypted secrets file. |
+| `SKELETON_KEY_AGE_RECIPIENTS` | _(unset)_ | `age-file` provider: extra `age1…` public keys every write is also encrypted to, so you keep your own access to the file. A malformed key fails the boot. |
 | `SKELETON_KEY_DISABLE_EXECUTE` | _(unset)_ | Set to `1` as a kill-switch: all `execute`-tier tools are refused and audited as denied, leaving only read-only tools. |
 | `SKELETON_KEY_PASSPHRASE` / `SKELETON_KEY_PASSPHRASE_FILE` | _(unset)_ | **Deprecated.** The old auto-unlock: your master passphrase in the environment (or a file). Still honored, with a warning at boot — prefer [Boot auto-unlock](#boot-auto-unlock), which never puts the passphrase on disk. |
 
@@ -250,6 +253,12 @@ Execute-tier tools go through Claude's approval prompt and are audited. Installi
 ## How credentials stay safe
 
 The service account belongs to exactly one Vaultwarden organization/collection. In Bitwarden's model, organization keys are separate from your personal user key, so this account is **cryptographically unable** to decrypt your personal vault — only the homelab collection. Reads are served from the `bw` CLI's **local encrypted offline cache**, so a Vaultwarden outage degrades you to last-known-good credentials instead of locking you out. Targets remember the vault item's **immutable id**, not just its name, and a deploy-time read (`secretEnv`) re-syncs the cache first — so renaming an item can't hand a stack a stale value, and a trashed item never satisfies a reference.
+
+### Using an age file instead of Vaultwarden
+
+No Vaultwarden server? Set `SKELETON_KEY_SECRETS_PROVIDER=age-file` and the wizard's connect step either generates an [age](https://age-encryption.org) identity (and creates an empty file) or takes the identity of a file you encrypted yourself. The identity is kept in Skeleton Key's encrypted bootstrap store; the file is decrypted only in memory. Scoping is simply the file's contents: Skeleton Key can read what's in it and nothing else, so keep personal secrets out of it. Add credentials with `request_credential` as usual, or edit the file with the `age` CLI — the plaintext is JSON (`{"version":1,"items":[{"name":"nas1-ssh","username":"admin","password":"…","fields":{"private_key":"…"}}]}`), changes apply on the next read, and listing your own public key in `SKELETON_KEY_AGE_RECIPIENTS` keeps the file decryptable by you after Skeleton Key rewrites it.
+
+Switching an existing deployment from one provider to the other: change the variable and restart. The store unlocks but tools stay withheld until you connect the new provider on the admin page (TOTP-gated). Targets keep their credential names, so create the items under the same names in the new provider.
 
 ### Credential hand-off
 

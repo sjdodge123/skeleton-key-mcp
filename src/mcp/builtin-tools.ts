@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../lib/ssh-keygen.js";
-import { requireCapability } from "../secrets/provider.js";
+import { capabilitiesOf, hasCapability, requireCapability, type SecretsProvider } from "../secrets/provider.js";
 import { SERVER_VERSION } from "../version.js";
 import { scanLan } from "../discovery/scan.js";
 import { assertKnownOptionKeys, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
@@ -193,6 +193,37 @@ export interface GlobalTool {
 const ok = (text: string): ToolResult => ({ text });
 const err = (text: string): ToolResult => ({ text, isError: true });
 
+/** One line for get_started: which secrets provider backs this deployment and
+ *  what it can do — and, for a read-only one, which tools will refuse. */
+export function secretsSummary(p: SecretsProvider): string {
+  const caps = capabilitiesOf(p);
+  const line = `Secrets provider: ${p.label} (read${caps.length ? `, ${caps.join(", ")}` : ""}).`;
+  const missing: string[] = [];
+  const refusing: string[] = [];
+  if (!hasCapability(p, "create")) {
+    missing.push("create");
+    refusing.push("request_credential", "vault_store_login", "vault_generate_ssh_key");
+  }
+  if (!hasCapability(p, "update")) {
+    missing.push("update");
+    if (hasCapability(p, "create")) refusing.push("request_credential with overwrite");
+  }
+  if (!hasCapability(p, "delete")) {
+    missing.push("delete");
+    refusing.push("vault_delete_credential");
+  }
+  if (missing.length === 0) return line;
+  return (
+    `${line} It can't ${orList(missing)} items, so ${refusing.join(", ")} will refuse — ` +
+    `make those changes in ${p.label} directly and refer to items by name.`
+  );
+}
+
+/** "a", "a or b", "a, b or c". */
+function orList(xs: string[]): string {
+  return xs.length <= 1 ? (xs[0] ?? "") : `${xs.slice(0, -1).join(", ")} or ${xs[xs.length - 1]}`;
+}
+
 export function buildGlobalTools(app: AppState): GlobalTool[] {
   return [
     {
@@ -211,7 +242,8 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
               "Until then, no targets or tools are available. Once unlocked, call get_started again to see what's registered.",
           );
         }
-        const version = `Skeleton Key v${SERVER_VERSION}.\n\n`;
+        const version = `Skeleton Key v${SERVER_VERSION}.\n${secretsSummary(a.secrets)}\n\n`;
+        const canCreate = hasCapability(a.secrets, "create");
         const targets = a.registry.list();
         if (targets.length === 0) {
           return ok(
@@ -219,10 +251,12 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
             "No targets are registered yet — nothing to manage until you add some.\n\n" +
               "Recommended onboarding (offer to do this with the user):\n" +
               "1. network_scan (ask for their LAN subnet, e.g. '192.168.0') to map services. If it finds the router/gateway (e.g. UniFi), start there — its API names every other device on the network, so the rest of the scan stops being anonymous IPs.\n" +
-              "2. Get a credential for the host, WITHOUT asking for secrets in chat:\n" +
-              "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status. " +
-              "Several secrets for one app (e.g. env vars for a migration)? Pass `fields` so one link collects them all onto one vault item.\n" +
-              "   • SSH host you already have access to? Call vault_generate_ssh_key, then either install the returned key via that host's run_command (if you already have a working credential) or give the user the one-liner to install it themselves.\n" +
+              (canCreate
+                ? "2. Get a credential for the host, WITHOUT asking for secrets in chat:\n" +
+                  "   • Need a password/API token? Call request_credential → hand the user the one-time link → poll credential_request_status. " +
+                  "Several secrets for one app (e.g. env vars for a migration)? Pass `fields` so one link collects them all onto one vault item.\n" +
+                  "   • SSH host you already have access to? Call vault_generate_ssh_key, then either install the returned key via that host's run_command (if you already have a working credential) or give the user the one-liner to install it themselves.\n"
+                : `2. Have the user add the host's credential in ${a.secrets.label} themselves (never in chat), then use its item name as the credentialRef — vault_list_credentials shows the names.\n`) +
               "3. register_target to add the host so its tools appear.\n" +
               "4. vault_validate_ssh (for ssh) to confirm access.\n\n" +
               "Managing existing creds: update_target re-points a host at a new credentialRef (e.g. password → key); vault_delete_credential retires an old item.",
