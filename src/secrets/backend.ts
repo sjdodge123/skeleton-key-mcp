@@ -13,6 +13,10 @@ export interface CheckResult {
  *  persist (only produced once the backend actually connected with it). */
 export interface BackendSetupResult {
   patch: Partial<BootstrapSecrets>;
+  /** Run after `patch` is persisted: any side effect that must not happen
+   *  before the settings it depends on are safely saved (the age provider
+   *  creating its file). Throws like `setup`. */
+  finalize?: () => Promise<void>;
 }
 
 /**
@@ -41,11 +45,12 @@ export interface SecretsBackend {
   connect(store: Readonly<BootstrapSecrets>): Promise<void>;
 
   /** The wizard's connect step (and the post-setup connect for a newly
-   *  selected backend): validate `input` against this backend's own schema
+   *  selected backend; `store` holds any settings saved by an earlier run of
+   *  the step): validate `input` against this backend's own schema
    *  (a `ZodError` the routes turn into a 400 naming fields, never values),
    *  connect with it, and return the store patch to persist. A backend
    *  failure is thrown as a `UserFacingError` carrying `describeFailure`. */
-  setup(input: unknown): Promise<BackendSetupResult>;
+  setup(input: unknown, store: Readonly<BootstrapSecrets>): Promise<BackendSetupResult>;
 
   /** Scoping / durability checks against the live connection, shown by the
    *  wizard. Never throws: a failed probe is a failed check. */

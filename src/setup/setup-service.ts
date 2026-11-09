@@ -22,8 +22,9 @@ export class SetupService {
    * the post-setup connect for a newly selected provider.
    */
   async connectSecrets(input: unknown): Promise<CheckResult[]> {
-    const { patch } = await this.app.secretsBackend.setup(input);
+    const { patch, finalize } = await this.app.secretsBackend.setup(input, this.app.store.get());
     await this.app.store.update(patch);
+    await finalize?.();
     await this.app.secretsConnected();
     return this.runChecks();
   }
