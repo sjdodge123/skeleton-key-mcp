@@ -38,6 +38,9 @@ export const paths = {
    *  src/web/tls.ts. A user-mounted pair via SKELETON_KEY_TLS_CERT_FILE /
    *  SKELETON_KEY_TLS_KEY_FILE takes precedence over this directory. */
   tlsDir: path.join(DATA_DIR, "tls"),
+  /** Default home of the age-encrypted secrets file when the `age-file`
+   *  secrets provider is selected (override: SKELETON_KEY_AGE_FILE). */
+  ageFile: path.join(DATA_DIR, "secrets.age"),
 } as const;
 
 /**
@@ -100,5 +103,21 @@ export const env = {
    *  Resolved lazily so the file (if any) is read at boot, not at import. */
   get unlockPassphrase(): string | undefined {
     return resolveUnlockPassphrase();
+  },
+  /** Which secrets backend serves credentials (`src/secrets/select.ts`):
+   *  `vaultwarden` (default) or `age-file`. Non-secret config; the backend's
+   *  own credentials live in the bootstrap store. Validated at boot. */
+  get secretsProvider(): string | undefined {
+    return process.env.SKELETON_KEY_SECRETS_PROVIDER?.trim() || undefined;
+  },
+  /** `age-file` provider: path of the encrypted secrets file (non-secret). */
+  get ageFile(): string {
+    const f = process.env.SKELETON_KEY_AGE_FILE?.trim();
+    return f ? path.resolve(f) : paths.ageFile;
+  },
+  /** `age-file` provider: extra `age1…` public keys writes also encrypt to,
+   *  comma- or whitespace-separated (non-secret). Validated at boot. */
+  get ageRecipients(): string[] {
+    return (process.env.SKELETON_KEY_AGE_RECIPIENTS ?? "").split(/[\s,]+/).filter(Boolean);
   },
 } as const;

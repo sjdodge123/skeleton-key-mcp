@@ -120,19 +120,28 @@ every package runs inside a process that can read the vault.
 
 ## Adding a secrets provider
 
-Vaultwarden is the first implementation of the `SecretsProvider` interface
-(`src/secrets/provider.ts`). Another backend (an age-encrypted file, 1Password Connect,
-HashiCorp Vault, …) can implement it too. A provider holds the keys to every target, so
-the bar is higher than for a connector:
+Two backends implement the `SecretsProvider` interface (`src/secrets/provider.ts`):
+Vaultwarden (`vaultwarden-provider.ts`, the default) and an age-encrypted file
+(`age-file-provider.ts`). Others (1Password Connect, HashiCorp Vault, …) can implement it
+too. A provider holds the keys to every target, so the bar is higher than for a
+connector:
 
-1. **Open an issue first.** Choosing a provider at startup and its connection lifecycle
-   (setup wizard, unlock) aren't pluggable yet, so a new provider will touch more than
-   its own file. Agree on that part in the issue.
+1. **Open an issue first** with the design: its config, its saved settings, and how it
+   meets each point of the security contract below. See
+   [#118](https://github.com/sjdodge123/skeleton-key-mcp/issues/118) for the shape.
 2. **Implement the required surface**: `get`, `resolveById`, `resolveRef`, `list`,
    `describeFailure` and `ready`. Add `create` / `update` / `delete` / `sync` only if the
    backend supports them. A missing write capability is fine: the write tools refuse
-   with a clear message and the read side keeps working.
-3. **State the security contract in the module doc**, one point at a time. The full text
+   with a clear message, `get_started` and `/api/status` say so up front, and the read
+   side keeps working.
+3. **Implement its lifecycle**, a `SecretsBackend` (`src/secrets/backend.ts`):
+   `configured`, `connect`, `setup` (validates its own input with zod, connects, and
+   returns the bootstrap-store fields to save; the provider's own credentials go in the
+   bootstrap store, never in env or a plaintext file), `verify`, and `changeServer` only
+   if it is reached over the network. Add its kind to `src/secrets/select.ts` (non-secret
+   settings such as a path come from env), and its connect form and setup notes to the
+   wizard (`src/web/ui.ts`, `connectFieldsHtml`).
+4. **State the security contract in the module doc**, one point at a time. The full text
    is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#secrets-providers). In short:
    - *Scoping.* Say how the backend, not Skeleton Key's own code, keeps the provider's
      identity limited to the homelab's secrets and away from the operator's personal
@@ -147,11 +156,14 @@ the bar is higher than for a connector:
      `resolveById` matches the id only.
    - *No caller-chosen scope.* No method takes a scope, account, collection or path.
    - *Offline behaviour.* Serve a cache or fail closed, and say which.
-4. **Test it the way `src/secrets/provider.test.ts` tests the Vaultwarden adapter**,
-   including a failure whose raw error text contains a secret-looking string that
-   `describeFailure` must not repeat.
-5. **No new runtime dependency without agreement in the issue.** A provider SDK runs
-   with the keys to everything.
+5. **Test it the way `src/secrets/age-file-provider.test.ts` and
+   `src/secrets/provider.test.ts` test the existing ones**, including a failure whose raw
+   error text contains a secret-looking string that `describeFailure` must not repeat.
+6. **No new runtime dependency without agreement in the issue.** A provider SDK runs
+   with the keys to everything. (`age-encryption` was agreed in #118.)
+7. **Keep the boundary.** The provider's concrete client stays inside its own module;
+   `src/secrets/provider.test.ts` lists the only file allowed to reach the Vaultwarden
+   client, and that list doesn't grow.
 
 **Coming soon:** connector families with shared tool contracts, declarative app recipes,
 and command packs for the SSH allowlist. Please hold PRs in those areas until the

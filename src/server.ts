@@ -21,6 +21,7 @@ function urlHost(url: string | null | undefined): string | null {
 async function main(): Promise<void> {
   await sodium.ready;
   const app = await AppState.create();
+  console.log(`[skeleton-key] Secrets provider: ${app.secrets.label} (SKELETON_KEY_SECRETS_PROVIDER=${app.secrets.kind}).`);
 
   // TLS on by default (self-signed into data/tls, or a user-mounted pair);
   // SKELETON_KEY_TLS=off opts out. A throw here (broken explicit pair) is a

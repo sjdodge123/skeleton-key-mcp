@@ -1,7 +1,7 @@
 import { access } from "node:fs/promises";
 import { BootstrapStore } from "./secrets/bootstrap-store.js";
-import { VaultwardenClient, describeVaultFailure } from "./secrets/vaultwarden.js";
-import { VaultwardenSecretsProvider } from "./secrets/vaultwarden-provider.js";
+import { createSecretsBackend, selectedProviderKind } from "./secrets/select.js";
+import type { SecretsBackend } from "./secrets/backend.js";
 import type { ReadOptions, SecretsProvider } from "./secrets/provider.js";
 import type { Credential } from "./secrets/types.js";
 import { TargetRegistry } from "./config/registry.js";
@@ -55,36 +55,36 @@ export interface CredentialReadOptions extends ReadOptions {
  */
 export class AppState {
   /**
-   * The secrets backend every credential consumer goes through — tools, web
-   * routes, snapshots. Never reach past it to `vault`.
+   * The secrets provider every credential consumer goes through — tools, web
+   * routes, snapshots. Which one is config (`SKELETON_KEY_SECRETS_PROVIDER`,
+   * `src/secrets/select.ts`).
    */
   readonly secrets: SecretsProvider;
 
   private constructor(
     readonly store: BootstrapStore,
-    /** The concrete Vaultwarden client, for its connection LIFECYCLE only (the
-     *  setup wizard, store unlock, vault-server repair). Credential reads and
-     *  writes go through `secrets`; `src/secrets/provider.test.ts` enforces it. */
-    readonly vault: VaultwardenClient,
+    /** The selected provider's connection LIFECYCLE (unlock, setup step,
+     *  checks, repair). Only this class and the setup service drive it;
+     *  credential reads and writes go through `secrets`. */
+    readonly secretsBackend: SecretsBackend,
     readonly registry: TargetRegistry,
     readonly audit: AuditLog,
     readonly oauth: OAuthService,
     readonly credentialRequests: CredentialRequestStore,
   ) {
-    // The collection is read from the store at write time (it is locked at
-    // construction). A write while the store is locked throws from `get()`
-    // rather than falling back to "the only collection" — fail closed.
-    this.secrets = new VaultwardenSecretsProvider(vault, () => store.get().bwCollectionName);
+    this.secrets = secretsBackend.provider;
   }
 
   static async create(): Promise<AppState> {
     const store = await BootstrapStore.open();
-    const vault = new VaultwardenClient();
+    // Config errors (an unknown provider, a malformed age recipient) throw
+    // here and fail the boot loudly.
+    const backend = await createSecretsBackend(selectedProviderKind(), store);
     const registry = await TargetRegistry.load();
     const audit = new AuditLog();
     const oauth = new OAuthService();
     const credentialRequests = new CredentialRequestStore();
-    const app = new AppState(store, vault, registry, audit, oauth, credentialRequests);
+    const app = new AppState(store, backend, registry, audit, oauth, credentialRequests);
     app.learnedPublicUrl = await loadPublicUrl();
     app.bearerHash = await loadBearerHash();
     return app;
@@ -93,9 +93,9 @@ export class AppState {
   /** SHA-256 of the MCP bearer token, so it's verifiable while locked. */
   private bearerHash: string | null = null;
 
-  /** Why the last vault (re)connect failed — a fixed summary from
-   *  `describeVaultFailure`, never the raw `bw` message — or null once the
-   *  vault is up. Surfaced by the unauthenticated `/api/status` so
+  /** Why the last secrets-provider (re)connect failed — a fixed summary from
+   *  `secrets.describeFailure`, never a raw backend message — or null once the
+   *  provider is up. Surfaced by the unauthenticated `/api/status` so
    *  the admin page can explain a store that unlocked while the vault did not,
    *  instead of leaving the only clue in the container log. */
   vaultError: string | null = null;
@@ -132,65 +132,68 @@ export class AppState {
 
   /**
    * Common tail of every store-unlock path (boot key file, deprecated boot
-   * passphrase, manual web-UI unlock): re-establish the saved Vaultwarden
-   * session, refresh the offline cache best-effort, keep the bearer hash
-   * current, and nudge live MCP sessions to re-list tools now the full set is
-   * available.
+   * passphrase, manual web-UI unlock) and of the admin "reconnect": have the
+   * selected secrets backend re-establish its saved connection, keep the
+   * bearer hash current, and nudge live MCP sessions to re-list tools now the
+   * full set is available.
+   *
+   * A backend with no saved settings is skipped — that's the first-run wizard
+   * before its connect step, or, once setup is complete, a deployment that
+   * was switched to a different provider: the store unlocks, the tools stay
+   * withheld (locked is the kill-switch), and the admin page offers that
+   * provider's connect form.
    */
   async postUnlock(): Promise<void> {
     const s = this.store.get();
-    if (s.bwServerUrl && s.bwClientId && s.bwClientSecret && s.bwMasterPassword) {
+    if (this.secretsBackend.configured(s)) {
       try {
-        await this.vault.reestablish({
-          serverUrl: s.bwServerUrl,
-          clientId: s.bwClientId,
-          clientSecret: s.bwClientSecret,
-          masterPassword: s.bwMasterPassword,
-        });
+        await this.secretsBackend.connect(s);
       } catch (err) {
-        this.vaultError = describeVaultFailure(err);
+        this.vaultError = this.secrets.describeFailure(err);
         throw err;
       }
       this.vaultError = null;
-      // Best-effort sync; safe to fail if Vaultwarden is unreachable (offline cache).
-      await this.vault.sync().catch(() => {});
+    } else if (await this.isSetupComplete()) {
+      this.vaultError = `The secrets provider is ${this.secrets.label}, which isn't connected yet — connect it on the admin page.`;
     }
     await this.ensureBearerHash();
     if (!this.locked) this.emitToolsChanged();
   }
 
-  /**
-   * Re-point the Vaultwarden client at a different server URL after setup —
-   * the repair when the stored URL stops being usable (the Bitwarden CLI now
-   * refuses plain http://). Logs the CLI out so `reestablish()` runs `config
-   * server` + the API-key login fresh, re-syncs the offline cache, and persists
-   * the URL only once the vault is actually unlocked on it (fails closed: a bad
-   * URL leaves the stored one untouched). The service-account credentials are
-   * the stored ones — nothing secret enters or leaves through this path.
-   */
-  async changeVaultServer(serverUrl: string): Promise<void> {
-    if (this.store.locked) throw new UserFacingError("Unlock the store first.", 409);
-    const s = this.store.get();
-    if (!s.bwClientId || !s.bwClientSecret || !s.bwMasterPassword) {
-      throw new UserFacingError("The vault has not been connected yet — run the setup wizard.", 409);
-    }
-    await this.vault.logout();
-    try {
-      await this.vault.reestablish({
-        serverUrl,
-        clientId: s.bwClientId,
-        clientSecret: s.bwClientSecret,
-        masterPassword: s.bwMasterPassword,
-      });
-      await this.vault.sync();
-    } catch (err) {
-      this.vaultError = describeVaultFailure(err);
-      throw err;
-    }
-    await this.store.update({ bwServerUrl: serverUrl });
+  /** The secrets backend reconnected with new settings (setup step, repair):
+   *  clear the last failure and let live sessions see the full tool set. */
+  async secretsConnected(): Promise<void> {
     this.vaultError = null;
     await this.ensureBearerHash();
     if (!this.locked) this.emitToolsChanged();
+  }
+
+  /**
+   * Re-point the secrets backend at a different server URL after setup — for
+   * Vaultwarden, the repair when the stored URL stops being usable (the
+   * Bitwarden CLI now refuses plain http://). The backend reconnects with the
+   * stored credentials and the URL is persisted only once that worked (fails
+   * closed: a bad URL leaves the stored one untouched). Nothing secret enters
+   * or leaves through this path. A backend without a server (the age file)
+   * refuses.
+   */
+  async changeVaultServer(serverUrl: string): Promise<void> {
+    if (this.store.locked) throw new UserFacingError("Unlock the store first.", 409);
+    const backend = this.secretsBackend;
+    if (!backend.changeServer) {
+      throw new UserFacingError(`The configured secrets provider (${this.secrets.label}) has no server URL to change.`, 409);
+    }
+    let patch;
+    try {
+      ({ patch } = await backend.changeServer(serverUrl, this.store.get()));
+    } catch (err) {
+      // Our own refusals (a precondition, before any reconnect was tried)
+      // leave the connection as it was; anything else means it is now down.
+      if (!(err instanceof UserFacingError)) this.vaultError = this.secrets.describeFailure(err);
+      throw err;
+    }
+    await this.store.update(patch);
+    await this.secretsConnected();
   }
 
   /** Persisted, auto-detected public base URL (set at boot; see server.ts).

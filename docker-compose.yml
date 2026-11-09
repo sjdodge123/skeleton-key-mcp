@@ -53,6 +53,13 @@ services:
       # who can restart the container gets an unlocked instance.
       # Blunt kill-switch for all state-changing tools:
       # SKELETON_KEY_DISABLE_EXECUTE: "1"
+      # Secrets provider: Vaultwarden by default. To keep homelab credentials
+      # in one age-encrypted file instead (no vault server needed), select it
+      # here; the wizard then generates or takes the age identity. Paths and
+      # public keys only — nothing secret goes in this file.
+      # SKELETON_KEY_SECRETS_PROVIDER: "age-file"
+      # SKELETON_KEY_AGE_FILE: "/data/secrets.age"
+      # SKELETON_KEY_AGE_RECIPIENTS: "age1yourpublickey..."   # so you can still decrypt it
     volumes:
       - skeleton-key-data:/data
       # For boot auto-unlock: mount a host directory where Skeleton Key stores

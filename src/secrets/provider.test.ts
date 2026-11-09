@@ -187,18 +187,24 @@ describe("write tools on a read-only provider refuse before any side effect", ()
 });
 
 /**
- * Every credential consumer goes through `AppState.secrets`. The concrete
- * Vaultwarden client (`AppState.vault`, `secrets/vaultwarden.ts`) is reachable
- * only from the files that drive its connection lifecycle, listed here with
- * their reason. Maintainer-owned: this list may shrink, not grow, without review.
+ * Every credential consumer goes through `AppState.secrets`, and the connection
+ * lifecycle through `AppState.secretsBackend` (the `SecretsBackend` interface).
+ * The concrete Vaultwarden client (`secrets/vaultwarden.ts`) is constructed and
+ * held only by the Vaultwarden backend, listed here with its reason.
+ * `AppState.vault` no longer exists. Maintainer-owned: this list may shrink,
+ * not grow, without review.
  */
 const VAULTWARDEN_LIFECYCLE: Record<string, string> = {
-  "src/app.ts": "constructs the client and the provider; re-establishes the session on unlock and vault-server repair",
-  "src/setup/setup-service.ts": "the first-run wizard connects the Vaultwarden service account",
-  "src/setup/verify.ts": "the wizard's org/collection scoping checks are Vaultwarden-specific",
-  "src/web/routes.ts": "the setup and vault-server routes summarize Vaultwarden connection failures",
-  "src/secrets/vaultwarden-provider.ts": "the adapter itself",
+  "src/secrets/vaultwarden-provider.ts": "the adapter and the Vaultwarden backend, which owns the one client",
 };
+
+/** `import … from ".../vaultwarden.js"` (not `vaultwarden-provider.js`). */
+const IMPORTS_CLIENT = /from\s+["'][./]*(?:secrets\/)?vaultwarden\.js["']/;
+/** `app.vault`, `a.vault`, `this.app.vault`, `{ vault } = this.app` — but not `app.vaultError`. */
+const TOUCHES_VAULT = [/[\w)\]]\.vault\b(?!Error)/, /\{[^}]*\bvault\b[^}]*\}\s*=/];
+/** Reaching past the backend interface to the concrete client it holds:
+ *  `app.secretsBackend.client`, `(app.secretsBackend as X).client`, `{ client } = app.secretsBackend`. */
+const TOUCHES_CLIENT = [/secretsBackend\b[^\n;]*\.client\b/, /\{[^}]*\bclient\b[^}]*\}\s*=\s*[\w.()]*secretsBackend\b/];
 
 describe("secrets provider boundary", () => {
   const repo = path.resolve(import.meta.dirname, "..", "..");
@@ -206,20 +212,34 @@ describe("secrets provider boundary", () => {
     .split("\n")
     .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && f !== "src/secrets/vaultwarden.ts");
 
-  it("only lifecycle files reach the concrete Vaultwarden client", () => {
+  it("only the Vaultwarden backend reaches the concrete client", () => {
     const bad: string[] = [];
     for (const f of files) {
       if (VAULTWARDEN_LIFECYCLE[f]) continue;
       const text = readFileSync(path.join(repo, f), "utf8");
-      if (/from\s+["'][./]*(?:secrets\/)?vaultwarden\.js["']/.test(text)) bad.push(`${f}: imports secrets/vaultwarden.js`);
-      // `app.vault`, `a.vault`, `this.app.vault`, `{ vault } = this.app` — but not `app.vaultError`.
-      if (/[\w)\]]\.vault\b(?!Error)/.test(text) || /\{[^}]*\bvault\b[^}]*\}\s*=/.test(text)) bad.push(`${f}: touches AppState.vault`);
+      if (IMPORTS_CLIENT.test(text)) bad.push(`${f}: imports secrets/vaultwarden.js`);
+      if (TOUCHES_VAULT.some((re) => re.test(text))) bad.push(`${f}: touches AppState.vault`);
+      if (TOUCHES_CLIENT.some((re) => re.test(text))) bad.push(`${f}: reaches past AppState.secretsBackend to its client`);
     }
     expect(bad).toEqual([]);
   });
 
-  it("the check isn't vacuous: the lifecycle owner does match it", () => {
-    expect(/[\w)\]]\.vault\b(?!Error)/.test(readFileSync(path.join(repo, "src/app.ts"), "utf8"))).toBe(true);
+  it("the checks aren't vacuous", () => {
+    // The one exception really does import the client…
+    expect(IMPORTS_CLIENT.test(readFileSync(path.join(repo, "src/secrets/vaultwarden-provider.ts"), "utf8"))).toBe(true);
+    // …and the patterns catch the shapes they're meant to, and only those.
+    for (const hit of ["this.app.vault.sync()", "await app.vault.reestablish(cfg)", "const { vault } = this.app;"]) {
+      expect(TOUCHES_VAULT.some((re) => re.test(hit)), hit).toBe(true);
+    }
+    expect(TOUCHES_VAULT.some((re) => re.test("app.vaultError = null"))).toBe(false);
+    for (const hit of ["app.secretsBackend.client.sync()", "(app.secretsBackend as VaultwardenBackend).client", "const { client } = app.secretsBackend;"]) {
+      expect(TOUCHES_CLIENT.some((re) => re.test(hit)), hit).toBe(true);
+    }
+    expect(TOUCHES_CLIENT.some((re) => re.test("this.secretsBackend.configured(s); attempt.client"))).toBe(false);
+  });
+
+  it("AppState has no `vault` member any more", () => {
+    expect(/\b(?:readonly\s+)?vault\s*[:?]/.test(readFileSync(path.join(repo, "src/app.ts"), "utf8"))).toBe(false);
   });
 
   it("the exception list names only files that exist", () => {
