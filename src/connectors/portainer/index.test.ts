@@ -17,6 +17,9 @@ import {
   summarizeStacks,
   curateInspect,
   secretFingerprintBlock,
+  interpolateCompose,
+  composeServiceEnv,
+  envDrift,
 } from "./index.js";
 import type { Credential, Target, ToolContext } from "../types.js";
 
@@ -482,46 +485,152 @@ describe("env redaction on read paths", () => {
 });
 
 describe("update_stack_images", () => {
-  it("re-pulls and redeploys with the stack's own compose file and env", async () => {
-    const compose = "services:\n  app:\n    image: ghcr.io/example/app:latest";
-    const calls = mockFetch([
-      { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "app", EndpointId: 2, Env: [{ name: "TOKEN", value: "s3cr3t" }] } } },
-      { match: (u) => u.includes("/api/stacks/3/file"), reply: { json: { StackFileContent: compose } } },
-      { match: (u, i) => u.includes("/api/stacks/3?endpointId=2") && i.method === "PUT", reply: { json: {} } },
-    ]);
-    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+  const COMPOSE = [
+    "services:",
+    "  app:",
+    "    image: ghcr.io/example/app:latest",
+    "    environment:",
+    '      PUBLIC_URL: "https://10.0.0.5:8787"',
+    "      TOKEN: ${TOKEN}",
+  ].join("\n");
+  const STACK = { Id: 3, Name: "app", EndpointId: 2, Env: [{ name: "TOKEN", value: "s3cr3t" }] };
+  const IMAGE_ENV = ["PATH=/usr/local/bin:/usr/bin", "NODE_VERSION=22.0.0"];
+
+  /** Routes for a stack whose one container runs with `containerEnv`. */
+  function routes(containerEnv: string[], put: { status?: number; json?: unknown } = { json: {} }) {
+    return [
+      { match: (u: string, i: any) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: STACK } },
+      { match: (u: string) => u.includes("/api/stacks/3/file"), reply: { json: { StackFileContent: COMPOSE } } },
+      {
+        match: (u: string) => u.includes("/api/endpoints/2/docker/containers/json"),
+        reply: { json: [{ Id: "c1", Names: ["/app"], Labels: { "com.docker.compose.project": "app", "com.docker.compose.service": "app" } }] },
+      },
+      { match: (u: string) => u.includes("/api/endpoints/2/docker/containers/c1/json"), reply: { json: { Name: "/app", Image: "sha256:img", Config: { Env: [...IMAGE_ENV, ...containerEnv] } } } },
+      { match: (u: string) => u.includes("/api/endpoints/2/docker/images/sha256%3Aimg/json"), reply: { json: { Config: { Env: IMAGE_ENV } } } },
+      { match: (u: string, i: any) => u.includes("/api/stacks/3?endpointId=2") && i.method === "PUT", reply: put },
+    ];
+  }
+  const run = (input: Record<string, unknown>, c: ToolContext = ctx(cred({ fields: { token: "k" } }))) =>
+    tool("update_stack_images").run({ stackId: 3, stackName: "app", ...input }, c);
+
+  it("re-pulls and redeploys with the stack's own compose file and env when nothing has drifted", async () => {
+    const calls = mockFetch(routes(["PUBLIC_URL=https://10.0.0.5:8787", "TOKEN=s3cr3t"]));
+    const res = await run({});
     expect(res.isError).toBeFalsy();
     const put = calls.find((c) => c.init.method === "PUT")!;
-    expect(JSON.parse(put.init.body)).toEqual({ stackFileContent: compose, env: [{ name: "TOKEN", value: "s3cr3t" }], prune: false, pullImage: true });
+    expect(JSON.parse(put.init.body)).toEqual({ stackFileContent: COMPOSE, env: [{ name: "TOKEN", value: "s3cr3t" }], prune: false, pullImage: true });
     expect(res.text).toContain("ghcr.io/example/app:latest");
-    expect(res.text).toMatch(/compose file and environment unchanged/);
+    expect(res.text).toMatch(/compose file and stack environment unchanged/);
     expect(res.text).not.toContain("s3cr3t");
+  });
+
+  it("refuses, sending nothing, when a container value differs from the stack file — the hand-edited container case", async () => {
+    const calls = mockFetch(routes(["PUBLIC_URL=http://10.0.0.5:8787", "TOKEN=s3cr3t"]));
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Refusing to redeploy stack 'app' \(#3\)/);
+    expect(res.text).toContain("- app: PUBLIC_URL (changed)");
+    expect(res.text).not.toContain("10.0.0.5");
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(false);
+  });
+
+  it("reports a variable set only on the container, and one only in the stack file", async () => {
+    mockFetch(routes(["PUBLIC_URL=https://10.0.0.5:8787", "EXTRA=hand-added"]));
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("- app: EXTRA (container-only)");
+    expect(res.text).toContain("- app: TOKEN (stack-only)");
+    expect(res.text).not.toContain("hand-added");
+    expect(res.text).not.toContain("s3cr3t");
+  });
+
+  it("shows keyed fingerprints of both values when a fingerprinter is available, never the values", async () => {
+    mockFetch(routes(["PUBLIC_URL=http://10.0.0.5:8787", "TOKEN=s3cr3t"]));
+    const c = { ...ctx(cred({ fields: { token: "k" } })), fingerprint: async (v: string) => `len=${v.length} fp=test` };
+    const res = await run({}, c);
+    expect(res.text).toContain("PUBLIC_URL (changed) — running len=20 fp=test, stack file len=21 fp=test");
+  });
+
+  it("redeploys anyway with allowEnvDrift, and says which variables now follow the stack file", async () => {
+    const calls = mockFetch(routes(["PUBLIC_URL=http://10.0.0.5:8787", "TOKEN=s3cr3t"]));
+    const res = await run({ allowEnvDrift: true });
+    expect(res.isError).toBeFalsy();
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(true);
+    expect(res.text).toMatch(/Environment drift was allowed/);
+    expect(res.text).toContain("PUBLIC_URL (changed)");
+  });
+
+  it("fails closed when the comparison cannot run", async () => {
+    const calls = mockFetch([
+      ...routes([]).filter((r) => !r.match("/api/endpoints/2/docker/containers/json", {})),
+      { match: (u: string) => u.includes("/api/endpoints/2/docker/containers/json"), reply: { status: 500, json: { message: "boom" } } },
+    ]);
+    const res = await run({});
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Could not compare stack 'app'/);
+    expect(calls.some((c) => c.init.method === "PUT")).toBe(false);
   });
 
   it("refuses when the given name does not match the id", async () => {
     const calls = mockFetch([
       { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "other", EndpointId: 2 } } },
     ]);
-    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+    const res = await run({});
     expect(res.isError).toBe(true);
     expect(res.text).toMatch(/named 'other'/);
     expect(calls.some((c) => c.init.method === "PUT")).toBe(false);
   });
 
   it("scrubs the stack's env values from a Portainer error", async () => {
-    mockFetch([
-      { match: (u, i) => /\/api\/stacks\/3$/.test(u) && (!i.method || i.method === "GET"), reply: { json: { Id: 3, Name: "app", EndpointId: 2, Env: [{ name: "TOKEN", value: "s3cr3t" }] } } },
-      { match: (u) => u.includes("/api/stacks/3/file"), reply: { json: { StackFileContent: "services: {}" } } },
-      { match: (u, i) => u.includes("/api/stacks/3?endpointId=2") && i.method === "PUT", reply: { status: 500, json: { message: "pull failed for TOKEN=s3cr3t" } } },
-    ]);
-    const res = await tool("update_stack_images").run({ stackId: 3, stackName: "app" }, ctx(cred({ fields: { token: "k" } })));
+    mockFetch(routes(["PUBLIC_URL=https://10.0.0.5:8787", "TOKEN=s3cr3t"], { status: 500, json: { message: "pull failed for TOKEN=s3cr3t" } }));
+    const res = await run({});
     expect(res.isError).toBe(true);
     expect(res.text).not.toContain("s3cr3t");
   });
 
-  it("names the stack, the target and what stays unchanged in the confirm text", () => {
-    const text = tool("update_stack_images").confirm!({ stackId: 3, stackName: "app" }, target({ endpointId: 1 }));
-    expect(text).toBe("Pull the newest images and redeploy Portainer stack 'app' (#3) on nas — recreates its containers; compose file and environment unchanged");
+  it("names the stack, the target and what stays unchanged in the confirm text, and flags allowEnvDrift", () => {
+    const confirm = tool("update_stack_images").confirm!;
+    expect(confirm({ stackId: 3, stackName: "app" }, target({ endpointId: 1 }))).toBe(
+      "Pull the newest images and redeploy Portainer stack 'app' (#3) on nas — recreates its containers; compose file and stack environment unchanged",
+    );
+    expect(confirm({ stackId: 3, stackName: "app", allowEnvDrift: true }, target({ endpointId: 1 }))).toMatch(/ALLOWING environment drift/);
+  });
+});
+
+describe("compose environment helpers", () => {
+  it("interpolates the forms Compose supports", () => {
+    const vars = new Map([["A", "1"], ["EMPTY", ""]]);
+    expect(interpolateCompose("${A}-$A-${MISSING}-$$A", vars)).toBe("1-1--$A");
+    expect(interpolateCompose("${EMPTY:-d}|${EMPTY-d}|${MISSING-d}", vars)).toBe("d||d");
+  });
+
+  it("reads map and list environments, resolving bare keys from the stack env", () => {
+    const compose = [
+      "services:",
+      "  a:",
+      "    environment:",
+      "      - X=1",
+      "      - FROM_STACK",
+      "      - NOT_SET",
+      "  b:",
+      "    env_file: stack.env",
+      "    environment:",
+      "      PORT: 8787",
+      "      FLAG: true",
+      "      FROM_STACK:",
+    ].join("\n");
+    const out = composeServiceEnv(compose, [{ name: "FROM_STACK", value: "v" }]);
+    expect([...out.get("a")!.env]).toEqual([["X", "1"], ["FROM_STACK", "v"]]);
+    expect(out.get("a")!.envFile).toBe(false);
+    expect([...out.get("b")!.env]).toEqual([["PORT", "8787"], ["FLAG", "true"], ["FROM_STACK", "v"]]);
+    expect(out.get("b")!.envFile).toBe(true);
+  });
+
+  it("ignores image defaults, and skips container-only reports for a service with an env_file", () => {
+    const image = [{ name: "PATH", value: "/bin" }];
+    const running = [{ name: "PATH", value: "/bin" }, { name: "FROM_FILE", value: "x" }];
+    expect(envDrift({ env: new Map(), envFile: true }, running, image)).toEqual([]);
+    expect(envDrift({ env: new Map(), envFile: false }, running, image)).toEqual([{ name: "FROM_FILE", kind: "container-only", running: "x" }]);
   });
 });
 
