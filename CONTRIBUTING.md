@@ -28,7 +28,8 @@ A PR that breaks one of these will not be merged, however useful the feature is.
    phones home.
 6. **The vault scope never widens.** The service identity can read only the
    infrastructure collection it was given. Don't add code that logs in as a personal
-   account or asks for broader access.
+   account or asks for broader access. Credential consumers go through
+   `AppState.secrets` (the `SecretsProvider`), never a vault client directly.
 7. **No real hostnames, IPs, or personal data** in code, tests, fixtures, docs, commit
    messages, or PR text. Use placeholders (`nas1`, `192.168.1.x`, `10.0.0.x`,
    `example.com`). `npm run check:homelab` checks the tree; `npm install` enables the
@@ -117,10 +118,44 @@ maintainer-owned and may shrink but not grow without review.
 over new packages. A new runtime dependency needs a maintainer's agreement in the issue:
 every package runs inside a process that can read the vault.
 
-**Coming soon:** pluggable secret providers (vaults other than Vaultwarden), connector
-families with shared tool contracts, declarative app recipes, and command packs for the
-SSH allowlist. Please hold PRs in those areas until the interfaces land, or discuss
-the design in an issue first.
+## Adding a secrets provider
+
+Vaultwarden is the first implementation of the `SecretsProvider` interface
+(`src/secrets/provider.ts`). Another backend (an age-encrypted file, 1Password Connect,
+HashiCorp Vault, …) can implement it too. A provider holds the keys to every target, so
+the bar is higher than for a connector:
+
+1. **Open an issue first.** Choosing a provider at startup and its connection lifecycle
+   (setup wizard, unlock) aren't pluggable yet, so a new provider will touch more than
+   its own file. Agree on that part in the issue.
+2. **Implement the required surface**: `get`, `resolveById`, `resolveRef`, `list`,
+   `describeFailure` and `ready`. Add `create` / `update` / `delete` / `sync` only if the
+   backend supports them. A missing write capability is fine: the write tools refuse
+   with a clear message and the read side keeps working.
+3. **State the security contract in the module doc**, one point at a time. The full text
+   is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#secrets-providers). In short:
+   - *Scoping.* Say how the backend, not Skeleton Key's own code, keeps the provider's
+     identity limited to the homelab's secrets and away from the operator's personal
+     ones. Vaultwarden does it with an org/collection key the service account is the
+     only member of. A filter in our process doesn't count.
+   - *Values stay in memory.* A value leaves the provider only inside the `Credential`
+     from `get` / `resolveById`: never in argv, logs, errors, audit entries, tool
+     results, or the return value of any other method.
+   - *Value-free failures.* `describeFailure` returns a fixed summary for anything the
+     provider throws.
+   - *Unambiguous resolution.* Ambiguous refs and deleted items are refused, and
+     `resolveById` matches the id only.
+   - *No caller-chosen scope.* No method takes a scope, account, collection or path.
+   - *Offline behaviour.* Serve a cache or fail closed, and say which.
+4. **Test it the way `src/secrets/provider.test.ts` tests the Vaultwarden adapter**,
+   including a failure whose raw error text contains a secret-looking string that
+   `describeFailure` must not repeat.
+5. **No new runtime dependency without agreement in the issue.** A provider SDK runs
+   with the keys to everything.
+
+**Coming soon:** connector families with shared tool contracts, declarative app recipes,
+and command packs for the SSH allowlist. Please hold PRs in those areas until the
+interfaces land, or discuss the design in an issue first.
 
 ## Pull requests
 

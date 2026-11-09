@@ -76,7 +76,7 @@ export function buildApiRouter(app: AppState): Router {
         setupComplete: await app.isSetupComplete(),
         storeExists: await app.store.exists(),
         storeLocked: app.store.locked,
-        vaultUnlocked: app.vault.unlocked,
+        vaultUnlocked: app.secrets.ready,
         vaultError: app.vaultError,
         publicUrl: app.publicUrl(),
         targetCount: app.registry.list().length,
@@ -135,7 +135,7 @@ export function buildApiRouter(app: AppState): Router {
         });
         return;
       }
-      res.json({ ok: true, vaultUnlocked: app.vault.unlocked });
+      res.json({ ok: true, vaultUnlocked: app.secrets.ready });
     }),
   );
 
@@ -258,7 +258,7 @@ export function buildApiRouter(app: AppState): Router {
         tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "ok",
         detail: "vault server URL changed; service account re-logged in, offline cache re-synced",
       });
-      res.json({ ok: true, vaultUnlocked: app.vault.unlocked, checks: await setup.runChecks().catch(() => []) });
+      res.json({ ok: true, vaultUnlocked: app.secrets.ready, checks: await setup.runChecks().catch(() => []) });
     }),
   );
 

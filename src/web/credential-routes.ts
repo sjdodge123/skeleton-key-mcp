@@ -5,7 +5,7 @@ import { safeHost } from "./credential-requests.js";
 import { checkConstraints, runVerifyProbe } from "./credential-verify.js";
 import { bodyOf, firstStr, paramStr } from "./http-util.js";
 import { htmlEscape } from "./html.js";
-import { describeVaultFailure } from "../secrets/vaultwarden.js";
+import { requireCapability } from "../secrets/provider.js";
 import { lockoutMessage, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
 
 /**
@@ -276,7 +276,7 @@ export function buildCredentialRouter(app: AppState): Router {
     }
 
     // The store must be unlocked to verify TOTP and write to the vault.
-    if (app.store.locked || !app.vault.unlocked) {
+    if (app.store.locked || !app.secrets.ready) {
       res.status(409).type("html").send(formPage(request, { error: "Skeleton Key is locked — unlock it first, then reopen this link." }));
       return;
     }
@@ -422,13 +422,13 @@ export function buildCredentialRouter(app: AppState): Router {
       if (request.overwrite) {
         // Re-fill the EXISTING item in place (same id): listed fields are
         // replaced by name, everything else on the item is kept.
-        await app.vault.updateLoginItem(request.name, {
+        await requireCapability(app.secrets, "update")(request.name, {
           username: loginUsername,
           password: !multi && request.kind === "password" ? secret : undefined,
           fields,
         });
       } else {
-        await app.vault.createLoginItem({
+        await requireCapability(app.secrets, "create")({
           name: request.name,
           username: loginUsername,
           password: !multi && request.kind === "password" ? secret : undefined,
@@ -437,7 +437,6 @@ export function buildCredentialRouter(app: AppState): Router {
           url: !multi && request.kind === "password" ? `ssh://${request.host}` : undefined,
           notes: `Stored via Skeleton Key credential hand-off. ${request.reason}`,
           fields,
-          collectionName: app.store.get().bwCollectionName,
         });
       }
       // Keyed fingerprints (len + HMAC prefix) so the agent can later compare
@@ -448,7 +447,7 @@ export function buildCredentialRouter(app: AppState): Router {
       // Roll the claim back so the user can retry the same link.
       releaseClaim();
       // A fixed summary only: the raw `bw` stderr can quote an upstream reply.
-      res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${describeVaultFailure(err)}` }));
+      res.status(400).type("html").send(formPage(request, { error: `Could not store the credential${multi ? "s" : ""}: ${app.secrets.describeFailure(err)}` }));
       return;
     } finally {
       // Drop the plaintext values as soon as the write is done (or failed) —
