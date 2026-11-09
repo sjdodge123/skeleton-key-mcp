@@ -85,8 +85,11 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
 
 Roughly in priority order.
 
-1. **Phase 3 — pluggable secret providers.** A `SecretsProvider` interface so vaults other
-   than Vaultwarden can back a deployment, with the scoping guarantee stated per provider.
+1. **Phase 3 — pluggable secret providers.** The `SecretsProvider` interface, the
+   Vaultwarden adapter and the per-provider security contract have landed
+   (`src/secrets/provider.ts`, docs/ARCHITECTURE.md "Secrets providers"). Still open:
+   choosing a provider at startup, a provider-neutral connection lifecycle (setup wizard,
+   unlock), and a second provider to prove the seam.
 2. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
    hypervisors, routers and NAS, checked by the conformance suite.
 3. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and

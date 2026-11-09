@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AppState } from "../app.js";
 import type { ToolResult, ToolTier, Target } from "../connectors/types.js";
 import { generateSshKey } from "../lib/ssh-keygen.js";
+import { requireCapability } from "../secrets/provider.js";
 import { SERVER_VERSION } from "../version.js";
 import { scanLan } from "../discovery/scan.js";
 import { assertKnownOptionKeys, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
@@ -254,19 +255,20 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       },
       run: async (input, a) => {
         const i = input as { name: string; username: string; host: string; url?: string; passphrase?: string };
+        // Before generating anything: a read-only provider refuses up front.
+        const create = requireCapability(a.secrets, "create");
         const key = await generateSshKey(`skeleton-key:${i.name}`, i.passphrase ?? "");
         const fields = [
           { name: "private_key", value: key.privateKey, hidden: true },
           { name: "host", value: i.host, hidden: false },
           ...(i.passphrase ? [{ name: "key_passphrase", value: i.passphrase, hidden: true }] : []),
         ];
-        await a.vault.createLoginItem({
+        await create({
           name: i.name,
           username: i.username,
           url: i.url ?? `ssh://${i.host}`,
           notes: "SSH key managed by Skeleton Key. Private key in the 'private_key' field.",
           fields,
-          collectionName: a.store.get().bwCollectionName,
         });
         return ok(
           `Stored SSH key as vault item "${i.name}" (credentialRef).\n` +
@@ -293,14 +295,13 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       confirm: (input) => `Store a login named '${(input as { name: string }).name}' in the vault`,
       run: async (input, a) => {
         const i = input as { name: string; username?: string; password?: string; token?: string; url?: string; notes?: string };
-        await a.vault.createLoginItem({
+        await requireCapability(a.secrets, "create")({
           name: i.name,
           username: i.username,
           password: i.password,
           url: i.url,
           notes: i.notes,
           fields: i.token ? [{ name: "token", value: i.token, hidden: true }] : [],
-          collectionName: a.store.get().bwCollectionName,
         });
         return ok(`Stored login "${i.name}" in the vault (credentialRef).`);
       },
@@ -311,7 +312,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       tier: "read",
       inputSchema: z.object({}),
       run: async (_input, a) => {
-        const names = await a.vault.listItemNames();
+        const names = await a.secrets.list();
         return ok(names.length ? `Vault items:\n- ${names.join("\n- ")}` : "No items in the scoped collection yet.");
       },
     },
@@ -413,7 +414,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         let credentialId: string | undefined;
         if (i.credentialRef) {
           try {
-            credentialId = (await a.vault.resolveRef(i.credentialRef)).id;
+            credentialId = (await a.secrets.resolveRef(i.credentialRef)).id;
           } catch (e) {
             return err(`credentialRef '${i.credentialRef}' didn't resolve: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -444,11 +445,12 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       confirm: (input) => `Delete vault item '${(input as { credentialRef: string }).credentialRef}' — any target still using it will lose access`,
       run: async (input, a) => {
         const i = input as { credentialRef: string; force?: boolean };
+        const remove = requireCapability(a.secrets, "delete");
         // Resolve the ref to its canonical identity FIRST, so the dependency
         // guard can't be bypassed by passing an id or a differently-cased ref
         // than the targets stored (deleteItem resolves fuzzily — the guard must
         // match the same way, or we'd delete a still-referenced item unguarded).
-        const resolved = await a.vault.resolveRef(i.credentialRef);
+        const resolved = await a.secrets.resolveRef(i.credentialRef);
         const exact = new Set([i.credentialRef, resolved.name, resolved.id]);
         // A target depends on this item iff its credentialRef RESOLVES to it.
         // A cheap exact-identity check first; otherwise resolve the target's ref
@@ -465,7 +467,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
             continue;
           }
           try {
-            if ((await a.vault.resolveRef(t.credentialRef)).id === resolved.id) dependents.push(t.name);
+            if ((await a.secrets.resolveRef(t.credentialRef)).id === resolved.id) dependents.push(t.name);
           } catch {
             /* ref no longer resolves — not a dependent of this item */
           }
@@ -476,7 +478,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
               "Re-point them first (update_target) or pass force=true.",
           );
         }
-        const { name } = await a.vault.deleteItem(i.credentialRef);
+        const { name } = await remove(i.credentialRef);
         const warn = dependents.length ? ` Warning: ${dependents.join(", ")} referenced it and will fail until re-pointed.` : "";
         return ok(`Deleted vault item "${name}".${warn}`);
       },
@@ -529,7 +531,7 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
         let credentialId = existing.credentialId;
         if (i.credentialRef) {
           try {
-            credentialId = (await a.vault.resolveRef(i.credentialRef)).id;
+            credentialId = (await a.secrets.resolveRef(i.credentialRef)).id;
           } catch (e) {
             return err(`credentialRef '${i.credentialRef}' didn't resolve: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -570,7 +572,9 @@ export function buildGlobalTools(app: AppState): GlobalTool[] {
       },
       run: async (input, a) => {
         const i = input as RequestCredentialInput;
-        const names = await a.vault.listItemNames();
+        // Refuse before minting a link the provider could never fulfil.
+        requireCapability(a.secrets, i.overwrite ? "update" : "create");
+        const names = await a.secrets.list();
         const exists = names.includes(i.name);
         if (exists && !i.overwrite) {
           return err(`A vault item named '${i.name}' already exists — pass overwrite: true to re-fill it in place, or pick a different name.`);

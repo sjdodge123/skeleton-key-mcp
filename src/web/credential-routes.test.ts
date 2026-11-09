@@ -380,6 +380,20 @@ describe("credential hand-off — pre-store verification probe", () => {
     expect(JSON.stringify(app.audit.recent(10))).not.toContain(CLIENT_SECRET);
   });
 
+  it("a provider that can't store refuses BEFORE the probe sends the value anywhere", async () => {
+    // Simulate a read-only provider: the instance has no `create`.
+    Object.defineProperty(app.secrets, "create", { value: undefined, configurable: true });
+    const req = app.credentialRequests.create({ name: "bot", host: "discord", kind: "token", reason: "migrate", verify: verify() });
+    const res = await postForm(req.id, { formToken: req.formToken, action: "submit", totp: generateTotpCode(TOTP_SECRET), secret: GOOD_TOKEN });
+    expect(res.status).toBe(409);
+    const html = await res.text();
+    expect(html).toContain("cannot create vault items");
+    expect(html).not.toContain(GOOD_TOKEN);
+    expect(seen).toEqual([]);
+    expect(created).toHaveLength(0);
+    expect(app.credentialRequests.get(req.id).status).toBe("pending");
+  });
+
   it("storeAnyway overrides a failed probe and records verification=failed", async () => {
     respondWith = 401;
     const req = app.credentialRequests.create({ name: "bot", host: "discord", kind: "token", reason: "migrate", verify: verify() });

@@ -181,7 +181,7 @@ export async function targetCredential(app: AppState, target: Target): Promise<C
 /** Best-effort: persist the id the name currently resolves to (missing or stale pin). */
 async function repinCredentialId(app: AppState, target: Target): Promise<void> {
   if (!target.credentialRef) return;
-  const { id } = await app.vault.resolveRef(target.credentialRef);
+  const { id } = await app.secrets.resolveRef(target.credentialRef);
   if (id === target.credentialId) return;
   const current = app.registry.get(target.name);
   if (!current || current.credentialRef !== target.credentialRef) return; // target changed under us

@@ -1,6 +1,9 @@
 import { access } from "node:fs/promises";
 import { BootstrapStore } from "./secrets/bootstrap-store.js";
-import { VaultwardenClient, describeVaultFailure, type GetCredentialOptions } from "./secrets/vaultwarden.js";
+import { VaultwardenClient, describeVaultFailure } from "./secrets/vaultwarden.js";
+import { VaultwardenSecretsProvider } from "./secrets/vaultwarden-provider.js";
+import type { ReadOptions, SecretsProvider } from "./secrets/provider.js";
+import type { Credential } from "./secrets/types.js";
 import { TargetRegistry } from "./config/registry.js";
 import { AuditLog } from "./audit/audit-log.js";
 import { OAuthService } from "./oauth/oauth-service.js";
@@ -39,20 +42,40 @@ interface AuthGate {
   refusals: RefusalCoalescer;
 }
 
+/** Options for `AppState.credentialFor`. */
+export interface CredentialReadOptions extends ReadOptions {
+  /** The ref is a pinned immutable item id: match by id only. */
+  byId?: boolean;
+}
+
 /**
  * Shared runtime state for the whole process: the encrypted bootstrap store, the
- * scoped Vaultwarden client, the target registry, and the audit log. Constructed
- * once at startup and passed to the MCP server and the web/wizard routes.
+ * secrets provider, the target registry, and the audit log. Constructed once at
+ * startup and passed to the MCP server and the web/wizard routes.
  */
 export class AppState {
+  /**
+   * The secrets backend every credential consumer goes through — tools, web
+   * routes, snapshots. Never reach past it to `vault`.
+   */
+  readonly secrets: SecretsProvider;
+
   private constructor(
     readonly store: BootstrapStore,
+    /** The concrete Vaultwarden client, for its connection LIFECYCLE only (the
+     *  setup wizard, store unlock, vault-server repair). Credential reads and
+     *  writes go through `secrets`; `src/secrets/provider.test.ts` enforces it. */
     readonly vault: VaultwardenClient,
     readonly registry: TargetRegistry,
     readonly audit: AuditLog,
     readonly oauth: OAuthService,
     readonly credentialRequests: CredentialRequestStore,
-  ) {}
+  ) {
+    // The collection is read from the store at write time (it is locked at
+    // construction). A write while the store is locked throws from `get()`
+    // rather than falling back to "the only collection" — fail closed.
+    this.secrets = new VaultwardenSecretsProvider(vault, () => store.get().bwCollectionName);
+  }
 
   static async create(): Promise<AppState> {
     const store = await BootstrapStore.open();
@@ -194,7 +217,7 @@ export class AppState {
    *  until the admin unlocks via the web UI. Tools degrade rather than the
    *  endpoint going dark — see `mcpAuth` and the CallTool locked gate. */
   get locked(): boolean {
-    return this.store.locked || !this.vault.unlocked;
+    return this.store.locked || !this.secrets.ready;
   }
 
   /**
@@ -361,14 +384,16 @@ export class AppState {
     return fingerprintValue(this, value);
   }
 
-  /** Resolve a target's credential from the vault (offline-cache backed).
-   *  `opts.fresh` syncs first (bounded, best-effort) for deploy-time reads;
-   *  `opts.byId` treats `credentialRef` as a pinned item id. */
-  async credentialFor(credentialRef: string, opts?: GetCredentialOptions) {
-    if (!this.vault.unlocked) {
+  /** Resolve a target's credential through the secrets provider.
+   *  `opts.fresh` refreshes the provider's cache first (bounded, best-effort)
+   *  for deploy-time reads; `opts.byId` treats `credentialRef` as a pinned
+   *  item id and matches it by id only. */
+  async credentialFor(credentialRef: string, opts: CredentialReadOptions = {}): Promise<Credential> {
+    if (!this.secrets.ready) {
       throw new Error(this.unlockGuidance());
     }
-    return this.vault.getCredential(credentialRef, opts);
+    const { byId, ...read } = opts;
+    return byId ? this.secrets.resolveById(credentialRef, read) : this.secrets.get(credentialRef, read);
   }
 }
 

@@ -111,7 +111,7 @@ describe("request_credential input schema", () => {
   it("records the field set on the request and reports the names (only) once fulfilled", async () => {
     const requests = new CredentialRequestStore();
     const fakeApp = {
-      vault: { listItemNames: async () => [] },
+      secrets: { list: async () => [], create: async () => ({ name: "" }) },
       credentialRequests: requests,
       publicUrl: () => "http://192.168.1.53:8787",
     } as unknown as AppState;
@@ -276,13 +276,13 @@ describe("credentialId pinning across register / update / delete / list", () => 
           else targets.push(t);
         },
       },
-      vault: {
+      secrets: {
         resolveRef: async (ref: string) => {
           const hit = Object.entries(idsByName).find(([n, id]) => n === ref || id === ref);
           if (!hit) throw new Error(`No vault item named "${ref}"`);
           return { id: hit[1], name: hit[0] };
         },
-        deleteItem: async (ref: string) => {
+        delete: async (ref: string) => {
           deleted.push(ref);
           return { name: ref };
         },
@@ -436,7 +436,7 @@ describe("request_credential — run()", () => {
   function stubApp(existing: string[], publicUrl: string | null = "https://sk.lan:8787") {
     const store = new CredentialRequestStore();
     return {
-      app: { vault: { listItemNames: async () => existing }, credentialRequests: store, publicUrl: () => publicUrl } as unknown as AppState,
+      app: { secrets: { list: async () => existing, create: async () => ({ name: "" }), update: async () => ({ id: "", name: "" }) }, credentialRequests: store, publicUrl: () => publicUrl } as unknown as AppState,
       store,
     };
   }

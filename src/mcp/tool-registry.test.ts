@@ -57,7 +57,7 @@ function appFor(
   });
   const app = {
     registry: { list: () => targets, get: (n: string) => targets.find((t) => t.name === n), upsert },
-    vault: { resolveRef },
+    secrets: { resolveRef },
     locked: opts.locked ?? false,
     credentialFor,
   } as unknown as AppState;
