@@ -10,7 +10,7 @@ import { scanLan } from "../discovery/scan.js";
 import { listConnectors, getConnector, registerableType, validateTargetOptions } from "../connectors/index.js";
 import { resolveTools } from "../mcp/tool-registry.js";
 import { listSkeletons, streamSkeletonTar } from "../snapshots/snapshot-service.js";
-import { describeVaultFailure, VaultCommandError } from "../secrets/vaultwarden.js";
+import { capabilitiesOf } from "../secrets/provider.js";
 import { UserFacingError } from "../lib/errors.js";
 import { clientMessage, paramStr } from "./http-util.js";
 import { lockoutMessage, passphraseRateLimit, refuseLockedOut, clientAttempt, totpRateLimit } from "./rate-limit.js";
@@ -78,6 +78,15 @@ export function buildApiRouter(app: AppState): Router {
         storeLocked: app.store.locked,
         vaultUnlocked: app.secrets.ready,
         vaultError: app.vaultError,
+        // Which secrets provider is selected and what it can do, so the admin
+        // page can say up front that a read-only one refuses the write tools.
+        // `configured` (whether its saved settings exist) needs the store open.
+        secrets: {
+          kind: app.secrets.kind,
+          label: app.secrets.label,
+          capabilities: capabilitiesOf(app.secrets),
+          configured: app.store.locked ? null : app.secretsBackend.configured(app.store.get()),
+        },
         publicUrl: app.publicUrl(),
         targetCount: app.registry.list().length,
         toolCount: app.store.locked ? 0 : resolveTools(app).length,
@@ -120,18 +129,18 @@ export function buildApiRouter(app: AppState): Router {
         refuseLockedOut(res, wait).json({ error: busy ? "An unlock is already in progress — try again in a moment." : lockoutMessage(wait, "passphrases") });
         return;
       }
-      // Re-establish the saved vault session, keep the bearer hash current, and
-      // nudge locked sessions to re-list tools — shared with the boot paths.
-      // A vault failure here must not read as a failed unlock: the store IS
-      // open, so say so and let the admin page offer the repair (re-pointing
-      // the vault URL) instead of bouncing the user back to the passphrase box.
+      // Re-establish the saved secrets-provider connection, keep the bearer
+      // hash current, and nudge locked sessions to re-list tools — shared with
+      // the boot paths. A provider failure here must not read as a failed
+      // unlock: the store IS open, so say so and let the admin page offer the
+      // repair instead of bouncing the user back to the passphrase box.
       try {
         await app.postUnlock();
       } catch (err) {
         res.json({
           ok: true,
           vaultUnlocked: false,
-          vaultError: describeVaultFailure(err),
+          vaultError: app.secrets.describeFailure(err),
         });
         return;
       }
@@ -220,18 +229,23 @@ export function buildApiRouter(app: AppState): Router {
     }),
   );
 
-  // --- Vault connection (post-setup repair) ---
-  // Re-point the Vaultwarden client at a new https:// URL — the fix when the
-  // stored LAN http:// address stops being accepted by the Bitwarden CLI. Same
-  // gate as the auto-unlock controls: store unlocked, and once setup is
-  // complete a fresh TOTP (it re-logs the service account in and rewrites a
-  // bootstrap secret). Fails closed: the stored URL is only replaced after the
-  // vault unlocks and syncs on the new one.
+  // --- Secrets-provider connection (post-setup repair) ---
+  // Re-point the secrets backend at a new https:// URL — for Vaultwarden, the
+  // fix when the stored LAN http:// address stops being accepted by the
+  // Bitwarden CLI. Same gate as the auto-unlock controls: store unlocked, and
+  // once setup is complete a fresh TOTP (it re-logs the service account in and
+  // rewrites a bootstrap secret). Fails closed: the stored URL is only
+  // replaced after the backend reconnects on the new one. A backend with no
+  // server (the age file) refuses with 409.
   router.post(
     "/vault/server",
     totpLimit,
     h(async (req, res) => {
       if (!(await guardAutoUnlock(req, res))) return;
+      if (!app.secretsBackend.changeServer) {
+        res.status(409).json({ error: `The configured secrets provider (${app.secrets.label}) has no server URL to change.` });
+        return;
+      }
       const { serverUrl } = z
         .object({
           serverUrl: z
@@ -240,13 +254,14 @@ export function buildApiRouter(app: AppState): Router {
             .refine((u) => u.startsWith("https://"), { message: "The Bitwarden CLI only accepts https:// vault URLs." }),
         })
         .parse(req.body ?? {});
+      // Only Vaultwarden has a server URL today; its stored field names the prior host.
       const prior = app.store.get().bwServerUrl;
       try {
         await app.changeVaultServer(serverUrl);
       } catch (err) {
-        const message = describeVaultFailure(err);
+        const message = app.secrets.describeFailure(err);
         app.audit.record({
-          ts: new Date().toISOString(), tool: "vault.change_server", target: "vaultwarden",
+          ts: new Date().toISOString(), tool: "vault.change_server", target: app.secrets.kind,
           tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "error",
           detail: message,
         });
@@ -254,11 +269,70 @@ export function buildApiRouter(app: AppState): Router {
         return;
       }
       app.audit.record({
-        ts: new Date().toISOString(), tool: "vault.change_server", target: "vaultwarden",
+        ts: new Date().toISOString(), tool: "vault.change_server", target: app.secrets.kind,
         tier: "execute", args: { host: hostOf(serverUrl), priorHost: hostOf(prior) }, status: "ok",
         detail: "vault server URL changed; service account re-logged in, offline cache re-synced",
       });
       res.json({ ok: true, vaultUnlocked: app.secrets.ready, checks: await setup.runChecks().catch(() => []) });
+    }),
+  );
+
+  // Retry the saved connection — after a backend outage, or once the
+  // operator has fixed the age file. Nothing is changed or persisted.
+  router.post(
+    "/vault/reconnect",
+    totpLimit,
+    h(async (req, res) => {
+      if (!(await guardAutoUnlock(req, res))) return;
+      if (!app.secretsBackend.configured(app.store.get())) {
+        res.status(409).json({ error: `${app.secrets.label} hasn't been connected yet — connect it first.` });
+        return;
+      }
+      const audit = (status: "ok" | "error", detail: string) =>
+        app.audit.record({ ts: new Date().toISOString(), tool: "vault.reconnect", target: app.secrets.kind, tier: "execute", args: {}, status, detail });
+      try {
+        await app.postUnlock();
+      } catch (err) {
+        const message = app.secrets.describeFailure(err);
+        audit("error", message);
+        res.status(400).json({ error: message });
+        return;
+      }
+      audit("ok", "secrets provider reconnected from its saved settings");
+      res.json({ ok: true, vaultUnlocked: app.secrets.ready, checks: await setup.runChecks().catch(() => []) });
+    }),
+  );
+
+  // Connect a secrets provider AFTER setup — the second half of switching
+  // SKELETON_KEY_SECRETS_PROVIDER on an existing deployment. Only while the
+  // selected provider has no saved settings, so it can never re-point a
+  // provider that is already connected. Store unlocked + a fresh TOTP. The
+  // input (an API key, an identity) is never audited or echoed.
+  router.post(
+    "/vault/connect",
+    totpLimit,
+    h(async (req, res) => {
+      if (!(await app.isSetupComplete())) {
+        res.status(409).json({ error: "Setup isn't complete — connect the provider in the setup wizard." });
+        return;
+      }
+      if (!(await guardAutoUnlock(req, res))) return;
+      if (app.secretsBackend.configured(app.store.get())) {
+        res.status(409).json({ error: `${app.secrets.label} is already connected — use reconnect instead.` });
+        return;
+      }
+      const { totp: _totp, ...input } = (req.body ?? {}) as Record<string, unknown>;
+      const audit = (status: "ok" | "error", detail: string) =>
+        app.audit.record({ ts: new Date().toISOString(), tool: "vault.connect", target: app.secrets.kind, tier: "execute", args: {}, status, detail });
+      let checks;
+      try {
+        checks = await setup.connectSecrets(input);
+      } catch (err) {
+        audit("error", err instanceof UserFacingError ? err.message : "connect failed");
+        throw err;
+      }
+      audit("ok", `${app.secrets.label} connected after setup`);
+      res.json({ ok: true, vaultUnlocked: app.secrets.ready, checks });
     }),
   );
 
@@ -279,30 +353,10 @@ export function buildApiRouter(app: AppState): Router {
     "/setup/vault",
     h(async (req, res) => {
       if (!(await guardSetup(res))) return;
-      const input = z
-        .object({
-          serverUrl: z
-            .string()
-            .url()
-            .refine((u) => u.startsWith("https://"), { message: "The Bitwarden CLI only accepts https:// vault URLs." }),
-          clientId: z.string().min(1),
-          clientSecret: z.string().min(1),
-          masterPassword: z.string().min(1),
-          collectionName: z.string().optional(),
-        })
-        .parse(req.body ?? {});
-      let checks;
-      try {
-        checks = await setup.connectVault(input);
-      } catch (err) {
-        // A `bw` failure gets its fixed summary; a UserFacingError keeps its
-        // own status; anything else (a local store write) is a logged 500.
-        if (err instanceof VaultCommandError) {
-          throw new UserFacingError(describeVaultFailure(err));
-        }
-        throw err;
-      }
-      res.json({ checks });
+      // The selected backend validates its own input and turns its failures
+      // into a value-free UserFacingError (400); a validation failure names
+      // fields only; anything else (a local store write) is a logged 500.
+      res.json({ checks: await setup.connectSecrets(req.body ?? {}) });
     }),
   );
 

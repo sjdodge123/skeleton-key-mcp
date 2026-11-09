@@ -5,15 +5,7 @@ import QRCode from "qrcode";
 import type { AppState, ClientAttempt, TotpCheck } from "../app.js";
 import { paths } from "../config/paths.js";
 import { UserFacingError } from "../lib/errors.js";
-import { verifyScoping, type CheckResult } from "./verify.js";
-
-export interface VaultConnectInput {
-  serverUrl: string;
-  clientId: string;
-  clientSecret: string;
-  masterPassword: string;
-  collectionName?: string;
-}
+import type { CheckResult } from "../secrets/backend.js";
 
 /**
  * Drives the first-run wizard's stateful steps against the AppState. Each method
@@ -23,31 +15,23 @@ export interface VaultConnectInput {
 export class SetupService {
   constructor(private readonly app: AppState) {}
 
-  /** Step: connect + verify the scoped Vaultwarden service account. */
-  async connectVault(input: VaultConnectInput): Promise<CheckResult[]> {
-    const { vault, store } = this.app;
-    await vault.reestablish({
-      serverUrl: input.serverUrl,
-      clientId: input.clientId,
-      clientSecret: input.clientSecret,
-      masterPassword: input.masterPassword,
-    });
-    await vault.sync();
-
-    await store.update({
-      bwServerUrl: input.serverUrl,
-      bwClientId: input.clientId,
-      bwClientSecret: input.clientSecret,
-      bwMasterPassword: input.masterPassword,
-      bwCollectionName: input.collectionName,
-    });
-
-    return verifyScoping(vault, input.collectionName);
+  /**
+   * Step: connect the selected secrets backend with the wizard's input (its
+   * own schema — Vaultwarden's service account, the age identity, …), persist
+   * the settings it returns only once it connected, and run its checks. Also
+   * the post-setup connect for a newly selected provider.
+   */
+  async connectSecrets(input: unknown): Promise<CheckResult[]> {
+    const { patch, finalize } = await this.app.secretsBackend.setup(input, this.app.store.get());
+    await this.app.store.update(patch);
+    await finalize?.();
+    await this.app.secretsConnected();
+    return this.runChecks();
   }
 
-  /** Step: re-run the scoping/durability checks on demand. */
+  /** Step: re-run the backend's scoping/durability checks on demand. */
   async runChecks(): Promise<CheckResult[]> {
-    return verifyScoping(this.app.vault, this.app.store.get().bwCollectionName);
+    return this.app.secretsBackend.verify(this.app.store.get());
   }
 
   /** Step: enroll TOTP; returns the otpauth URL + a QR data-URL for display. */
@@ -77,7 +61,7 @@ export class SetupService {
   async complete(): Promise<void> {
     const s = this.app.store.get();
     const missing: string[] = [];
-    if (!s.bwClientId) missing.push("Vaultwarden connection");
+    if (!this.app.secretsBackend.configured(s)) missing.push(`${this.app.secrets.label} connection`);
     if (!s.mcpBearerToken) missing.push("MCP bearer token");
     if (!s.totpSecret) missing.push("TOTP enrollment");
     if (missing.length > 0) {

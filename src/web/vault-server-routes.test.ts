@@ -62,23 +62,23 @@ const NEW_URL = "https://vault.example.net";
 /** Stub the `bw`-backed client: reestablish succeeds unless the URL matches `refuse`. */
 function stubVault(refuse?: RegExp): { logout: number; reestablish: string[]; sync: number } {
   const seen = { logout: 0, reestablish: [] as string[], sync: 0 };
-  app.vault.logout = async () => {
+  app.secretsBackend.client.logout = async () => {
     seen.logout += 1;
-    app.vault.session = null;
+    app.secretsBackend.client.session = null;
   };
-  app.vault.reestablish = async (cfg: { serverUrl: string }) => {
+  app.secretsBackend.client.reestablish = async (cfg: { serverUrl: string }) => {
     seen.reestablish.push(cfg.serverUrl);
     if (refuse?.test(cfg.serverUrl)) {
       throw new Error(
         `bw unlock failed: Unable to fetch ServerConfig from ${cfg.serverUrl}/api InsecureUrlNotAllowedError: Insecure URL not allowed. All URLs must use HTTPS.`,
       );
     }
-    app.vault.session = "test-session";
+    app.secretsBackend.client.session = "test-session";
   };
-  app.vault.sync = async () => {
+  app.secretsBackend.client.sync = async () => {
     seen.sync += 1;
   };
-  app.vault.run = async () => "[]"; // scoping checks list orgs/collections
+  app.secretsBackend.client.run = async () => "[]"; // scoping checks list orgs/collections
   return seen;
 }
 
