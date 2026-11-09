@@ -104,7 +104,7 @@ Once Skeleton Key is installed and the Portainer that runs it is registered as a
 What happens under the hood:
 
 1. `get_started` reports the running version. Claude checks the releases page itself; the server never contacts the internet to look for updates.
-2. Claude finds the stack running `ghcr.io/sjdodge123/skeleton-key-mcp` on your Portainer target and calls **`update_stack_images`**. It re-pulls the image and redeploys the stack **without touching its compose file or environment**. Your approval prompt names the exact stack and host.
+2. Claude finds the stack running `ghcr.io/sjdodge123/skeleton-key-mcp` on your Portainer target and calls **`update_stack_images`**. It re-pulls the image and redeploys the stack **without touching its compose file or environment**. Your approval prompt names the exact stack and host. If a setting was ever edited on the running container but not in the stack file, the redeploy would undo it, so the tool refuses first and lists the variables that differ; Claude then fixes the stack file with your OK and tries again.
 3. The MCP connection drops while the container is recreated, which is expected. After about 30 seconds Claude calls `get_started` again to confirm the new version. With [boot auto-unlock](#boot-auto-unlock) it's back unlocked; without it, unlock it in the web UI.
 
 Not registered Portainer yet? Ask Claude: *"Register the Portainer that runs Skeleton Key."* It needs a Portainer access token, which it collects through a one-time secure link, never in chat.
