@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as age from "age-encryption";
@@ -178,8 +178,14 @@ describe("age-file provider: writes", () => {
   it("writes atomically: 0600, armored, no temp file left behind", async () => {
     const { p } = await providerWith([]);
     await p.create({ name: "x", password: "p" });
-    expect((await stat(file)).mode & 0o777).toBe(0o600);
-    expect((await readFile(file, "utf8")).startsWith("-----BEGIN AGE ENCRYPTED FILE-----")).toBe(true);
+    // One handle for both checks, so the mode and the contents are read from the same file.
+    const fh = await open(file, "r");
+    try {
+      expect((await fh.stat()).mode & 0o777).toBe(0o600);
+      expect((await fh.readFile("utf8")).startsWith("-----BEGIN AGE ENCRYPTED FILE-----")).toBe(true);
+    } finally {
+      await fh.close();
+    }
     expect(await readdir(dir)).toEqual(["secrets.age"]);
   });
 
