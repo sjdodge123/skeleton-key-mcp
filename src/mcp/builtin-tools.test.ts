@@ -45,13 +45,39 @@ describe("global tool registry", () => {
 
 describe("get_started", () => {
   const run = (app: Partial<AppState>) => byName.get("get_started")!.run({}, app as AppState);
+  const fn = async () => ({}) as never;
+  /** A provider with every capability, and one with only the required surface. */
+  const full = { kind: "vaultwarden", label: "Vaultwarden", create: fn, update: fn, delete: fn, sync: fn };
+  const readOnly = { kind: "test-ro", label: "Test RO Vault" };
 
   it("reports the running version once unlocked, so an agent can tell whether an update exists", async () => {
-    const empty = await run({ locked: false, registry: { list: () => [] } } as unknown as Partial<AppState>);
+    const empty = await run({ locked: false, secrets: full, registry: { list: () => [] } } as unknown as Partial<AppState>);
     expect(empty.text).toContain(`Skeleton Key v${SERVER_VERSION}.`);
-    const some = await run({ locked: false, registry: { list: () => [{ name: "nas1", type: "ssh", host: "10.0.0.5" }] } } as unknown as Partial<AppState>);
+    const some = await run({ locked: false, secrets: full, registry: { list: () => [{ name: "nas1", type: "ssh", host: "10.0.0.5" }] } } as unknown as Partial<AppState>);
     expect(some.text).toContain(`Skeleton Key v${SERVER_VERSION}.`);
     expect(some.text).toContain("nas1 (ssh)");
+  });
+
+  it("names the secrets provider and its capabilities", async () => {
+    const r = await run({ locked: false, secrets: full, registry: { list: () => [] } } as unknown as Partial<AppState>);
+    expect(r.text).toContain("Secrets provider: Vaultwarden (read, create, update, delete, sync).");
+    expect(r.text).not.toContain("will refuse");
+    expect(r.text).toContain("request_credential");
+  });
+
+  it("says up front which tools a read-only provider will refuse, and onboards without request_credential", async () => {
+    const r = await run({ locked: false, secrets: readOnly, registry: { list: () => [] } } as unknown as Partial<AppState>);
+    expect(r.text).toContain("Secrets provider: Test RO Vault (read).");
+    expect(r.text).toMatch(/can't create, update or delete items, so request_credential, vault_store_login, vault_generate_ssh_key, vault_delete_credential will refuse/);
+    expect(r.text).toContain("add the host's credential in Test RO Vault themselves");
+    expect(r.text).not.toContain("Call request_credential");
+  });
+
+  it("a provider that can create but not update flags only the overwrite path", async () => {
+    const noUpdate = { kind: "x", label: "X", create: fn, delete: fn };
+    const r = await run({ locked: false, secrets: noUpdate, registry: { list: () => [] } } as unknown as Partial<AppState>);
+    expect(r.text).toContain("Secrets provider: X (read, create, delete). It can't update items, so request_credential with overwrite will refuse");
+    expect(r.text).toContain("Call request_credential");
   });
 
   it("shows only the unlock guidance while locked", async () => {

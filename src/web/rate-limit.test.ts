@@ -231,14 +231,14 @@ describe("TOTP attempt limiting", () => {
   });
 
   it("covers the credential hand-off form: 429 before the secret is read", async () => {
-    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
-    app.vault.createLoginItem = vi.fn();
+    Object.defineProperty(app.secretsBackend.client, "unlocked", { value: true, configurable: true });
+    app.secretsBackend.client.createLoginItem = vi.fn();
     await lockOut();
     const req = app.credentialRequests.create({ name: "x", host: "h", reason: "r" });
     const r = await form(`${v4}/credential/${req.id}`, { formToken: req.formToken, totp: code(), secret: "hunter2-hunter2" });
     expect(r.status).toBe(429);
     expect(await r.text()).toMatch(/Too many wrong authenticator codes/);
-    expect(app.vault.createLoginItem).not.toHaveBeenCalled();
+    expect(app.secretsBackend.client.createLoginItem).not.toHaveBeenCalled();
     expect(app.credentialRequests.get(req.id).status).toBe("pending");
   });
 
@@ -297,6 +297,8 @@ describe("every TOTP route is gated twice: middleware AND handler", () => {
     { name: "autounlock enable", path: "/api/store/autounlock/enable", body: (totp) => ({ totp }) },
     { name: "autounlock disable", path: "/api/store/autounlock/disable", body: (totp) => ({ totp }) },
     { name: "vault server", path: "/api/vault/server", body: (totp) => ({ totp, serverUrl: "https://vault.example" }) },
+    { name: "vault reconnect", path: "/api/vault/reconnect", body: (totp) => ({ totp }) },
+    { name: "vault connect", path: "/api/vault/connect", body: (totp) => ({ totp }) },
     { name: "setup totp verify", preSetup: true, path: "/api/setup/totp/verify", body: (token) => ({ token }) },
     { name: "audit recent", path: "/api/audit/recent", body: (totp) => ({ totp }) },
     { name: "oauth client revoke", path: "/api/oauth/clients/some-client/revoke", body: (totp) => ({ totp }) },
@@ -334,8 +336,8 @@ describe("every TOTP route is gated twice: middleware AND handler", () => {
   }
 
   beforeEach(() => {
-    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
-    app.vault.createLoginItem = vi.fn();
+    Object.defineProperty(app.secretsBackend.client, "unlocked", { value: true, configurable: true });
+    app.secretsBackend.client.createLoginItem = vi.fn();
     // A global lockout: every client is refused, whatever it sends.
     for (let i = 0; i < 10; i++) app.checkTotp(wrong(i + 1), { client: `198.51.100.${i}`, via: "test" });
   });

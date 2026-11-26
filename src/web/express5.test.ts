@@ -7,6 +7,7 @@ import type { Server } from "node:http";
 import type { Request } from "express";
 import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 import type { AppState } from "../app.js";
+import type { VaultwardenBackend } from "../secrets/vaultwarden-provider.js";
 import { bodyOf, errorHandler, paramStr } from "./http-util.js";
 
 /**
@@ -19,6 +20,8 @@ import { bodyOf, errorHandler, paramStr } from "./http-util.js";
 
 let dir: string;
 let app: AppState;
+/** The concrete Vaultwarden client behind the default provider, for stubbing `bw` calls. */
+const vw = () => (app.secretsBackend as VaultwardenBackend).client;
 let httpServer: Server;
 let root: string;
 
@@ -264,7 +267,7 @@ describe("Express 5: a POST no body parser matched (req.body undefined)", () => 
 
   it("the credential hand-off form treats it as a stale form (CSRF), and stores nothing", async () => {
     const createLoginItem = vi.fn();
-    app.vault.createLoginItem = createLoginItem;
+    vw().createLoginItem = createLoginItem;
     const req = app.credentialRequests.create({ name: "n", host: "h", kind: "token", reason: "r" });
     const r = await fetch(`${root}/credential/${req.id}`, plain);
     expect(r.status).toBe(403);
@@ -375,9 +378,9 @@ describe("Express 5: the final error handler", () => {
 describe("Express 5: errors past the credential claim", () => {
   it("an unexpected throw after the claim releases the link instead of stranding it", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    Object.defineProperty(vw(), "unlocked", { value: true, configurable: true });
     const createLoginItem = vi.fn();
-    app.vault.createLoginItem = createLoginItem;
+    vw().createLoginItem = createLoginItem;
     const req = app.credentialRequests.create({
       name: "bot", host: "h", kind: "token", reason: "r",
       verify: { method: "GET", url: "http://127.0.0.1:9/probe", headers: { Authorization: "Bot {{value}}" }, timeoutMs: 1000 },
@@ -399,7 +402,7 @@ describe("Express 5: errors past the credential claim", () => {
 describe("credential claim ownership", () => {
   it("a throw after this request released its claim never drops a concurrent submit's claim", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    Object.defineProperty(vw(), "unlocked", { value: true, configurable: true });
     const req = app.credentialRequests.create({
       name: "bot", host: "h", kind: "token", reason: "r",
       verify: { method: "GET", url: "http://127.0.0.1:9/probe", headers: { Authorization: "Bot {{value}}" }, timeoutMs: 1000 },

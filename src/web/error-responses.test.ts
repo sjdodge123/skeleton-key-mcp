@@ -8,6 +8,7 @@ import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { generateTotpCode, generateTotpSecret } from "../lib/totp.js";
 import type { AppState } from "../app.js";
+import type { VaultwardenBackend } from "../secrets/vaultwarden-provider.js";
 
 /**
  * No thrown message reaches an HTTP response. Each route that used to echo
@@ -20,6 +21,8 @@ import type { AppState } from "../app.js";
 
 let dir: string;
 let app: AppState;
+/** The concrete Vaultwarden client behind the default provider, for stubbing `bw` calls. */
+const vw = () => (app.secretsBackend as VaultwardenBackend).client;
 let httpServer: Server;
 let root: string;
 let paths: { setupComplete: string };
@@ -155,8 +158,8 @@ describe("/api (the h() wrapper)", () => {
 describe("vault failures reach the admin as a fixed summary", () => {
   /** Stub a `bw` failure as sanitizeBwError builds it: `bw <sub> failed: …`. */
   function failReestablish(message: string): void {
-    app.vault.logout = async () => {};
-    app.vault.reestablish = async () => {
+    vw().logout = async () => {};
+    vw().reestablish = async () => {
       throw new VaultCommandError(message, /^bw (\w+)/.exec(message)?.[1] ?? "unlock", 1);
     };
   }
@@ -189,8 +192,8 @@ describe("vault failures reach the admin as a fixed summary", () => {
 
   it("POST /api/setup/vault: an empty session key from bw is a vault failure (400), not a bare 500", async () => {
     silenceErrors();
-    app.vault.logout = async () => {};
-    app.vault.reestablish = async () => {
+    vw().logout = async () => {};
+    vw().reestablish = async () => {
       throw new VaultCommandError("bw unlock returned an empty session key.", "unlock", 0);
     };
     const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
@@ -200,8 +203,8 @@ describe("vault failures reach the admin as a fixed summary", () => {
 
   it("a plain Error that merely reads like a bw failure is not treated as one", async () => {
     const logged = silenceErrors();
-    app.vault.logout = async () => {};
-    app.vault.reestablish = async () => {
+    vw().logout = async () => {};
+    vw().reestablish = async () => {
       throw new Error(`bw unlock failed: ${SECRET}`);
     };
     const r = await post("/api/setup/vault", { serverUrl: "https://vault.example.net", clientId: "id", clientSecret: "cs", masterPassword: "mp" });
@@ -212,8 +215,8 @@ describe("vault failures reach the admin as a fixed summary", () => {
 
   it("POST /api/setup/vault: a non-vault fault (local store write) is a logged 500, not a vault message", async () => {
     const logged = silenceErrors();
-    app.vault.reestablish = async () => {};
-    app.vault.sync = async () => {};
+    vw().reestablish = async () => {};
+    vw().sync = async () => {};
     app.store.update = async () => {
       throw new Error(`EACCES writing near ${SECRET}`);
     };
@@ -225,13 +228,13 @@ describe("vault failures reach the admin as a fixed summary", () => {
 
   it("POST /api/setup/checks: a failed check's detail is the fixed summary, never the raw message", async () => {
     const logged = silenceErrors();
-    app.vault.listOrganizations = async () => {
+    vw().listOrganizations = async () => {
       throw new VaultCommandError(`bw list failed: upstream said ${SECRET}`, "list", 1);
     };
-    app.vault.listCollections = async () => {
+    vw().listCollections = async () => {
       throw new SyntaxError(`Unexpected token in JSON at position 3 ("${SECRET}")`);
     };
-    app.vault.listItemNames = async () => {
+    vw().listItemNames = async () => {
       throw new Error(`decrypt failed: ${SECRET}`);
     };
     const r = await post("/api/setup/checks", {});
@@ -282,7 +285,7 @@ describe("vault failures reach the admin as a fixed summary", () => {
 describe("credential hand-off: a failed vault write", () => {
   async function submit(): Promise<string> {
     await markSetupComplete();
-    Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
+    Object.defineProperty(vw(), "unlocked", { value: true, configurable: true });
     const req = app.credentialRequests.create({ name: "bot", host: "h", kind: "token", reason: "r" });
     const r = await fetch(
       `${root}/credential/${req.id}`,
@@ -296,7 +299,7 @@ describe("credential hand-off: a failed vault write", () => {
 
   it("shows the bw subcommand, not its stderr", async () => {
     silenceErrors();
-    app.vault.createLoginItem = async () => {
+    vw().createLoginItem = async () => {
       throw new VaultCommandError(`bw create failed: 422 ${SECRET}`, "create", 1);
     };
     const text = await submit();
@@ -307,7 +310,7 @@ describe("credential hand-off: a failed vault write", () => {
 
   it("keeps a UserFacingError's message (the admin can act on it)", async () => {
     const { UserFacingError } = await import("../lib/errors.js");
-    app.vault.createLoginItem = async () => {
+    vw().createLoginItem = async () => {
       throw new UserFacingError(`A vault item named "bot" already exists — pick a different name.`);
     };
     const text = await submit();

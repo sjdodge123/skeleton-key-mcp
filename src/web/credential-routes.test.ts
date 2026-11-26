@@ -56,8 +56,8 @@ beforeEach(async () => {
 
   // Stub the vault: an unlocked client whose createLoginItem records its input.
   created = [];
-  Object.defineProperty(app.vault, "unlocked", { value: true, configurable: true });
-  app.vault.createLoginItem = vi.fn(async (input: any) => {
+  Object.defineProperty(app.secretsBackend.client, "unlocked", { value: true, configurable: true });
+  app.secretsBackend.client.createLoginItem = vi.fn(async (input: any) => {
     created.push(input);
     return { name: input.name };
   });
@@ -433,7 +433,7 @@ describe("credential hand-off — pre-store verification probe", () => {
 describe("credential hand-off — overwrite an existing item in place", () => {
   it("calls updateLoginItem (not createLoginItem) with the replacement fields and reports 'Updated'", async () => {
     const updates: any[] = [];
-    app.vault.updateLoginItem = vi.fn(async (ref: string, patch: any) => {
+    app.secretsBackend.client.updateLoginItem = vi.fn(async (ref: string, patch: any) => {
       updates.push({ ref, patch });
       return { id: "item-id", name: ref };
     });

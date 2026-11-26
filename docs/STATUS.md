@@ -4,7 +4,7 @@ Where the project stands and what's next. Update it as work lands. For the modul
 `docs/ARCHITECTURE.md`; for product scope and the security model see `docs/SCOPE.md`; for
 rules and commands see `CLAUDE.md`. Per-release detail lives in the GitHub releases and PRs.
 
-_Last updated: 2026-11-07._
+_Last updated: 2026-11-09._
 
 ## TL;DR
 
@@ -13,7 +13,9 @@ _Last updated: 2026-11-07._
   approval-gated execute tools across eight connectors.
 - **Phase 2 (contributor readiness) shipped in v0.4.0.** One folder per connector, a committed
   tool manifest, a conformance suite, import boundaries, a scaffold, and a connector guide.
-- **Phase 3 (pluggability) is next.** See "Next" below.
+- **Phase 3 (pluggability) is under way.** Secret providers are pluggable: a deployment picks
+  Vaultwarden or an age-encrypted file with `SKELETON_KEY_SECRETS_PROVIDER`. Connector
+  families are next; see "Next" below.
 
 Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`; only a pushed
 `vX.Y.Z` tag moves `:latest` (see CONTRIBUTING "Releases").
@@ -33,6 +35,13 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
   `SKELETON_KEY_PASSPHRASE` / `_FILE` are deprecated but honored.
 - Scoped Vaultwarden client over the `bw` CLI with an offline cache; targets pin the vault
   item's immutable id, trashed items never satisfy a ref, deploy-time reads re-sync first.
+- Pluggable secret providers (Phase 3): the `SecretsProvider` interface with a per-provider
+  security contract (#116), and selection at boot with `SKELETON_KEY_SECRETS_PROVIDER` behind
+  a provider-neutral connection lifecycle (`SecretsBackend`: wizard connect step, unlock,
+  checks, server-URL repair, post-setup connect and reconnect) (#118). Two providers:
+  Vaultwarden (default) and an age-encrypted file. `get_started` and `/api/status` report the
+  provider's capabilities, so a read-only one says up front which tools will refuse. Only
+  the Vaultwarden backend can reach its client (boundary test).
 - OAuth 2.1 (dynamic client registration, PKCE, TOTP-gated consent, rotating refresh tokens,
   per-client revocation), with the static bearer as a fallback.
 - Locked vault is a kill-switch: every tool except a banner-only `get_started` is withheld
@@ -85,26 +94,25 @@ Releases are tag-driven: a merge to `main` publishes `:main` and `:sha-<short>`;
 
 Roughly in priority order.
 
-1. **Phase 3 — pluggable secret providers.** The `SecretsProvider` interface, the
-   Vaultwarden adapter and the per-provider security contract have landed
-   (`src/secrets/provider.ts`, docs/ARCHITECTURE.md "Secrets providers"). Still open:
-   choosing a provider at startup, a provider-neutral connection lifecycle (setup wizard,
-   unlock), and a second provider to prove the seam.
-2. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
+1. **Phase 3 — connector families.** Shared tool contracts (names and input shapes) for
    hypervisors, routers and NAS, checked by the conformance suite.
-3. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and
+2. **Phase 3 — recipes and command packs.** Declarative app recipes for `create_stack`, and
    reusable allowlist packs for the SSH connector.
-4. **New connectors.** `synology` (DSM Web API, multi-host incl. VirtualDSM) and `pihole`
+3. **New connectors.** `synology` (DSM Web API, multi-host incl. VirtualDSM) and `pihole`
    (stats, blocklists); discovery already detects both and falls back to `http` today.
-5. **Admin console.** Grow the web UI past the first-run wizard: audit-log viewer, target CRUD,
+4. **Admin console.** Grow the web UI past the first-run wizard: audit-log viewer, target CRUD,
    OAuth client list/revoke, token rotation, vault re-unlock, and a snapshots page to list and
    download DR skeletons ([#50](https://github.com/sjdodge123/skeleton-key-mcp/issues/50)).
-6. **Dry-run for execute tools**, starting with a compose preview for `create_stack` /
+5. **Dry-run for execute tools**, starting with a compose preview for `create_stack` /
    `update_stack`.
-7. **Monitor-suppression audit detail.** `power_action … suppressMonitors` pauses and resumes
+6. **Monitor-suppression audit detail.** `power_action … suppressMonitors` pauses and resumes
    monitors on the uptime-kuma target under the Pelican tool's single approval; the audit row
    records the call but not which monitor ids were touched. A per-pause/resume audit row
    would close the gap.
+7. **More secret providers, on request.** 1Password Connect and HashiCorp Vault are sketched
+   in #116; each needs its own issue (CONTRIBUTING "Adding a secrets provider"). A tool that
+   copies items between providers would make switching easier; today the items are re-created
+   under the same names.
 8. **Smaller follow-ups.**
    - The web-UI target form doesn't pin `credentialId` (it pins lazily on first read).
    - `verify` URLs over plain http are allowed for literal LAN IPs only, not LAN hostnames.

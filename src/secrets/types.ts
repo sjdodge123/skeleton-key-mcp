@@ -18,7 +18,8 @@ export interface Credential {
 }
 
 /** Skeleton Key's own bootstrap secrets — kept in the local encrypted store,
- *  distinct from the homelab credentials that live in Vaultwarden. */
+ *  distinct from the homelab credentials that live in the secrets provider
+ *  (Vaultwarden or the age file). */
 export interface BootstrapSecrets {
   /** Vaultwarden service-account API key. */
   bwClientId?: string;
@@ -29,6 +30,9 @@ export interface BootstrapSecrets {
   bwServerUrl?: string;
   /** Name of the collection Skeleton Key is scoped to. */
   bwCollectionName?: string;
+  /** `age-file` secrets provider: the age identity (`AGE-SECRET-KEY-1…`) that
+   *  decrypts the secrets file. */
+  ageIdentity?: string;
   /** Static bearer token clients present to reach the MCP endpoint. */
   mcpBearerToken?: string;
   /** TOTP seed for the admin web UI (base32). */
